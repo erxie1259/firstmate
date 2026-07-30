@@ -67,6 +67,32 @@ Existing task operations use recorded endpoint ids and do not move a live task w
 The per-home workspace is reused while it has task tabs.
 Closing its last tab can remove the workspace, and the next spawn recreates it.
 
+## Agent display names
+
+After launching a Herdr crew, Firstmate gives its registered agent a cosmetic display name containing both task and resolved model, such as `flags-l10n-q7-dsv4pro`.
+The task id and final slash-delimited model segment are lowercased, each run of unsupported characters becomes one dash, and empty components fall back to `task` and `default`.
+A task component that would begin with a non-letter receives a `t-` prefix.
+The model component keeps its first 12 normalized characters.
+The base format is `<task>-<model>` within Herdr's 32-character limit.
+When the task component must shrink, it keeps a readable leading segment plus up to six characters from its final dash-delimited token.
+
+Herdr agent names must start with a lowercase letter, contain only lowercase letters, digits, dashes, or underscores, and contain at most 32 characters.
+Firstmate validates every composed name locally and never attempts an invalid rename.
+Names are unique across one Herdr session.
+If the base name is already taken, Firstmate tries deterministic `-2` through `-99` suffixes and shortens only the task component to preserve model visibility.
+The normal case of multiple crews on one model remains distinct because task identity is part of every base name.
+
+`name` is separate from Herdr's detected `agent` field.
+Renaming an OpenCode agent leaves `agent=opencode`, so native identity branches such as Pi composer handling continue to use the unchanged detected type.
+The task tab remains exactly `fm-<task-id>` because task lookup depends on that label.
+
+Agent registration can lag behind pane launch, so Firstmate retries a not-yet-registered rename briefly.
+Any other rename failure warns and lets spawn, metadata publication, and supervision continue unchanged.
+Naming is presentation only and never task or endpoint authority.
+
+`herdr agent rename <pane> --clear` can clear a live name manually.
+Closing the pane releases its session-wide name, so normal `fm-teardown.sh` pane cleanup already permits later reuse and sends no redundant clear request.
+
 ## Presentation spaces
 
 Each new crewmate or scout is placed in a disposable one-task workspace by default, on Herdr 0.8.0 and newer.

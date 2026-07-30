@@ -394,18 +394,16 @@ fm_backend_herdr_cli() {  # <session> <herdr-subcommand-and-args...>
 fm_backend_herdr_agent_name_slug() {  # <value>
   printf '%s' "$1" \
     | LC_ALL=C tr '[:upper:]' '[:lower:]' \
-    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+    | LC_ALL=C sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
 }
 
 fm_backend_herdr_agent_name_valid() {  # <name>
   local name=$1
   [ -n "$name" ] && [ "${#name}" -le 32 ] || return 1
-  case "$name" in
-    [a-z]*)
-      case "$name" in *[!a-z0-9_-]*) return 1 ;; esac
-      ;;
-    *) return 1 ;;
-  esac
+  ( LC_ALL=C
+    case "$name" in [a-z]*) ;; *) exit 1 ;; esac
+    case "$name" in *[!a-z0-9_-]*) exit 1 ;; esac
+  )
 }
 
 fm_backend_herdr_agent_name_compose() {  # <task-id> <model> [collision-ordinal]
@@ -455,12 +453,24 @@ fm_backend_herdr_agent_name_compose() {  # <task-id> <model> [collision-ordinal]
 # registration, then set its display name. Session name collisions advance
 # through deterministic numeric suffixes. Naming is cosmetic: every failure
 # warns and returns success so it can never abort a spawn.
+#
+# Registration retry limit FM_BACKEND_HERDR_AGENT_RENAME_ATTEMPTS (default 20),
+# inter-attempt delay FM_BACKEND_HERDR_AGENT_RENAME_DELAY (default 0.25s).
+# Each herdr CLI call is bounded with FM_BACKEND_HERDR_AGENT_RENAME_TIMEOUT
+# (default 5s); when timeout(1) is unavailable the call runs unbounded.
+# Run this function detached from the spawn tail so it never blocks spawn
+# completion or task-lock release.
 fm_backend_herdr_agent_name_best_effort() {  # <session> <pane> <task-id> <model>
   local session=$1 pane=$2 task=$3 model=$4 ordinal=1 name out code detail
   local registration_attempt=1
   local registration_attempts=${FM_BACKEND_HERDR_AGENT_RENAME_ATTEMPTS:-20}
   local delay=${FM_BACKEND_HERDR_AGENT_RENAME_DELAY:-0.25}
+  local cli_timeout=${FM_BACKEND_HERDR_AGENT_RENAME_TIMEOUT:-5}
   case "$registration_attempts" in ''|*[!0-9]*|0) registration_attempts=20 ;; esac
+  local herdr_cli_cmd=(herdr)
+  if command -v timeout >/dev/null 2>&1; then
+    herdr_cli_cmd=(timeout "$cli_timeout" herdr)
+  fi
   while [ "$ordinal" -le 99 ]; do
     name=$(fm_backend_herdr_agent_name_compose "$task" "$model" "$ordinal") || {
       echo "warning: could not compose a valid Herdr agent name for task $task; crew remains running" >&2
@@ -470,7 +480,7 @@ fm_backend_herdr_agent_name_best_effort() {  # <session> <pane> <task-id> <model
       echo "warning: refusing invalid composed Herdr agent name for task $task; crew remains running" >&2
       return 0
     fi
-    if out=$(fm_backend_herdr_cli "$session" agent rename "$pane" "$name" 2>&1); then
+    if out=$(HERDR_SESSION="$session" "${herdr_cli_cmd[@]}" agent rename "$pane" "$name" --session "$session" 2>&1); then
       return 0
     fi
     code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)

@@ -93,10 +93,12 @@
 #   session's exact active workspace and tab. A detected focus change restores
 #   only that exact tab id; an ambiguous pre-operation snapshot refuses the
 #   focus-sensitive presentation mutation.
-#   After launch, Herdr spawns make one best-effort cosmetic agent rename from
-#   the normalized task id and resolved model. The adapter owns the exact
-#   truncation, collision, validity, and warning behavior. Naming never changes
-#   the fm-<id> tab label and can never fail the spawn.
+#   After launch, Herdr spawns make one detached best-effort cosmetic agent
+#   rename from the normalized task id and resolved model. The rename runs in a
+#   background subshell with stdin detached, so it never blocks spawn completion
+#   or task-lock release. The adapter owns the exact truncation, collision,
+#   validity, timeout, and warning behavior. Naming never changes the fm-<id>
+#   tab label and can never fail the spawn.
 #   Every single-task invocation holds one task-id-scoped lock across backend
 #   creation through metadata publication, so concurrent same-id spawns serialize
 #   even when they select different backends. A fresh spawn first takes the
@@ -2936,8 +2938,8 @@ if [ "$HARNESS" = kimi ]; then
   fi
 fi
 if [ "$BACKEND" = herdr ]; then
-  fm_backend_herdr_agent_name_best_effort \
-    "$HERDR_SES" "$HERDR_PANE_ID" "$ID" "${MODEL:-default}" || true
+  ( fm_backend_herdr_agent_name_best_effort \
+      "$HERDR_SES" "$HERDR_PANE_ID" "$ID" "${MODEL:-default}" </dev/null & )
 fi
 if [ "$KIND" = secondmate ] && [ "${FM_SKIP_SECONDMATE_INHERIT:-0}" != 1 ]; then
   if ! fm_config_reread_discard_pending "$PROJ_ABS" "$ID" "$FM_HOME"; then

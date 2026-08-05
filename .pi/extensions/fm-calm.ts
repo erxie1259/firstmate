@@ -11,10 +11,49 @@
 // diagnostic (see installCalmPresentationAdapter below) if a future Pi removes it; Pi
 // still exposes no global renderer for arbitrary built-in or custom rows.
 // docs/configuration.md owns the home-local Calm preference contract.
+//
+// Built-in tool presentation (bash, read, edit, write, grep, find, ls) is claimed by
+// name through pi.registerTool(), the only seam Pi exposes for it. Pi resolves two
+// extensions registering the same tool name by first-registered-extension-wins with no
+// merge (verified in installed Pi's ExtensionRunner.getAllRegisteredTools): the loser's
+// whole ToolDefinition, execute included, is dropped, not just its rendering, and there
+// is no unregister call. This is the plan Calm follows to avoid claiming a name a
+// differently-loaded extension already owns, given that constraint:
+//
+// - Registration is gated on config/calm already being "on" at load time (the
+//   loadCalmPreference() check right before the wrappedBuiltIns registration loop
+//   below). A calm-off session or reload registers nothing, so a non-Calm user never
+//   contests a name. This must stay synchronous during this
+//   factory's own load, not deferred to session_start: /reload (and
+//   ctx.newSession/fork/switchSession) render the restored transcript from a
+//   pre-session_start snapshot of the tool registry (AgentSession.reload's
+//   beforeSessionStart callback runs before its own session_start emit), so a deferred
+//   claim would miss that render. Confirmed bound: the first time a session that
+//   started Calm-off turns Calm on, tool-call rows from before that toggle do not
+//   retroactively hide, because Pi's ToolExecutionComponent captures its tool
+//   definition once at construction with no re-read hook; every session after that
+//   first toggle starts with the preference already "on" and takes this same
+//   synchronous path from the top, so the guarantee is intact from then on.
+// - When Calm turns on for the first time in a session that started off
+//   (activateBuiltInsIfNeeded below, called from the /calm command handler), Calm can
+//   safely call pi.getAllTools() - a runtime action, valid only once every extension
+//   has finished loading, unlike the synchronous load-time path above - to see whether
+//   a different, non-builtin extension already owns a name, and skip claiming only
+//   that one, leaving it fully intact and callable. There is no equivalent read for a
+//   full, executable ToolDefinition (pi.getAllTools() returns metadata only: name,
+//   description, parameters, promptGuidelines, sourceInfo - no execute/renderCall/
+//   renderResult), so wrapping the other extension's own tool instead of Pi's built-in
+//   is not reachable by any exposed API.
+// - A name Calm could not check before claiming - because Calm registered
+//   unconditionally at load since Calm was already on - can still be silently lost to
+//   an earlier-loaded extension. reportBuiltInLosses() below is the backstop for that
+//   residual case: a session-start diagnostic naming the tool and the extension that
+//   won it, whenever Calm currently does not own a name it wrapped.
 import { randomUUID } from "node:crypto";
 import {
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -25,6 +64,7 @@ import type {
   ExtensionAPI,
   ExtensionUIContext,
   ToolDefinition,
+  ToolInfo,
   ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -83,6 +123,21 @@ type StandardShellState = {
 const extensionFile = fileURLToPath(import.meta.url);
 const extensionDir = dirname(extensionFile);
 const root = resolve(extensionDir, "../..");
+
+// Resolves symlinks before comparing tool-ownership identity below: sourceInfo.path
+// values come from independent path-resolution code paths (this module's own
+// import.meta.url vs. Pi's extension loader), and macOS alone symlinks /tmp and /var
+// to /private/..., so lexical string comparison alone spuriously reads a symlinked
+// self-path as a foreign one. Falls back to the raw path for synthetic, non-file
+// sourceInfo paths such as "<builtin:read>" or "<inline>", which realpathSync rejects.
+const realpathOrSelf = (path: string): string => {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+};
+const extensionRealFile = realpathOrSelf(extensionFile);
 
 // Each presentation adapter probes the exact Pi API it patches. If a future Pi removes
 // that API, only the affected adapter degrades; the rest of Calm keeps working.
@@ -166,9 +221,9 @@ export default function (pi: ExtensionAPI) {
 
   registerFirstmateSyntheticPresentation(pi);
 
-  function registerBuiltIn<TParams extends TSchema, TDetails, TState>(
+  function wrapBuiltIn<TParams extends TSchema, TDetails, TState>(
     factory: DefinitionFactory<TParams, TDetails, TState>,
-  ): void {
+  ): ToolDefinition<TParams, TDetails, TState> {
     const definitions = new Map<string, ToolDefinition<TParams, TDetails, TState>>();
     const definitionFor = (cwd: string): ToolDefinition<TParams, TDetails, TState> => {
       let definition = definitions.get(cwd);
@@ -220,7 +275,7 @@ export default function (pi: ExtensionAPI) {
       return shell;
     };
 
-    pi.registerTool({
+    return {
       ...original,
       renderShell: "self",
 
@@ -263,18 +318,108 @@ export default function (pi: ExtensionAPI) {
         refreshStandardShell(state, theme, context);
         return new Container();
       },
+    };
+  }
+
+  // Each wrapBuiltIn() call below has its own concrete TParams/TDetails/TState; the
+  // array holding all seven has no single sound instantiation, so it is typed the same
+  // way Pi's own ToolDefinition consumers erase this (any, any, any).
+  const wrappedBuiltIns: ToolDefinition<any, any, any>[] = [
+    wrapBuiltIn(createReadToolDefinition),
+    wrapBuiltIn(createBashToolDefinition),
+    wrapBuiltIn(createEditToolDefinition),
+    wrapBuiltIn(createWriteToolDefinition),
+    wrapBuiltIn(createGrepToolDefinition),
+    wrapBuiltIn(createFindToolDefinition),
+    wrapBuiltIn(createLsToolDefinition),
+  ];
+
+  // True once the 7 built-ins have been registered, whichever path did it: the
+  // synchronous load-time path just below (Calm already on), or the first-activation
+  // path in the /calm command handler (Calm turned on mid-session, see
+  // activateBuiltInsIfNeeded).
+  let builtInsRegistered = false;
+
+  // Part A: gate on Calm already being on at load time. Must stay synchronous and
+  // unconditional here (see file header) - a foreign-claim check is not reachable at
+  // this point, so a Calm-on session or reload keeps today's behavior exactly. A
+  // Calm-off session or reload registers nothing: zero collision exposure for anyone
+  // who has never turned Calm on.
+  if (loadCalmPreference()) {
+    for (const tool of wrappedBuiltIns) pi.registerTool(tool);
+    builtInsRegistered = true;
+  }
+
+  // Which of the 7 built-ins are currently owned by a different, non-builtin
+  // extension. Only safe to call once every extension has finished loading (see file
+  // header); never call this during the factory's own synchronous execution above.
+  function contestedBuiltIns(): ToolDefinition<any, any, any>[] {
+    let registered: ToolInfo[];
+    try {
+      registered = pi.getAllTools();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.error(`Firstmate Calm: built-in ownership check unavailable, claiming every built-in unconditionally. ${reason}`);
+      return [];
+    }
+    return wrappedBuiltIns.filter((tool) => {
+      const owner = registered.find((info) => info.name === tool.name)?.sourceInfo;
+      return owner !== undefined && owner.source !== "builtin" && realpathOrSelf(owner.path) !== extensionRealFile;
     });
   }
 
-  registerBuiltIn(createReadToolDefinition);
-  registerBuiltIn(createBashToolDefinition);
-  registerBuiltIn(createEditToolDefinition);
-  registerBuiltIn(createWriteToolDefinition);
-  registerBuiltIn(createGrepToolDefinition);
-  registerBuiltIn(createFindToolDefinition);
-  registerBuiltIn(createLsToolDefinition);
+  // Part B: the first time Calm turns on in a session that started off, claim every
+  // uncontested built-in and leave any contested one, and its owning extension,
+  // completely untouched. Part C: tell the user plainly which built-in Calm could not
+  // take over and why, since Calm's presentation silently does not apply to it.
+  function activateBuiltInsIfNeeded(ui: ExtensionUIContext): void {
+    if (builtInsRegistered) return;
+    const contested = contestedBuiltIns();
+    const contestedNames = new Set(contested.map((tool) => tool.name));
+    for (const tool of wrappedBuiltIns) {
+      if (!contestedNames.has(tool.name)) pi.registerTool(tool);
+    }
+    builtInsRegistered = true;
+    if (contested.length === 0) return;
+    const names = contested.map((tool) => `"${tool.name}"`).join(", ");
+    const plural = contested.length > 1;
+    ui.notify(
+      `Firstmate Calm: the ${names} built-in tool${plural ? "s are" : " is"} already provided by another extension, so Calm may not fully function for ${plural ? "them" : "it"} this session.`,
+      "warning",
+    );
+    for (const tool of contested) {
+      console.error(`Firstmate Calm: skipped claiming built-in "${tool.name}" because another extension already owns it.`);
+    }
+  }
+
+  // Backstop for the one case activateBuiltInsIfNeeded cannot reach: Calm registered
+  // unconditionally at load time (Part A, Calm was already on) without any chance to
+  // check for a foreign claim first, so it can still silently lose a name to an
+  // earlier-loaded extension. Runs on every session_start reason because a reload
+  // rebuilds every extension's registrations from scratch, so last session's clean
+  // bill of health does not carry over.
+  function reportBuiltInLosses(): void {
+    if (!builtInsRegistered) return;
+    let registered: ToolInfo[];
+    try {
+      registered = pi.getAllTools();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.error(`Firstmate Calm: built-in ownership check unavailable. ${reason}`);
+      return;
+    }
+    for (const tool of wrappedBuiltIns) {
+      const owner = registered.find((info) => info.name === tool.name)?.sourceInfo;
+      if (owner && owner.source !== "builtin" && realpathOrSelf(owner.path) !== extensionRealFile) {
+        console.error(
+          `Firstmate Calm: another extension (${owner.path}) also claimed the built-in "${tool.name}" tool and won; Calm's presentation for it is unavailable this session.`,
+        );
+      }
+    }
+  }
 
   pi.on("session_start", (_event, ctx) => {
+    reportBuiltInLosses();
     exportRendering = false;
     setCalmPresentation(loadCalmPreference());
     setCalmStockExportRendering(false);
@@ -335,6 +480,7 @@ export default function (pi: ExtensionAPI) {
       const active = !calmPresentationIsActive();
       persistCalmPreference(active);
       setCalmPresentation(active);
+      if (active) activateBuiltInsIfNeeded(ctx.ui);
       publishPresentationState();
       applyWorkingPresentation(ctx.ui, true);
       ctx.ui.setHiddenThinkingLabel(active ? "" : undefined);

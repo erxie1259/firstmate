@@ -12,43 +12,12 @@
 // still exposes no global renderer for arbitrary built-in or custom rows.
 // docs/configuration.md owns the home-local Calm preference contract.
 //
-// Built-in tool presentation (bash, read, edit, write, grep, find, ls) is claimed by
-// name through pi.registerTool(), the only seam Pi exposes for it. Pi resolves two
-// extensions registering the same tool name by first-registered-extension-wins with no
-// merge (verified in installed Pi's ExtensionRunner.getAllRegisteredTools): the loser's
-// whole ToolDefinition, execute included, is dropped, not just its rendering, and there
-// is no unregister call. This is the plan Calm follows to avoid claiming a name a
-// differently-loaded extension already owns, given that constraint:
-//
-// - Registration is gated on config/calm already being "on" at load time (the
-//   loadCalmPreference() check right before the wrappedBuiltIns registration loop
-//   below). A calm-off session or reload registers nothing, so a non-Calm user never
-//   contests a name. This must stay synchronous during this
-//   factory's own load, not deferred to session_start: /reload (and
-//   ctx.newSession/fork/switchSession) render the restored transcript from a
-//   pre-session_start snapshot of the tool registry (AgentSession.reload's
-//   beforeSessionStart callback runs before its own session_start emit), so a deferred
-//   claim would miss that render. Confirmed bound: the first time a session that
-//   started Calm-off turns Calm on, tool-call rows from before that toggle do not
-//   retroactively hide, because Pi's ToolExecutionComponent captures its tool
-//   definition once at construction with no re-read hook; every session after that
-//   first toggle starts with the preference already "on" and takes this same
-//   synchronous path from the top, so the guarantee is intact from then on.
-// - When Calm turns on for the first time in a session that started off
-//   (activateBuiltInsIfNeeded below, called from the /calm command handler), Calm can
-//   safely call pi.getAllTools() - a runtime action, valid only once every extension
-//   has finished loading, unlike the synchronous load-time path above - to see whether
-//   a different, non-builtin extension already owns a name, and skip claiming only
-//   that one, leaving it fully intact and callable. There is no equivalent read for a
-//   full, executable ToolDefinition (pi.getAllTools() returns metadata only: name,
-//   description, parameters, promptGuidelines, sourceInfo - no execute/renderCall/
-//   renderResult), so wrapping the other extension's own tool instead of Pi's built-in
-//   is not reachable by any exposed API.
-// - A name Calm could not check before claiming - because Calm registered
-//   unconditionally at load since Calm was already on - can still be silently lost to
-//   an earlier-loaded extension. reportBuiltInLosses() below is the backstop for that
-//   residual case: a session-start diagnostic naming the tool and the extension that
-//   won it, whenever Calm currently does not own a name it wrapped.
+// Pi has one first-registration-wins ToolDefinition per tool name, with no merge or
+// unregister operation. Keep Calm-off registration empty; keep Calm-on load-time
+// registration synchronous because restored rows capture the registry before
+// session_start; and collision-check only the later first-activation path, when
+// getAllTools() is reliable. docs/calm-mode-feasibility.md owns the Pi-source evidence
+// and docs/calm.md owns the user-facing behavior and non-retroactive first-toggle bound.
 import { randomUUID } from "node:crypto";
 import {
   mkdirSync,
@@ -334,17 +303,15 @@ export default function (pi: ExtensionAPI) {
     wrapBuiltIn(createLsToolDefinition),
   ];
 
-  // True once the 7 built-ins have been registered, whichever path did it: the
-  // synchronous load-time path just below (Calm already on), or the first-activation
-  // path in the /calm command handler (Calm turned on mid-session, see
-  // activateBuiltInsIfNeeded).
+  // True once this extension has handled built-in registration for its lifetime:
+  // either all seven synchronously at load, or only the uncontested subset during
+  // first activation.
   let builtInsRegistered = false;
 
-  // Part A: gate on Calm already being on at load time. Must stay synchronous and
-  // unconditional here (see file header) - a foreign-claim check is not reachable at
-  // this point, so a Calm-on session or reload keeps today's behavior exactly. A
-  // Calm-off session or reload registers nothing: zero collision exposure for anyone
-  // who has never turned Calm on.
+  // Gate on Calm already being on at load time. This must stay synchronous and
+  // unconditional here (see file header): a foreign-claim check is not reachable at
+  // this point, while deferral would make restored rows capture the wrong definition.
+  // A Calm-off session or reload registers nothing and creates no collision exposure.
   if (loadCalmPreference()) {
     for (const tool of wrappedBuiltIns) pi.registerTool(tool);
     builtInsRegistered = true;
@@ -368,10 +335,10 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  // Part B: the first time Calm turns on in a session that started off, claim every
-  // uncontested built-in and leave any contested one, and its owning extension,
-  // completely untouched. Part C: tell the user plainly which built-in Calm could not
-  // take over and why, since Calm's presentation silently does not apply to it.
+  // The first time Calm turns on in a session that started off, claim every
+  // uncontested built-in and leave each contested tool and its owning extension
+  // untouched. Tell the user which built-in Calm could not take over, since Calm's
+  // presentation does not apply to it.
   function activateBuiltInsIfNeeded(ui: ExtensionUIContext): void {
     if (builtInsRegistered) return;
     const contested = contestedBuiltIns();
@@ -393,7 +360,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Backstop for the one case activateBuiltInsIfNeeded cannot reach: Calm registered
-  // unconditionally at load time (Part A, Calm was already on) without any chance to
+  // unconditionally at load time because it was already on, without any chance to
   // check for a foreign claim first, so it can still silently lose a name to an
   // earlier-loaded extension. Runs on every session_start reason because a reload
   // rebuilds every extension's registrations from scratch, so last session's clean

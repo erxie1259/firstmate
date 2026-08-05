@@ -236,6 +236,51 @@ test_status_prose_ignores_obstacle_lines_and_unanchored_tokens() {
   pass "fm-gate keeps obstacle lines and unanchored prose tokens out of derived claims"
 }
 
+test_status_keyed_verbs_are_read() {
+  local case_dir
+  case_dir=$(make_case status-keyed)
+  write_meta "$case_dir"
+  commit_real_work "$case_dir"
+  # bin/fm-classify-lib.sh allows an optional [key=<slug>] token between the
+  # verb and the colon. A resolver that matched "^done:" literally would read
+  # nothing here and go quietly claimless.
+  write_status "$case_dir" \
+    "working [key=phase]: reworked bin/real.sh" \
+    "done [key=phase]: also added bin/never-written.sh"
+
+  run_gate "$case_dir" "$TASK_ID"
+
+  expect_code 1 "$RC" "status-keyed"
+  assert_contains "$OUT" 'source=status confidence=derived files=2' \
+    "status-keyed: keyed done/working lines must still yield their claims"
+  assert_contains "$OUT" 'claimed but untouched:
+    bin/never-written.sh' "status-keyed: the false claim must still be caught"
+  pass "fm-gate reads keyed done/working status lines through the classify contract"
+}
+
+test_status_root_token_needs_a_real_anchor() {
+  local case_dir
+  case_dir=$(make_case status-root)
+  write_meta "$case_dir"
+  commit_real_work "$case_dir"
+  # CHANGELOG.md is neither tracked nor changed: at the repo root there is
+  # nothing to tell it apart from prose about a file this task never owned, so
+  # it must not become a claim. README.md IS tracked and was not changed, so a
+  # claim on it is still real evidence and must still fail.
+  write_status "$case_dir" "done: regenerated CHANGELOG.md and rewrote README.md"
+
+  run_gate "$case_dir" "$TASK_ID"
+
+  expect_code 1 "$RC" "status-root"
+  assert_contains "$OUT" 'source=status confidence=derived files=1' \
+    "status-root: only the anchored root token may become a claim"
+  assert_not_contains "$OUT" 'CHANGELOG.md' \
+    "status-root: an unanchored root token must not become a claimed path"
+  assert_contains "$OUT" 'claimed but untouched:
+    README.md' "status-root: a tracked root file claimed but untouched is still caught"
+  pass "fm-gate anchors repo-root prose tokens on being tracked or changed"
+}
+
 test_no_claims_reports_inconclusive_not_pass() {
   local case_dir
   case_dir=$(make_case no-claims)
@@ -439,6 +484,8 @@ test_exhaustive_source_fails_on_unclaimed_touch
 test_non_exhaustive_source_notes_unclaimed_touch
 test_status_prose_claims_catch_a_false_claim
 test_status_prose_ignores_obstacle_lines_and_unanchored_tokens
+test_status_keyed_verbs_are_read
+test_status_root_token_needs_a_real_anchor
 test_no_claims_reports_inconclusive_not_pass
 test_missing_metadata_cannot_run
 test_returned_worktree_cannot_run

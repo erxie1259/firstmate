@@ -61,14 +61,26 @@
 # ---------------------------------
 # Only `done:` and `working:` lines are read: those assert work, while
 # `blocked:`, `paused:`, `needs-decision:`, and `failed:` lines describe
-# obstacles and routinely name files that were deliberately NOT touched.
+# obstacles and routinely name files that were deliberately NOT touched. The
+# leading verb is parsed by bin/fm-classify-lib.sh, the one owner of that
+# vocabulary, so the optional `[key=<slug>]` token is handled and a keyed line
+# such as `working [key=phase]: ...` is read like any other.
+#
 # A token counts as a claimed path when it is path-shaped (a slash or a
 # dot-extension, no `..`, not a bare number, not a URL) AND it is anchored in
-# the repository: it is a file tracked at HEAD or at the base, it is in the
-# actual diff, or its parent directory exists in one of those trees. The anchor
-# is what keeps incidental prose such as a ref name or a version string out of
-# the claim set while still catching a file the worker said it created and did
-# not.
+# the repository. The anchor is what keeps incidental prose - a ref name, a
+# version string, the name of a tool the worker merely RAN - out of the claim
+# set. A nested token anchors on its parent directory existing in the tree at
+# HEAD or at the base, so a file the worker said it created under an existing
+# directory and did not create is still caught. A repo-root token has no such
+# parent to distinguish it from any other dotted word, so it anchors only on
+# being tracked or actually changed.
+#
+# That costs one case knowingly: a repo-root file claimed as newly created but
+# never created is dropped rather than reported, because at the root there is
+# no evidence separating that claim from prose about an unrelated file. A
+# derived source that cries wolf gets ignored, which would cost more. An
+# exhaustive claim source has no such gap.
 #
 # Gates
 # -----
@@ -100,6 +112,9 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 # shellcheck source=bin/fm-backend.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-classify-lib.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/fm-classify-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-pr-lib.sh"
@@ -399,7 +414,10 @@ path_is_anchored() {  # <candidate>
   grep -qxF -- "$candidate" "$KNOWN_FILES" && return 0
   case "$candidate" in
     */*) parent=${candidate%/*} ;;
-    *) return 0 ;;  # a repo-root file: the root always exists
+    # A repo-root token has no parent directory that could distinguish it from
+    # any other dotted word in the prose, so the known-file check above is its
+    # only anchor. See the header for what that trades away.
+    *) return 1 ;;
   esac
   grep -qxF -- "$parent" "$KNOWN_DIRS"
 }
@@ -433,18 +451,29 @@ claims_from_file() {
 }
 
 claims_from_status() {
-  local record="$TMP_ROOT/status-claims" token
+  local record="$TMP_ROOT/status-claims" work="$TMP_ROOT/status-work" line token
   [ -f "$STATUS_LOG" ] || return 1
   [ "$WT_OK" -eq 1 ] && [ "$BASE_OK" -eq 1 ] || return 1
   anchor_sets_build
+  # Only lines that assert work; obstacle lines routinely name files that were
+  # deliberately not touched. Verb parsing is NOT re-implemented here:
+  # bin/fm-classify-lib.sh owns it, so a keyed line such as
+  # "working [key=phase]: ..." is recognized exactly as that contract defines,
+  # and its verb and key token are stripped before tokenizing.
+  : > "$work"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$(status_line_verb "$line")" in
+      done|working)
+        status_line_note "$line" >> "$work"
+        printf '\n' >> "$work"
+        ;;
+    esac
+  done < "$STATUS_LOG"
   {
     printf 'claim_source=status\n'
     printf 'claim_confidence=derived\n'
     printf 'files_changed_exhaustive=0\n'
-    # Only lines that assert work; obstacle lines routinely name files that
-    # were deliberately not touched.
-    grep -E '^(done|working):' "$STATUS_LOG" 2>/dev/null \
-      | tr -c 'A-Za-z0-9._/+-' '\n' \
+    tr -c 'A-Za-z0-9._/+-' '\n' < "$work" \
       | sed -e 's#^\./##' -e 's/\.*$//' \
       | LC_ALL=C sort -u \
       | while IFS= read -r token; do

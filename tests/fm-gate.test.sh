@@ -517,6 +517,13 @@ test_envelope_catches_undeclared_and_false_changes() {
   expect_code 1 "$RC" "envelope-claims-work-never-done"
   assert_contains "$OUT" 'claimed but untouched:' "envelope-claims-work-never-done: the false claim must fail"
   assert_contains "$OUT" 'bin/never-written.sh' "envelope-claims-work-never-done: the exact file must be named"
+
+  write_envelope "$case_dir" "$(envelope_json '[]')"
+  run_gate "$case_dir" "$TASK_ID"
+  expect_code 1 "$RC" "envelope-empty-with-changes"
+  assert_contains "$OUT" 'GATE diff_matches_claims: FAIL' "envelope-empty-with-changes: empty exhaustive claims must fail on a non-empty diff"
+  assert_contains "$OUT" 'touched but unclaimed:' "envelope-empty-with-changes: the omission must be named"
+  assert_contains "$OUT" 'bin/real.sh' "envelope-empty-with-changes: the changed file must be named"
   pass "fm-gate catches an envelope that hides a change or claims work never done"
 }
 
@@ -584,6 +591,12 @@ test_broken_envelope_fails_and_falls_through() {
   run_gate "$case_dir" "$TASK_ID"
   assert_contains "$OUT" 'files_changed must hold plain repo-relative paths' \
     "envelope-absolute-path: an absolute path is not a repo-relative claim"
+
+  chmod 000 "$case_dir/data/$TASK_ID/envelope.json"
+  run_gate "$case_dir" "$TASK_ID"
+  expect_code 3 "$RC" "envelope-unreadable"
+  assert_contains "$OUT" 'GATE envelope_valid: CANNOT-RUN' "envelope-unreadable: an unreadable envelope cannot be checked"
+  assert_contains "$OUT" 'not a readable file' "envelope-unreadable: the reason must identify the read failure"
   pass "fm-gate reports a present-but-invalid envelope instead of ignoring or trusting it"
 }
 

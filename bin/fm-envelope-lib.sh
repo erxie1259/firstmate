@@ -93,7 +93,7 @@ fm_envelope_path() {  # <data-dir> <task-id>
 
 fm_envelope_validate() {  # <file>
   local file=${1:-} verdict rc=0
-  if [ -z "$file" ] || [ ! -f "$file" ]; then
+  if [ -z "$file" ] || [ ! -f "$file" ] || [ ! -r "$file" ]; then
     printf 'not a readable file: %s\n' "${file:-<no path>}"
     return 2
   fi

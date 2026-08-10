@@ -636,7 +636,7 @@ gate_diff_matches_claims() {
       "no claim source produced a record (no --claims file, and no readable status log at $STATUS_LOG)"
     return
   fi
-  if [ "$CLAIMED_COUNT" -eq 0 ]; then
+  if [ "$CLAIMED_COUNT" -eq 0 ] && [ "$CLAIM_EXHAUSTIVE" -eq 0 ]; then
     gate_result diff_matches_claims CANNOT-RUN \
       "claim source '$CLAIM_SOURCE' names no changed files, so there is nothing to check against the diff" \
       "branch $BRANCH actually changed $ACTUAL_CHANGED_COUNT file(s) vs $BASE"

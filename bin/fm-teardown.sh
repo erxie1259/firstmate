@@ -29,6 +29,11 @@
 # declared scratch and the report at data/<task-id>/report.md is the work
 # product. Teardown proceeds only once the report exists and the shared
 # unresolved-decision completion gate verifies its captain-held inventory.
+# When a task left a typed terminal envelope at data/<task-id>/envelope.json,
+# teardown validates it through bin/fm-envelope-lib.sh and prints one ENVELOPE:
+# note. That note is advisory: an absent, or even an unusable, envelope never
+# refuses cleanup. See the block itself for why the claims-versus-diff half of
+# the check belongs to bin/fm-gate.sh instead.
 # Before destructive cleanup, teardown validates task check artifacts and any
 # matching quarantine entries as ordinary single-link files on the state
 # device. It refuses and preserves task state when that proof fails; otherwise
@@ -149,6 +154,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-nm-run-lib.sh
 . "$SCRIPT_DIR/fm-nm-run-lib.sh"
+# shellcheck source=bin/fm-envelope-lib.sh
+. "$SCRIPT_DIR/fm-envelope-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
   echo "error: invalid teardown request" >&2
   exit 2
@@ -2063,6 +2070,36 @@ if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
     echo "Inventory its report and any visual review through bin/fm-decision-hold.sh before teardown." >&2
     exit 1
   fi
+fi
+
+# The typed terminal envelope, when the crewmate wrote one. This is the last
+# moment it is read next to the work it describes, so a broken one is surfaced
+# here rather than discovered later against a returned worktree.
+#
+# ADVISORY ONLY: it never refuses and never changes this script's exit status.
+# By the time teardown runs, the work has usually landed and the local base ref
+# may already contain it, which makes a claims-versus-diff comparison capable of
+# a false accusation - and cleanup is not the place to be wrong about that. So
+# teardown checks only what stays true after landing, the envelope's own
+# validity, and leaves the claims-versus-diff check to bin/fm-gate.sh, which is
+# meant to run while the task's branch is still the thing under inspection.
+# A task with no envelope does nothing here beyond one [ -e ] test.
+ENVELOPE_PATH=$(fm_envelope_path "$DATA" "$ID")
+if [ -e "$ENVELOPE_PATH" ]; then
+  ENVELOPE_STATUS=0
+  ENVELOPE_WHY=$(fm_envelope_validate "$ENVELOPE_PATH") || ENVELOPE_STATUS=$?
+  case "$ENVELOPE_STATUS" in
+    0)
+      echo "ENVELOPE: $ID declares $(fm_envelope_summary "$ENVELOPE_PATH" 2>/dev/null || echo 'a valid terminal envelope')"
+      ;;
+    2)
+      echo "ENVELOPE: $ID left an envelope that could not be checked - $ENVELOPE_WHY" >&2
+      ;;
+    *)
+      echo "ENVELOPE: $ID left an unusable envelope at $ENVELOPE_PATH - $ENVELOPE_WHY" >&2
+      echo "Cleanup continues; this is a note about the record, not about the work." >&2
+      ;;
+  esac
 fi
 
 # A public commitment is not kept until its final reply lands in the ORIGINAL

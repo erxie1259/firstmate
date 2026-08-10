@@ -49,6 +49,13 @@
 # declared-external-wait verb (FM_CLASSIFY_PAUSED_VERB, default "paused") from
 # "blocked:": pause for a known external wait expected to clear on its own,
 # blocked when firstmate must act.
+# Ship and scout briefs carry a "Terminal envelope" section, and this script is
+# the single owner of that contract: it tells the crewmate to write
+# data/<task-id>/envelope.json at terminal state and states the exact six-key
+# schema. The envelope never replaces the status protocol, and consumers
+# (bin/fm-gate.sh through bin/fm-envelope-lib.sh, and bin/fm-teardown.sh) treat
+# an absent one as not applicable, so it stays additive. Secondmate charters get
+# no envelope: a persistent home has no terminal state to describe.
 # Ship tasks include a project-memory section so durable project-intrinsic
 # learnings can be committed to AGENTS.md through the project's delivery path;
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
@@ -297,6 +304,55 @@ EOF
 HERDR_SECTION=${HERDR_SECTION%$'\n'}
 fi
 
+# The typed terminal envelope. THIS IS THE ONE PLACE the envelope's contract is
+# stated: what a crewmate writes and what each key means lives here, because
+# this scaffold is the text crewmates are actually given. bin/fm-envelope-lib.sh
+# enforces the same contract for bin/fm-gate.sh and bin/fm-teardown.sh, and both
+# treat a missing envelope as not-applicable - so a task that never writes one
+# behaves exactly as tasks did before envelopes existed.
+# The schema block is a QUOTED heredoc: its backticks and braces must reach the
+# reading agent verbatim, and nothing in it interpolates.
+IFS= read -r -d '' ENVELOPE_SCHEMA <<'EOF' || true
+Write exactly these six keys, no others, and give every array a value even when it is empty:
+
+```json
+{
+  "files_changed": ["path/relative/to/the/repo/root"],
+  "tests_run": 0,
+  "tests_passed": 0,
+  "claims": ["one short factual statement about what you actually did"],
+  "acceptance_criteria_met": ["an acceptance criterion from this brief you are asserting is met"],
+  "open_questions": ["anything you could not resolve; [] when there is nothing"]
+}
+```
+
+- `files_changed` must be EXHAUSTIVE: every repo-relative path your work adds, edits, or deletes, and nothing else.
+  A path you name but never touched, and a file you touched but never named, are both checked and both fail.
+- `tests_run` and `tests_passed` are non-negative whole numbers, and `tests_passed` may not exceed `tests_run`.
+  Use `0` and `0` when you ran none; do not inflate either one.
+- `claims`, `acceptance_criteria_met`, and `open_questions` hold short plain strings, and any of them may be `[]`.
+- This record is checked mechanically against your actual diff, so write what is true rather than what is tidy.
+  An honest envelope that reports a shortfall is worth more than a clean one that does not survive the check.
+EOF
+ENVELOPE_SCHEMA=${ENVELOPE_SCHEMA%$'\n'}
+
+ENVELOPE_INTRO="Before you append your final \`done:\` or \`failed:\` status line, write a machine-readable summary of this task to \`$DATA/$ID/envelope.json\`.
+It does not replace the status protocol above, which stays exactly as described; it is an additional record firstmate can check without reading prose.
+Keep it current: if later work changes the file set or the test result, rewrite the envelope before your next terminal status line."
+
+if [ "$KIND" = scout ]; then
+ENVELOPE_SECTION="# Terminal envelope
+$ENVELOPE_INTRO
+Your worktree is scratch, so a scout usually has nothing to declare in \`files_changed\` and writes \`[]\`; the findings themselves belong in the report, not in this file.
+
+$ENVELOPE_SCHEMA"
+else
+ENVELOPE_SECTION="# Terminal envelope
+$ENVELOPE_INTRO
+
+$ENVELOPE_SCHEMA"
+fi
+
 if [ "$KIND" = scout ]; then
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -333,6 +389,8 @@ The report is the only thing that survives, so anything worth keeping must be in
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+
+$ENVELOPE_SECTION
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -455,6 +513,8 @@ Record only project knowledge useful to almost every future session.
 For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
 If you touch a project \`AGENTS.md\` that lacks \`## Maintaining this file\`, add that short self-governance section from \`$FM_ROOT/bin/fm-ensure-agents-md.sh\` in the same pass.
 Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
+
+$ENVELOPE_SECTION
 
 $DOD
 EOF

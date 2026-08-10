@@ -33,16 +33,22 @@
 #
 # Claim sources
 # -------------
-# There is no typed crew envelope yet, so claims are resolved from what already
-# exists. Each source is one resolver function that writes the SAME normalized
-# claim record; claims_resolve lists them in precedence order. Adding the typed
-# envelope (fm-crew-envelope-q24) means adding one resolver and one line there,
-# and no gate changes at all.
+# Each source is one resolver function that writes the SAME normalized claim
+# record; claims_resolve lists them in precedence order, and no gate below ever
+# learns which source a claim came from.
 #
-#   file    an explicit --claims <file> record, used verbatim.
-#   status  state/<task-id>.status prose. Heuristic and non-exhaustive: prose
-#           never enumerates every changed file, so this source declares
-#           files_changed_exhaustive=0 and unclaimed touches stay a note.
+#   file      an explicit --claims <file> record, used verbatim.
+#   envelope  the crewmate's typed terminal envelope at data/<task-id>/envelope.json.
+#             Declared and exhaustive, so an unclaimed touch FAILS. The envelope's
+#             contract is owned by the bin/fm-brief.sh scaffold and parsed by
+#             bin/fm-envelope-lib.sh; this script only consumes the result.
+#   status    state/<task-id>.status prose. Heuristic and non-exhaustive: prose
+#             never enumerates every changed file, so this source declares
+#             files_changed_exhaustive=0 and unclaimed touches stay a note.
+#
+# The envelope outranks status prose because a declared exhaustive list is
+# strictly better evidence than tokens scraped out of sentences. It is optional:
+# a task without one resolves claims exactly as it did before envelopes existed.
 #
 # Normalized claim record (the format --claims reads, one key=value per line,
 # blank lines and # comments ignored):
@@ -53,6 +59,8 @@
 #                                     changed file, so an unclaimed touch fails
 #   files_changed=<repo-relative path> repeatable, may be absent
 #   tests_command=<shell command>     optional, run only under --run-tests
+#   tests_run=<count>                 optional, a self-reported test count
+#   tests_passed=<count>              optional, how many of those passed
 #
 # An unknown key is refused rather than ignored, so a claim producer cannot
 # silently emit a field these gates do not honor.
@@ -84,6 +92,9 @@
 #
 # Gates
 # -----
+#   envelope_valid       A PRESENT data/<id>/envelope.json must parse and satisfy
+#                        its contract. The envelope is optional, so its absence
+#                        is N/A - never a failure and never a pass.
 #   diff_matches_claims  The files the worker says it changed against the actual
 #                        diff of its branch. Files claimed but untouched always
 #                        FAIL. Files touched but unclaimed FAIL only for an
@@ -91,9 +102,12 @@
 #   artifacts_exist      A scout must have left a non-empty data/<id>/report.md.
 #                        A ship must have commits on its branch. A secondmate is
 #                        not a work deliverable, so the gate is not applicable.
-#   tests_pass           Opt-in twice over: the task must declare tests_command
-#                        and the caller must pass --run-tests. This script never
-#                        guesses a test command.
+#   tests_pass           A declared tests_command is verified only when the
+#                        caller passes --run-tests; this script never guesses a
+#                        test command. Failing that, a claim record carrying
+#                        self-reported tests_run/tests_passed is checked for
+#                        internal consistency and reported as unverified, since
+#                        counts with no re-runnable command prove nothing.
 #
 # The task's recorded metadata supplies kind, worktree, and project; the branch
 # is the worktree's checked-out branch. Any of those being absent makes the
@@ -118,6 +132,9 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 # shellcheck source=bin/fm-pr-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# shellcheck source=bin/fm-envelope-lib.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/fm-envelope-lib.sh"
 
 usage() {
   awk '
@@ -218,6 +235,7 @@ gate_result() {  # <gate-name> <PASS|FAIL|SKIP|N/A|CANNOT-RUN> [detail...]
 META="$STATE/$ID.meta"
 STATUS_LOG="$STATE/$ID.status"
 REPORT="$DATA/$ID/report.md"
+ENVELOPE=$(fm_envelope_path "$DATA" "$ID")
 
 printf 'task: %s\n' "$ID"
 if [ ! -f "$META" ]; then
@@ -342,12 +360,27 @@ CLAIM_SOURCE=
 CLAIM_CONFIDENCE=
 CLAIM_EXHAUSTIVE=0
 CLAIM_TESTS_COMMAND=
+CLAIM_TESTS_RUN=
+CLAIM_TESTS_PASSED=
 CLAIMED_FILES="$TMP_ROOT/claimed-files"
 : > "$CLAIMED_FILES"
+
+# The envelope is read ONCE, here, so its verdict is the same fact the
+# envelope_valid gate reports and the claim resolver acts on. Presence is tested
+# with -e rather than -f: a path that exists but is not a readable regular file
+# is a present-and-broken envelope, not an absent one.
+ENVELOPE_PRESENT=0
+ENVELOPE_STATUS=0
+ENVELOPE_WHY=
+if [ -e "$ENVELOPE" ]; then
+  ENVELOPE_PRESENT=1
+  ENVELOPE_WHY=$(fm_envelope_validate "$ENVELOPE") || ENVELOPE_STATUS=$?
+fi
 
 claim_record_read() {  # <file>
   local file=$1 line key value
   local source='' confidence='' exhaustive='' tests=''
+  local tests_run='' tests_passed=''
   : > "$CLAIMED_FILES"
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
@@ -368,6 +401,8 @@ claim_record_read() {  # <file>
       files_changed_exhaustive) exhaustive=$value ;;
       files_changed) [ -z "$value" ] || printf '%s\n' "$value" >> "$CLAIMED_FILES" ;;
       tests_command) tests=$value ;;
+      tests_run) tests_run=$value ;;
+      tests_passed) tests_passed=$value ;;
       *)
         printf 'fm-gate: unknown claim record key: %s\n' "$key" >&2
         return 1
@@ -383,10 +418,28 @@ claim_record_read() {  # <file>
     0|1) ;;
     *) printf 'fm-gate: files_changed_exhaustive must be 0 or 1, got "%s"\n' "$exhaustive" >&2; return 1 ;;
   esac
+  # Both counts are optional, but a present one must be a plain non-negative
+  # integer: a count that cannot be compared is refused rather than dropped.
+  for value in "$tests_run" "$tests_passed"; do
+    case "$value" in
+      ''|*[!0-9]*)
+        [ -z "$value" ] || {
+          printf 'fm-gate: tests_run and tests_passed must be non-negative integers, got "%s"\n' "$value" >&2
+          return 1
+        }
+        ;;
+    esac
+  done
+  if [ -n "$tests_run" ] && [ -n "$tests_passed" ] && [ "$tests_passed" -gt "$tests_run" ]; then
+    printf 'fm-gate: tests_passed (%s) exceeds tests_run (%s)\n' "$tests_passed" "$tests_run" >&2
+    return 1
+  fi
   CLAIM_SOURCE=$source
   CLAIM_CONFIDENCE=$confidence
   CLAIM_EXHAUSTIVE=$exhaustive
   CLAIM_TESTS_COMMAND=$tests
+  CLAIM_TESTS_RUN=$tests_run
+  CLAIM_TESTS_PASSED=$tests_passed
   LC_ALL=C sort -u "$CLAIMED_FILES" -o "$CLAIMED_FILES"
 }
 
@@ -450,6 +503,17 @@ claims_from_file() {
   claim_record_read "$CLAIMS_FILE" || exit 2
 }
 
+# The typed terminal envelope, when the crewmate left one that satisfies its
+# contract. A present-but-invalid envelope is deliberately NOT used as a claim
+# source: the envelope_valid gate reports it, and resolution falls through to
+# status prose so the rest of the report still says something useful.
+claims_from_envelope() {
+  local record="$TMP_ROOT/envelope-claims"
+  [ "$ENVELOPE_PRESENT" -eq 1 ] && [ "$ENVELOPE_STATUS" -eq 0 ] || return 1
+  fm_envelope_claim_record "$ENVELOPE" > "$record" || return 1
+  claim_record_read "$record" || exit 2
+}
+
 claims_from_status() {
   local record="$TMP_ROOT/status-claims" work="$TMP_ROOT/status-work" line token
   [ -f "$STATUS_LOG" ] || return 1
@@ -486,10 +550,11 @@ claims_from_status() {
   claim_record_read "$record" || exit 2
 }
 
-# Claim sources in precedence order. The typed crew envelope lands as one more
-# resolver here; the gates below never learn where a claim came from.
+# Claim sources in precedence order; the gates below never learn where a claim
+# came from.
 claims_resolve() {
   claims_from_file && return 0
+  claims_from_envelope && return 0
   claims_from_status && return 0
   return 1
 }
@@ -516,6 +581,34 @@ fi
 if [ "$BASE_OK" -eq 1 ]; then
   printf 'base: %s (%s)\n' "$BASE" "$BASE_WHY"
 fi
+
+# --- gate: envelope_valid ---------------------------------------------------
+
+gate_envelope_valid() {
+  local summary
+  if [ "$ENVELOPE_PRESENT" -ne 1 ]; then
+    gate_result envelope_valid N/A \
+      "no envelope at $ENVELOPE; the typed terminal envelope is optional"
+    return
+  fi
+  case "$ENVELOPE_STATUS" in
+    0)
+      summary=$(fm_envelope_summary "$ENVELOPE" 2>/dev/null || true)
+      if [ -n "$summary" ]; then
+        gate_result envelope_valid PASS "$ENVELOPE" "$summary"
+      else
+        gate_result envelope_valid PASS "$ENVELOPE"
+      fi
+      ;;
+    2)
+      gate_result envelope_valid CANNOT-RUN "$ENVELOPE" "$ENVELOPE_WHY"
+      ;;
+    *)
+      gate_result envelope_valid FAIL "$ENVELOPE" "$ENVELOPE_WHY" \
+        "the envelope's contract is stated in this task's brief"
+      ;;
+  esac
+}
 
 # --- gate: diff_matches_claims ----------------------------------------------
 
@@ -644,6 +737,26 @@ gate_artifacts_exist() {
 gate_tests_pass() {
   local out rc=0
   if [ "$CLAIMS_OK" -ne 1 ] || [ -z "$CLAIM_TESTS_COMMAND" ]; then
+    # No re-runnable command. Self-reported counts cannot stand in for one, but
+    # they are still a claim, so an internally inconsistent pair is reported
+    # rather than passed over. A consistent pair is explicitly UNVERIFIED.
+    if [ -n "$CLAIM_TESTS_RUN" ] && [ -n "$CLAIM_TESTS_PASSED" ]; then
+      if [ "$CLAIM_TESTS_PASSED" -lt "$CLAIM_TESTS_RUN" ]; then
+        gate_result tests_pass FAIL \
+          "claim source '$CLAIM_SOURCE' reports only $CLAIM_TESTS_PASSED of $CLAIM_TESTS_RUN tests passing" \
+          "a terminal record should not declare failing tests; check the task before accepting it"
+        return
+      fi
+      if [ "$CLAIM_TESTS_RUN" -eq 0 ]; then
+        gate_result tests_pass SKIP \
+          "claim source '$CLAIM_SOURCE' reports that no tests were run"
+        return
+      fi
+      gate_result tests_pass SKIP \
+        "claim source '$CLAIM_SOURCE' reports $CLAIM_TESTS_PASSED of $CLAIM_TESTS_RUN tests passing" \
+        "unverified: the record carries no re-runnable tests_command, and this gate never guesses one"
+      return
+    fi
     gate_result tests_pass SKIP \
       "the task declares no tests_command, and this gate never guesses one"
     return
@@ -670,6 +783,7 @@ gate_tests_pass() {
     "$(printf '%s\n' "$out" | tail -20 | sed 's/^/  /')"
 }
 
+gate_envelope_valid
 gate_diff_matches_claims
 gate_artifacts_exist
 gate_tests_pass

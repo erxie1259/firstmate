@@ -579,6 +579,89 @@ test_local_only_fork_remote_allows() {
   pass "local-only worktree with HEAD on a fork remote is torn down (fix holds)"
 }
 
+# The typed terminal envelope at data/<id>/envelope.json. Teardown reports on a
+# present one and is ADVISORY about it: the work has usually landed by now, so a
+# note about the record must never become a reason to refuse cleanup, and a task
+# that never wrote one must tear down exactly as it always did.
+run_teardown_with_data() {  # <case-dir> [args...]
+  local case_dir=$1; shift
+  FM_ROOT_OVERRIDE="$ROOT" \
+  FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_DATA_OVERRIDE="$case_dir/data" \
+  FM_CONFIG_OVERRIDE="$case_dir/config" \
+  PATH="$case_dir/fakebin:${FM_TEARDOWN_TEST_PATH:-$PATH}" \
+    "$TEARDOWN" task-x1 "$@"
+}
+
+write_task_envelope() {  # <case-dir> <json>
+  mkdir -p "$1/data/task-x1"
+  printf '%s\n' "$2" > "$1/data/task-x1/envelope.json"
+}
+
+test_teardown_reports_a_valid_envelope_without_gating_on_it() {
+  local case_dir rc
+  case_dir=$(make_case envelope-valid)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+  write_task_envelope "$case_dir" \
+    '{"files_changed":["bin/thing.sh"],"tests_run":3,"tests_passed":3,"claims":["fixed it"],"acceptance_criteria_met":["ac1"],"open_questions":[]}'
+
+  set +e
+  run_teardown_with_data "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "envelope-valid: a valid envelope must not change teardown's outcome"
+  grep -q 'ENVELOPE: task-x1 declares' "$case_dir/stdout" \
+    || fail "envelope-valid: teardown did not report the envelope: $(cat "$case_dir/stdout")"
+  grep -q '1 file(s) claimed, 3/3 tests passing' "$case_dir/stdout" \
+    || fail "envelope-valid: the note did not summarize the record: $(cat "$case_dir/stdout")"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "envelope-valid: teardown printed a REFUSED line"
+  pass "teardown reports a valid terminal envelope and still tears the task down"
+}
+
+test_teardown_notes_a_broken_envelope_but_never_refuses() {
+  local case_dir rc
+  case_dir=$(make_case envelope-broken)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+  write_task_envelope "$case_dir" '{"files_changed": ['
+
+  set +e
+  run_teardown_with_data "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "envelope-broken: an unusable envelope must not block cleanup of landed work"
+  grep -q 'unusable envelope' "$case_dir/stderr" \
+    || fail "envelope-broken: teardown did not surface the broken record: $(cat "$case_dir/stderr")"
+  grep -q 'not a reason to refuse\|note about the record' "$case_dir/stderr" \
+    || fail "envelope-broken: the note did not say cleanup continues: $(cat "$case_dir/stderr")"
+  ! grep -q REFUSED "$case_dir/stderr" \
+    || fail "envelope-broken: a note about the record must never become a refusal"
+  pass "teardown notes an unusable envelope without ever turning it into a refusal"
+}
+
+test_teardown_without_an_envelope_is_unchanged() {
+  local case_dir rc
+  case_dir=$(make_case envelope-absent)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+
+  set +e
+  run_teardown_with_data "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "envelope-absent: teardown must succeed exactly as before"
+  ! grep -q 'ENVELOPE:' "$case_dir/stdout" "$case_dir/stderr" \
+    || fail "envelope-absent: teardown said something about an envelope that does not exist"
+  pass "teardown of a task with no envelope is byte-for-byte the behavior it always had"
+}
+
 test_teardown_prompts_tasks_axi_done_when_compatible() {
   local case_dir out
   case_dir=$(make_case tasks-axi-reminder)
@@ -2476,6 +2559,9 @@ EOF
 }
 
 test_local_only_fork_remote_allows
+test_teardown_reports_a_valid_envelope_without_gating_on_it
+test_teardown_notes_a_broken_envelope_but_never_refuses
+test_teardown_without_an_envelope_is_unchanged
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
 test_local_only_truly_unpushed_refuses

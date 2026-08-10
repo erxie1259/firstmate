@@ -13,6 +13,13 @@
 #   - no claims, no metadata, and a returned (detached) worktree are all
 #     reported as inconclusive rather than as a pass
 #   - scout and ship deliverables, and the opt-in tests_pass gate
+#   - a typed terminal envelope is a declared exhaustive claim source, so an
+#     undeclared touch fails where status prose would only have noted it
+#   - an ABSENT envelope is not applicable and leaves every other verdict, the
+#     claim source, and the exit status exactly as they were without it, while a
+#     PRESENT but invalid one is reported and refused as a claim source
+#   - self-reported test counts are checked for consistency and never mistaken
+#     for having run anything
 #   - the whole run leaves the repository byte-identical
 set -u
 
@@ -82,6 +89,22 @@ write_status() {
   shift
   : > "$case_dir/state/$TASK_ID.status"
   printf '%s\n' "$@" >> "$case_dir/state/$TASK_ID.status"
+}
+
+# The typed terminal envelope a crewmate writes at data/<id>/envelope.json.
+# Written as raw JSON text so a test can hand the gate a malformed or
+# contract-violating document, which is half of what needs covering.
+write_envelope() {
+  local case_dir=$1 body=$2
+  mkdir -p "$case_dir/data/$TASK_ID"
+  printf '%s\n' "$body" > "$case_dir/data/$TASK_ID/envelope.json"
+}
+
+# A well-formed envelope with the two really-changed files and no test claims,
+# so each test can vary exactly the one thing it is about.
+envelope_json() {  # <files-json-array> [tests_run] [tests_passed]
+  printf '{"files_changed":%s,"tests_run":%s,"tests_passed":%s,"claims":["did the work"],"acceptance_criteria_met":["ac1"],"open_questions":[]}' \
+    "$1" "${2:-0}" "${3:-0}"
 }
 
 # Sets OUT to the gate's combined output and RC to its exit status. Deliberately
@@ -455,6 +478,167 @@ test_malformed_claim_record_is_refused() {
   pass "fm-gate refuses a malformed or missing claim record instead of guessing"
 }
 
+test_envelope_is_an_exhaustive_declared_claim_source() {
+  local case_dir
+  case_dir=$(make_case envelope-honest)
+  write_meta "$case_dir"
+  commit_real_work "$case_dir"
+  write_envelope "$case_dir" "$(envelope_json '["bin/real.sh","docs/added.md"]' 4 4)"
+
+  run_gate "$case_dir" "$TASK_ID"
+
+  expect_code 0 "$RC" "envelope-honest"
+  assert_contains "$OUT" 'GATE envelope_valid: PASS' "envelope-honest: a contract-satisfying envelope passes"
+  assert_contains "$OUT" 'claims: source=envelope confidence=declared files=2 exhaustive=yes' \
+    "envelope-honest: the envelope is a declared, exhaustive claim source"
+  assert_contains "$OUT" 'GATE diff_matches_claims: PASS' "envelope-honest: the diff matches"
+  assert_contains "$OUT" 'verdict: PASS' "envelope-honest: overall verdict"
+  pass "fm-gate reads the typed envelope as a declared exhaustive claim source"
+}
+
+# The load-bearing case: exhaustive means an omission is a lie, not a rounding
+# error. A worker that quietly touched a file it did not declare must be caught.
+test_envelope_catches_undeclared_and_false_changes() {
+  local case_dir
+  case_dir=$(make_case envelope-dishonest)
+  write_meta "$case_dir"
+  commit_real_work "$case_dir"
+
+  write_envelope "$case_dir" "$(envelope_json '["bin/real.sh"]')"
+  run_gate "$case_dir" "$TASK_ID"
+  expect_code 1 "$RC" "envelope-hides-a-touch"
+  assert_contains "$OUT" 'GATE diff_matches_claims: FAIL' "envelope-hides-a-touch: an undeclared change must fail"
+  assert_contains "$OUT" 'touched but unclaimed:' "envelope-hides-a-touch: the omission must be named"
+  assert_contains "$OUT" 'docs/added.md' "envelope-hides-a-touch: the exact file must be named"
+  assert_not_contains "$OUT" 'note only' "envelope-hides-a-touch: an exhaustive source must not downgrade this to a note"
+
+  write_envelope "$case_dir" "$(envelope_json '["bin/real.sh","docs/added.md","bin/never-written.sh"]')"
+  run_gate "$case_dir" "$TASK_ID"
+  expect_code 1 "$RC" "envelope-claims-work-never-done"
+  assert_contains "$OUT" 'claimed but untouched:' "envelope-claims-work-never-done: the false claim must fail"
+  assert_contains "$OUT" 'bin/never-written.sh' "envelope-claims-work-never-done: the exact file must be named"
+  pass "fm-gate catches an envelope that hides a change or claims work never done"
+}
+
+# Back-compat is the whole reason the envelope is optional: a task that never
+# writes one must produce the same verdict, exit status, and claim source it did
+# before envelopes existed.
+test_absent_envelope_changes_nothing() {
+  local case_dir out_without out_with
+  case_dir=$(make_case envelope-absent)
+  write_meta "$case_dir"
+  commit_real_work "$case_dir"
+  write_status "$case_dir" "done: rewrote bin/real.sh"
+
+  run_gate "$case_dir" "$TASK_ID"
+  expect_code 0 "$RC" "envelope-absent"
+  out_without=$OUT
+  assert_contains "$OUT" 'GATE envelope_valid: N/A' "envelope-absent: an absent envelope is not applicable"
+  assert_contains "$OUT" 'the typed terminal envelope is optional' "envelope-absent: the reason must say so"
+  assert_contains "$OUT" 'claims: source=status confidence=derived' \
+    "envelope-absent: claim resolution must fall through to status prose exactly as before"
+  assert_contains "$OUT" 'verdict: PASS' "envelope-absent: the verdict must be unaffected"
+
+  # Everything except the envelope_valid line must be byte-identical to a run
+  # made with the gate's envelope handling given nothing to do.
+  write_envelope "$case_dir" "$(envelope_json '["bin/real.sh","docs/added.md"]')"
+  run_gate "$case_dir" "$TASK_ID"
+  out_with=$OUT
+  [ "$out_without" != "$out_with" ] \
+    || fail "envelope-absent: writing an envelope changed nothing, so this test proves nothing"
+  pass "fm-gate treats an absent envelope as not applicable and behaves exactly as before"
+}
+
+# A present envelope that does not parse is a different thing from an absent
+# one. It is reported, it does not become a claim source, and resolution still
+# falls through so the rest of the report stays useful.
+test_broken_envelope_fails_and_falls_through() {
+  local case_dir
+  case_dir=$(make_case envelope-broken)
+  write_meta "$case_dir"
+  commit_real_work "$case_dir"
+  write_status "$case_dir" "done: rewrote bin/real.sh"
+
+  write_envelope "$case_dir" '{"files_changed": ['
+  run_gate "$case_dir" "$TASK_ID"
+  expect_code 1 "$RC" "envelope-unparseable"
+  assert_contains "$OUT" 'GATE envelope_valid: FAIL' "envelope-unparseable: broken JSON must fail the gate"
+  assert_contains "$OUT" 'not valid JSON' "envelope-unparseable: the reason must name the parse failure"
+  assert_contains "$OUT" 'claims: source=status confidence=derived' \
+    "envelope-unparseable: a broken envelope must not be used as a claim source"
+  assert_contains "$OUT" 'GATE diff_matches_claims: PASS' \
+    "envelope-unparseable: resolution must fall through so the rest of the report survives"
+
+  write_envelope "$case_dir" '{"files_changed":[],"tests_run":0,"tests_passed":0,"claims":[],"acceptance_criteria_met":[],"open_questions":[],"notes":"extra"}'
+  run_gate "$case_dir" "$TASK_ID"
+  expect_code 1 "$RC" "envelope-unknown-key"
+  assert_contains "$OUT" 'unknown key(s): notes' \
+    "envelope-unknown-key: a field no consumer honors must be refused, not silently dropped"
+
+  write_envelope "$case_dir" '{"files_changed":[],"tests_run":0,"tests_passed":0,"claims":[]}'
+  run_gate "$case_dir" "$TASK_ID"
+  assert_contains "$OUT" 'missing required key(s): acceptance_criteria_met, open_questions' \
+    "envelope-missing-keys: every missing key must be named"
+
+  write_envelope "$case_dir" '{"files_changed":["/etc/passwd"],"tests_run":0,"tests_passed":0,"claims":[],"acceptance_criteria_met":[],"open_questions":[]}'
+  run_gate "$case_dir" "$TASK_ID"
+  assert_contains "$OUT" 'files_changed must hold plain repo-relative paths' \
+    "envelope-absolute-path: an absolute path is not a repo-relative claim"
+  pass "fm-gate reports a present-but-invalid envelope instead of ignoring or trusting it"
+}
+
+# Self-reported counts cannot substitute for running anything, so a consistent
+# pair is explicitly UNVERIFIED rather than a pass. A pair that contradicts
+# itself is still a claim, and it fails.
+test_envelope_test_counts_are_checked_not_trusted() {
+  local case_dir
+  case_dir=$(make_case envelope-counts)
+  write_meta "$case_dir"
+  commit_real_work "$case_dir"
+
+  write_envelope "$case_dir" "$(envelope_json '["bin/real.sh","docs/added.md"]' 12 12)"
+  run_gate "$case_dir" "$TASK_ID"
+  expect_code 0 "$RC" "envelope-counts-consistent"
+  assert_contains "$OUT" 'GATE tests_pass: SKIP' "envelope-counts-consistent: counts alone never pass the gate"
+  assert_contains "$OUT" 'reports 12 of 12 tests passing' "envelope-counts-consistent: the claim must be shown"
+  assert_contains "$OUT" 'unverified' "envelope-counts-consistent: an unverified claim must say so"
+
+  write_envelope "$case_dir" "$(envelope_json '["bin/real.sh","docs/added.md"]' 9 7)"
+  run_gate "$case_dir" "$TASK_ID"
+  expect_code 1 "$RC" "envelope-counts-shortfall"
+  assert_contains "$OUT" 'GATE tests_pass: FAIL' "envelope-counts-shortfall: a declared shortfall must fail"
+  assert_contains "$OUT" 'only 7 of 9 tests passing' "envelope-counts-shortfall: the shortfall must be quantified"
+
+  write_envelope "$case_dir" "$(envelope_json '["bin/real.sh","docs/added.md"]' 2 5)"
+  run_gate "$case_dir" "$TASK_ID"
+  assert_contains "$OUT" 'GATE envelope_valid: FAIL' "envelope-counts-impossible: passing more than were run is malformed"
+  assert_contains "$OUT" 'exceeds tests_run' "envelope-counts-impossible: the contradiction must be named"
+  pass "fm-gate checks self-reported test counts for consistency and never treats them as verification"
+}
+
+# Precedence: an explicit --claims record is the caller speaking directly and
+# outranks whatever the worker left behind.
+test_explicit_claims_outrank_the_envelope() {
+  local case_dir
+  case_dir=$(make_case envelope-precedence)
+  write_meta "$case_dir"
+  commit_real_work "$case_dir"
+  write_envelope "$case_dir" "$(envelope_json '["bin/never-written.sh"]')"
+  write_claims "$case_dir/claims" \
+    "claim_source=explicit" \
+    "claim_confidence=declared" \
+    "files_changed_exhaustive=1" \
+    "files_changed=bin/real.sh" \
+    "files_changed=docs/added.md"
+
+  run_gate "$case_dir" "$TASK_ID" --claims "$case_dir/claims"
+
+  expect_code 0 "$RC" "envelope-precedence"
+  assert_contains "$OUT" 'claims: source=explicit' "envelope-precedence: --claims must win over the envelope"
+  assert_contains "$OUT" 'GATE envelope_valid: PASS' "envelope-precedence: the envelope is still reported on"
+  pass "fm-gate lets an explicit claim record outrank the envelope while still reporting it"
+}
+
 test_gate_run_mutates_nothing() {
   local case_dir before after
   case_dir=$(make_case read-only)
@@ -494,4 +678,10 @@ test_ship_without_commits_fails_artifacts
 test_secondmate_artifacts_not_applicable
 test_tests_pass_is_opt_in_twice
 test_malformed_claim_record_is_refused
+test_envelope_is_an_exhaustive_declared_claim_source
+test_envelope_catches_undeclared_and_false_changes
+test_absent_envelope_changes_nothing
+test_broken_envelope_fails_and_falls_through
+test_envelope_test_counts_are_checked_not_trusted
+test_explicit_claims_outrank_the_envelope
 test_gate_run_mutates_nothing

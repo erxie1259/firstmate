@@ -688,6 +688,93 @@ test_scout_and_secondmate_load_decision_hold_policy() {
   pass "fm-brief.sh: investigation and visual-review completions load the shared decision policy"
 }
 
+# The typed terminal envelope. fm-brief.sh is the SINGLE owner of that contract
+# (AGENTS.md section 1's one-owner rule), so the schema has to reach every ship
+# and scout brief from here, and a persistent secondmate - which has no terminal
+# state - must not be given one.
+test_terminal_envelope_contract_reaches_ship_and_scout() {
+  local home brief mode
+  home="$TMP_ROOT/envelope-home"
+  mkdir -p "$home/data"
+
+  for mode in no-mistakes direct-PR local-only; do
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+      "$ROOT/bin/fm-brief.sh" "envelope-ship-$mode" alpha --mode "$mode" >/dev/null 2>&1 \
+      || fail "fm-brief.sh --mode $mode exited non-zero"
+    brief="$home/data/envelope-ship-$mode/brief.md"
+    assert_grep "# Terminal envelope" "$brief" \
+      "ship brief (mode=$mode) carries no terminal-envelope section"
+    assert_grep "$home/data/envelope-ship-$mode/envelope.json" "$brief" \
+      "ship brief (mode=$mode) does not name the envelope path the gates read"
+    assert_grep "does not replace the status protocol" "$brief" \
+      "ship brief (mode=$mode) must state that the envelope is additional, not a replacement"
+    assert_grep "must be EXHAUSTIVE" "$brief" \
+      "ship brief (mode=$mode) must state that files_changed is exhaustive, since that is what is enforced"
+  done
+
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-brief.sh" envelope-scout alpha --scout >/dev/null 2>&1 \
+    || fail "fm-brief.sh scout scaffold exited non-zero"
+  brief="$home/data/envelope-scout/brief.md"
+  assert_grep "# Terminal envelope" "$brief" "scout brief carries no terminal-envelope section"
+  assert_grep "worktree is scratch" "$brief" \
+    "scout brief must say why files_changed is normally empty for a scout"
+
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_SECONDMATE_CHARTER='sample domain' \
+    "$ROOT/bin/fm-brief.sh" envelope-mate --secondmate --no-projects >/dev/null 2>&1 \
+    || fail "fm-brief.sh secondmate scaffold exited non-zero"
+  brief="$home/data/envelope-mate/brief.md"
+  assert_no_grep "Terminal envelope" "$brief" \
+    "a persistent secondmate has no terminal state and must not be given an envelope contract"
+  pass "fm-brief.sh: the terminal-envelope contract reaches ship and scout briefs but not charters"
+}
+
+# Drift guard across the one-owner boundary. The scaffold states the schema and
+# bin/fm-envelope-lib.sh enforces it for the gates and for teardown. Those are
+# two files, so they can disagree - and if they ever do, a crewmate that follows
+# its brief exactly would be told it wrote an invalid envelope. This feeds the
+# brief's OWN published example straight into the real enforcer, so the two
+# sides are pinned to the same key set through behavior rather than by matching
+# source text.
+test_terminal_envelope_example_satisfies_the_enforcer() {
+  local home brief example why rc=0
+  home="$TMP_ROOT/envelope-drift-home"
+  mkdir -p "$home/data"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-brief.sh" envelope-drift alpha --mode no-mistakes >/dev/null 2>&1 \
+    || fail "fm-brief.sh exited non-zero"
+  brief="$home/data/envelope-drift/brief.md"
+
+  example="$TMP_ROOT/envelope-example.json"
+  awk '/^```json$/ { capture = 1; next } /^```$/ { capture = 0 } capture' "$brief" > "$example"
+  [ -s "$example" ] \
+    || fail "the ship brief publishes no JSON envelope example, so a crewmate has no schema to follow"
+
+  # shellcheck source=bin/fm-envelope-lib.sh
+  . "$ROOT/bin/fm-envelope-lib.sh"
+  why=$(fm_envelope_validate "$example") || rc=$?
+  [ "$rc" -eq 0 ] \
+    || fail "the envelope example in the generated brief is rejected by bin/fm-envelope-lib.sh: $why"
+
+  # And the same enforcer must refuse what the brief forbids, so "no others" is
+  # a real constraint rather than advice.
+  python3 - "$example" "$TMP_ROOT/envelope-extra.json" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+doc["extra_key"] = "not in the contract"
+json.dump(doc, open(sys.argv[2], "w"))
+PY
+  rc=0
+  why=$(fm_envelope_validate "$TMP_ROOT/envelope-extra.json") || rc=$?
+  [ "$rc" -eq 1 ] \
+    || fail "an envelope with a key the brief forbids was accepted (rc=$rc)"
+  case "$why" in
+    *extra_key*) ;;
+    *) fail "the refusal did not name the offending key: $why" ;;
+  esac
+  pass "fm-brief.sh: the published envelope example is exactly what bin/fm-envelope-lib.sh accepts"
+}
+
 # Scout and secondmate paths still scaffold well-formed briefs.
 test_scout_and_secondmate_scaffold() {
   local brief
@@ -727,4 +814,6 @@ test_secondmate_marked_request_reporting_contract
 test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
+test_terminal_envelope_contract_reaches_ship_and_scout
+test_terminal_envelope_example_satisfies_the_enforcer
 test_scout_and_secondmate_scaffold

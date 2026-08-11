@@ -2,7 +2,7 @@
 name: bot-review-triage
 description: >-
   Agent-only procedure for triaging automated reviewer-bot comments on task PRs, such as coderabbitai.
-  Use when a PR wake, heartbeat review, or pre-merge check shows unresolved bot review comments, and always before merging a PR that carries any.
+  Use on any PR wake, heartbeat review, or pre-merge check, and always before merging, to check for unresolved bot review comments.
   Owns validity triage, fix routing through the task's delivery path, dismissal recording, and the untriaged-comment merge boundary.
 user-invocable: false
 metadata:

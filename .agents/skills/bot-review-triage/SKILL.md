@@ -39,6 +39,8 @@ This skill is the single owner of how the fleet triages those comments and route
 
 ## Merge boundary
 
+- Re-check the PR's comments and reviews immediately before any merge.
 - Never merge a PR carrying an untriaged bot comment.
+- When the bot has not reviewed the PR, the reason decides the wait: a posted rate-limit or unavailability notice from the bot means the merge proceeds without waiting for its review, while an absent review with no such notice means look for the bot's review and triage it before merging.
 - A valid unfixed finding blocks the merge unless the captain explicitly accepts it.
 - Routine triage is autonomous under the project's standing posture; batch what happened - suggestions fixed, noise dismissed - into the task's outcome summary instead of escalating each comment.

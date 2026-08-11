@@ -20,8 +20,8 @@ They apply to checks the fleet ships into project repos and to firstmate's own t
 A new check starts non-blocking and earns the right to block.
 
 - Introduce every new gate in report-only mode: it runs, reports its findings, and cannot fail the pipeline or block a merge.
-- Establish a baseline over an agreed observation window of real runs before any promotion, and measure the false-positive rate against that baseline.
-- Promote a check to blocking only through an explicit reviewed change after the owner accepts the observed noise level, never as a default and never silently.
+- Establish a baseline over an agreed observation window of real runs before any promotion, recording passed, failed, and incomplete outcomes separately so incomplete runs neither inflate the false-positive measurement nor escape it.
+- Promote a check to blocking only through an explicit reviewed change after the owner accepts both the observed false-positive rate and the observed incomplete rate, never as a default and never silently; a check that frequently cannot complete is not ready to block.
 - A blocking check must tell the developer what failed, why, and what to do next; never block on a result the affected developer cannot self-serve diagnose.
 
 **Why:** an unvetted blocking gate gets bypassed or disabled at its first false positive, and a disabled gate protects nothing while still costing maintenance.
@@ -34,6 +34,6 @@ Every check has three distinct outcomes: it ran and passed, it ran and failed, o
 - A check that could not complete - missing tool, missing input, unavailable service, timeout, authentication failure - must report that loudly and name the concrete missing requirement.
 - It must never exit successfully, because a silent skip converts a broken checker into a green light.
 - It must also never present itself as an ordinary failure of the checked code, because that misdirects debugging toward code that was never actually examined.
-- Give the incomplete outcome its own distinct exit code or status wherever the surface allows, and make downstream consumers treat it as "unknown", never as "clean".
+- Give the incomplete outcome its own distinct exit code or status wherever the surface allows; on a surface that only offers pass or fail, report incomplete on the failing side with an explicit machine-readable incomplete marker in the output, so downstream consumers read it as "unknown", never as "clean".
 
-**Why:** the most dangerous state for a check is not failing noisily but passing vacuously; a check that cannot run must be indistinguishable from a check that was never trusted, not from a check that succeeded.
+**Why:** the most dangerous state for a check is not failing noisily but passing vacuously; a result that never actually examined anything must never be treated as clean.

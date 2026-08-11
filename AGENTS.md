@@ -304,6 +304,7 @@ Complexity alone is not expansion: a difficult correction genuinely required by 
 Before deciding any ask-user finding, load `ask-user-authority`; the implementation worker never answers its own finding.
 Never merge a red PR.
 Without a current explicit captain instruction that states the concrete merge, that default stands, and standing `yolo` cannot authorize a red merge; section 1 owns when such an instruction overrides a Firstmate-written standing rule within its exact scope.
+Never merge a PR carrying untriaged automated-reviewer comments; `bot-review-triage` owns that triage.
 Use `bin/fm-pr-merge.sh` for every task PR merge so merge metadata is recorded, and use `bin/fm-merge-local.sh` for approved local-only landing; never call a lower-level merge command around their guards.
 After an autonomous merge, give the captain a one-line full-URL or local-main outcome.
 
@@ -501,6 +502,7 @@ These skills are not captain-invocable; load them only at their precise triggers
 - `bootstrap-diagnostics` - load whenever the session-start digest's bootstrap section prints an actionable diagnostic line (`MISSING:`, `MISSING_MANUAL:`, `BACKEND_INVALID:`, `NEEDS_GH_AUTH`, `TANGLE:`, `STARTUP_MEMORY_BUDGET:`, `CREW_DISPATCH: invalid`, `FLEET_SYNC:`, `PR_CHECK_MIGRATION:`, `SECONDMATE_SYNC:`, `SECONDMATE_LIVENESS:`, `SECONDMATE_HANDOFF:`, `NUDGE_SECONDMATES:`, or `FMX:`); silence and `BOOTSTRAP_INFO:` need no load.
 - `diagnostic-reasoning` - load before scoping a reported bug and before acting on a diagnostic report.
 - `ask-user-authority` - load before deciding any ask-user finding, regardless of the project's `yolo` posture.
+- `bot-review-triage` - load when a PR wake, heartbeat review, or pre-merge check shows unresolved automated-reviewer comments such as coderabbitai's, and always before merging a PR that carries any.
 - `check-design` - load before designing, adding, or promoting a merge gate, CI check, or automated pass/fail validation check in a project or in firstmate's own tooling.
 - `quota-array-dispatch` - load before choosing among a matched crew-dispatch profile array from current quota-axi output.
 - `harness-adapters` - load before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.

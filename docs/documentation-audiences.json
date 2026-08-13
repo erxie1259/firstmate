@@ -209,6 +209,14 @@
       "audience": "public-product"
     },
     {
+      "path": "VISION.md",
+      "audience": "public-product"
+    },
+    {
+      "path": "docs/agent-control.md",
+      "audience": "maintainer-architecture"
+    },
+    {
       "path": "docs/architecture.md",
       "audience": "maintainer-architecture"
     },
@@ -301,6 +309,10 @@
       "audience": "agent-runtime"
     },
     {
+      "path": "docs/supervision-protocols/cursor.md",
+      "audience": "agent-runtime"
+    },
+    {
       "path": "docs/supervision-protocols/grok.md",
       "audience": "agent-runtime"
     },
@@ -330,6 +342,10 @@
     },
     {
       "path": "docs/verification/dispatch-auth.md",
+      "audience": "maintainer-verification"
+    },
+    {
+      "path": "docs/verification/muse.md",
       "audience": "maintainer-verification"
     },
     {

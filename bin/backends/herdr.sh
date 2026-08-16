@@ -3135,8 +3135,12 @@ fm_backend_herdr_events_capable() {  # <session>
   case "$protocol" in ''|*[!0-9]*) return 1 ;; esac
   [ "$protocol" -ge "$FM_BACKEND_HERDR_MIN_EVENTS_PROTOCOL" ] || return 1
   schema=$(herdr api schema --json 2>/dev/null) || return 1
-  printf '%s' "$schema" | grep -Fq 'events.subscribe' || return 1
-  printf '%s' "$schema" | grep -Fq 'pane.agent_status_changed' || return 1
+  # In-memory fixed-string substring tests, deliberately NOT `printf | grep -Fq`:
+  # grep exits on first match and closes the pipe while the printf builtin still
+  # has most of the ~220KB left to write, so every probe printed a spurious
+  # `printf: write error: Broken pipe` to stderr during ordinary watcher startup.
+  case "$schema" in *'events.subscribe'*) ;; *) return 1 ;; esac
+  case "$schema" in *'pane.agent_status_changed'*) ;; *) return 1 ;; esac
   return 0
 }
 

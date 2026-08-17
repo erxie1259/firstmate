@@ -359,6 +359,149 @@ test_lock_empty_pid_uses_minimum_grace() {
   pass "empty mid-acquire lock keeps a minimum grace"
 }
 
+# Records every owner-directory template the lock primitives ask mktemp for,
+# which is how a test observes exactly WHICH lock paths an acquire attempted -
+# including a nested "<lock>.steal.steal" the caller would never leave behind on
+# disk. FM_TEST_MKTEMP_REFUSE names one template prefix to refuse, simulating an
+# environmental create failure (no space, no write permission) on that one lock
+# path while every other path still works.
+# Templates carry the pwd -P resolved lock path (/private/var on macOS, /var
+# elsewhere), so callers match on the lock BASENAME rather than the full path.
+install_mktemp_probe() {  # <fakebin>
+  local fakebin=$1 real
+  real=$(command -v mktemp) || fail "no mktemp on PATH to wrap"
+  cat > "$fakebin/mktemp" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "\${FM_TEST_MKTEMP_LOG:-/dev/null}"
+case "\$*" in
+  *"\${FM_TEST_MKTEMP_REFUSE:-__no_such_refusal__}.owner."*) exit 1 ;;
+esac
+exec "$real" "\$@"
+SH
+  chmod +x "$fakebin/mktemp"
+}
+
+test_lock_steal_arbitration_never_recurses() {
+  local dir state fakebin lockdir dead log err out attempts nested lines
+  dir=$(make_case lock-steal-no-recursion)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  lockdir="$state/.contend.lock"
+  log="$dir/mktemp.log"
+  err="$dir/acquire.err"
+  install_mktemp_probe "$fakebin"
+  dead=$(dead_pid)
+  mkdir "$lockdir"
+  printf '%s\n' "$dead" > "$lockdir/pid"
+  : > "$log"
+  # A stale primary lock sends the acquire into steal arbitration, and the steal
+  # path alone cannot be created. Before the fix that was indistinguishable from
+  # contention (no pid to read, no live holder, no mid-acquire freshness), so the
+  # acquire arbitrated "<lock>.steal.steal", then ".steal.steal.steal", until the
+  # filesystem refused the name.
+  out=$(PATH="$fakebin:$PATH" FM_TEST_MKTEMP_LOG="$log" \
+    FM_TEST_MKTEMP_REFUSE=".contend.lock.steal" \
+    FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then rc=0; else rc=1; fi
+    printf "rc=%s\n" "$rc"
+  ' _ "$LIB" "$lockdir" 2> "$err")
+  case "$out" in
+    *"rc=1"*) ;;
+    *) fail "acquire reported success while the steal path could not be created: $out" ;;
+  esac
+  attempts=$(grep -c -F '.contend.lock.steal.owner.' "$log" || true)
+  [ "${attempts:-0}" -ge 1 ] \
+    || fail "acquire never reached steal arbitration, so the depth assertion is vacuous: $(cat "$log")"
+  nested=$(grep -c -F '.contend.lock.steal.steal' "$log" || true)
+  [ "${nested:-0}" -eq 0 ] \
+    || fail "steal arbitration recursed past one level ($nested nested attempts): $(cat "$log")"
+  [ -z "$(find "$state" -maxdepth 1 -name '.contend.lock.steal.steal*' 2>/dev/null)" ] \
+    || fail "steal arbitration created a nested lock path on disk"
+  lines=$(grep -c . "$err" || true)
+  [ "${lines:-0}" -eq 1 ] \
+    || fail "expected exactly one environmental failure line, got $lines: $(cat "$err")"
+  grep -F '.contend.lock.steal' "$err" >/dev/null \
+    || fail "failure line does not name the lock path that could not be created: $(cat "$err")"
+  pass "steal arbitration never recurses past one level"
+}
+
+test_lock_create_failure_is_loud_and_never_arbitrated() {
+  local dir state fakebin parent lockdir log err out lines steal
+  dir=$(make_case lock-create-failure)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  parent="$dir/unwritable"
+  log="$dir/mktemp.log"
+  err="$dir/acquire.err"
+  install_mktemp_probe "$fakebin"
+  mkdir -p "$parent"
+  chmod 0500 "$parent"
+  if : 2>/dev/null > "$parent/probe"; then
+    # This uid ignores directory permissions (root in a container). A parent that
+    # is not a directory at all refuses the same way for every uid.
+    rm -f "$parent/probe"
+    chmod 0700 "$parent"
+    : > "$dir/notadir"
+    parent="$dir/notadir"
+  fi
+  lockdir="$parent/.contend.lock"
+  : > "$log"
+  out=$(PATH="$fakebin:$PATH" FM_TEST_MKTEMP_LOG="$log" \
+    FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then rc1=0; else rc1=1; fi
+    if fm_lock_try_acquire "$2"; then rc2=0; else rc2=1; fi
+    printf "rc1=%s rc2=%s\n" "$rc1" "$rc2"
+  ' _ "$LIB" "$lockdir" 2> "$err")
+  case "$out" in
+    *"rc1=1 rc2=1"*) ;;
+    *) fail "acquire reported success against an unusable lock parent: $out" ;;
+  esac
+  steal=$(grep -c -F '.contend.lock.steal' "$log" || true)
+  [ "${steal:-0}" -eq 0 ] \
+    || fail "an environmental create failure fell through to steal arbitration: $(cat "$log")"
+  lines=$(grep -c . "$err" || true)
+  [ "${lines:-0}" -eq 1 ] \
+    || fail "expected one failure line across two acquires, got $lines: $(cat "$err")"
+  grep -F '.contend.lock' "$err" >/dev/null \
+    || fail "failure line does not name the unusable lock: $(cat "$err")"
+  chmod 0700 "$parent" 2>/dev/null || true
+  pass "an environmental create failure fails loudly once without arbitrating"
+}
+
+test_lock_stale_steal_mutex_is_reclaimed_without_nesting() {
+  local dir state fakebin lockdir dead log out newpid nested
+  dir=$(make_case lock-stale-steal-reclaim)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  lockdir="$state/.contend.lock"
+  log="$dir/mktemp.log"
+  install_mktemp_probe "$fakebin"
+  dead=$(dead_pid)
+  mkdir "$lockdir" "$lockdir.steal"
+  printf '%s\n' "$dead" > "$lockdir/pid"
+  printf '%s\n' "$dead" > "$lockdir.steal/pid"
+  : > "$log"
+  out=$(PATH="$fakebin:$PATH" FM_TEST_MKTEMP_LOG="$log" \
+    FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then rc=0; else rc=1; fi
+    printf "rc=%s pid=%s\n" "$rc" "$(cat "$2/pid" 2>/dev/null || true)"
+  ' _ "$LIB" "$lockdir")
+  case "$out" in
+    *"rc=0"*) ;;
+    *) fail "a stale steal mutex blocked the acquire instead of being reclaimed: $out" ;;
+  esac
+  newpid=${out#*pid=}; newpid=${newpid%% *}
+  [ -n "$newpid" ] || fail "reclaimed lock has no pid recorded: $out"
+  [ "$newpid" != "$dead" ] || fail "stale dead-pid lock was not replaced: $out"
+  nested=$(grep -c -F '.contend.lock.steal.steal' "$log" || true)
+  [ "${nested:-0}" -eq 0 ] \
+    || fail "reclaiming a stale steal mutex arbitrated a nested lock: $(cat "$log")"
+  pass "a stale steal mutex is reclaimed without nesting"
+}
+
 test_lock_late_claim_loses_after_recreate() {
   local dir state lockdir out
   dir=$(make_case lock-late-claim)
@@ -1112,6 +1255,9 @@ test_lock_stale_steal_single_winner_under_concurrency
 test_lock_live_steal_mutex_is_not_reclaimed
 test_lock_does_not_steal_live_lock
 test_lock_empty_pid_uses_minimum_grace
+test_lock_steal_arbitration_never_recurses
+test_lock_create_failure_is_loud_and_never_arbitrated
+test_lock_stale_steal_mutex_is_reclaimed_without_nesting
 test_lock_late_claim_loses_after_recreate
 test_lock_paused_mid_acquire_claim_fails_during_steal
 test_watch_restart_rejects_reused_pid

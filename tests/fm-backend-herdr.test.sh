@@ -4312,6 +4312,150 @@ test_wait_transition_clean_timeout_returns_1() {
   pass "fm_backend_herdr_wait_transition: stock macOS Bash clean timeout closes fd 9 and returns 1"
 }
 
+# make_herdr_schemafake: a `herdr` stub for the events-capability probe only. It
+# answers `status --json` at the events protocol floor and streams the file named
+# by $FM_FAKE_SCHEMA_FILE for `api schema --json`, so a test can drive the real
+# ~220KB payload shape through fm_backend_herdr_events_capable.
+make_herdr_schemafake() {  # <dir> -> echoes fakebin dir
+  local dir=$1 fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-} ${2:-}" in
+  "status --json") printf '{"client":{"version":"0.7.3","protocol":16},"server":{"running":true}}\n' ;;
+  "api schema") cat "${FM_FAKE_SCHEMA_FILE:-/dev/null}" ;;
+  *) : ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/herdr"
+  printf '%s\n' "$fb"
+}
+
+# write_herdr_schema: a schema payload the size of the real one (~220KB), with
+# the caller's tokens FIRST so a match lands early and the rest of the payload is
+# still unwritten - exactly the shape that made the old `printf | grep -Fq` probe
+# take EPIPE and print "printf: write error: Broken pipe" to stderr.
+write_herdr_schema() {  # <path> <token>...
+  local path=$1 t
+  shift
+  { printf '{"methods":['
+    for t in "$@"; do printf '{"name":"%s"},' "$t"; done
+    printf '{"name":"pad","doc":"'
+    head -c 220000 /dev/zero | tr '\0' 'x'
+    printf '"}]}\n'
+  } > "$path"
+}
+
+# events_capable_probe: run the capability gate against <schema-file> under the
+# schema fake, echoing "<rc>|<stderr>". An empty <force> leaves the override
+# unset, exactly like an unconfigured home. FM_BACKEND_HERDR_EVENT_READER is set
+# so the verdict does not depend on python3 being installed on the test host.
+events_capable_probe() {  # <dir> <schema-file> [force] -> "<rc>|<stderr>"
+  local dir=$1 schema=$2 force=${3:-} fb err rc
+  fb=$(make_herdr_schemafake "$dir")
+  err="$dir/stderr"
+  PATH="$fb:$PATH" FM_FAKE_SCHEMA_FILE="$schema" FM_BACKEND_HERDR_EVENT_READER=/nonexistent-reader \
+    FM_BACKEND_HERDR_EVENTS_FORCE="$force" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_events_capable sess' "$ROOT" \
+    >/dev/null 2>"$err"
+  rc=$?
+  printf '%s|%s\n' "$rc" "$(cat "$err")"
+}
+
+test_events_capable_full_schema_is_silent() {
+  local dir schema result rc err
+  dir="$TMP_ROOT/cap-full"; mkdir -p "$dir"
+  schema="$dir/schema.json"
+  write_herdr_schema "$schema" events.subscribe pane.agent_status_changed
+  result=$(events_capable_probe "$dir" "$schema")
+  rc=${result%%|*}; err=${result#*|}
+  [ "$rc" = 0 ] || fail "a schema carrying both capability tokens must return 0 (capable), got $rc"
+  [ -z "$err" ] || fail "the capability probe must write nothing to stderr on a ~220KB schema, got '$err'"
+  pass "fm_backend_herdr_events_capable: a full ~220KB schema is capable and writes no stderr"
+}
+
+# make_shortcircuit_grep: a `grep` that matches and exits IMMEDIATELY without
+# draining stdin, like GNU grep and ugrep do under -q (macOS /usr/bin/grep reads
+# its whole input, so the hostile case below cannot be staged with the host's own
+# grep). Paired with an ignored SIGPIPE - which is what a watcher armed from a
+# Node-based harness inherits - this is the exact pair of conditions that made a
+# `printf | grep -Fq` probe of the ~220KB schema print a write error.
+make_shortcircuit_grep() {  # <dir> -> echoes bin dir
+  local dir=$1 gb="$1/grepbin"
+  mkdir -p "$gb"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$gb/grep"
+  chmod +x "$gb/grep"
+  printf '%s\n' "$gb"
+}
+
+test_events_capable_silent_under_short_circuit_grep() {
+  local dir schema fb gb err rc
+  dir="$TMP_ROOT/cap-epipe"; mkdir -p "$dir"
+  schema="$dir/schema.json"; err="$dir/stderr"
+  write_herdr_schema "$schema" events.subscribe pane.agent_status_changed
+  fb=$(make_herdr_schemafake "$dir")
+  gb=$(make_shortcircuit_grep "$dir")
+  PATH="$gb:$fb:$PATH" FM_FAKE_SCHEMA_FILE="$schema" FM_BACKEND_HERDR_EVENT_READER=/nonexistent-reader \
+    bash -c 'trap "" PIPE; . "$0/bin/backends/herdr.sh"; fm_backend_herdr_events_capable sess' "$ROOT" \
+    >/dev/null 2>"$err"
+  rc=$?
+  [ "$rc" = 0 ] || fail "the capability probe must still return 0 with a short-circuiting grep on PATH, got $rc"
+  [ ! -s "$err" ] || fail "the capability probe must not write a pipe error on a ~220KB schema, got '$(cat "$err")'"
+  pass "fm_backend_herdr_events_capable: no write error with a short-circuiting grep and SIGPIPE ignored"
+}
+
+test_events_capable_missing_subscribe_is_incapable() {
+  local dir schema result rc
+  dir="$TMP_ROOT/cap-no-subscribe"; mkdir -p "$dir"
+  schema="$dir/schema.json"
+  write_herdr_schema "$schema" pane.agent_status_changed
+  result=$(events_capable_probe "$dir" "$schema")
+  rc=${result%%|*}
+  [ "$rc" = 1 ] || fail "a schema without events.subscribe must return 1 (fail closed to polling), got $rc"
+  pass "fm_backend_herdr_events_capable: a schema missing events.subscribe is incapable"
+}
+
+test_events_capable_missing_status_event_is_incapable() {
+  local dir schema result rc
+  dir="$TMP_ROOT/cap-no-event"; mkdir -p "$dir"
+  schema="$dir/schema.json"
+  write_herdr_schema "$schema" events.subscribe
+  result=$(events_capable_probe "$dir" "$schema")
+  rc=${result%%|*}
+  [ "$rc" = 1 ] || fail "a schema without pane.agent_status_changed must return 1, got $rc"
+  pass "fm_backend_herdr_events_capable: a schema missing pane.agent_status_changed is incapable"
+}
+
+test_events_capable_tokens_are_fixed_strings() {
+  local dir schema result rc
+  dir="$TMP_ROOT/cap-fixed"; mkdir -p "$dir"
+  schema="$dir/schema.json"
+  # Both tokens present only with the dots standing in for another character:
+  # a regex match would accept these, a fixed-string match must not.
+  write_herdr_schema "$schema" eventsXsubscribe paneXagent_status_changed
+  result=$(events_capable_probe "$dir" "$schema")
+  rc=${result%%|*}
+  [ "$rc" = 1 ] || fail "the capability tokens must match as fixed strings, not regexes (dot is literal), got rc $rc"
+  pass "fm_backend_herdr_events_capable: capability tokens match as fixed strings, not regexes"
+}
+
+test_events_capable_force_override_short_circuits() {
+  local dir schema result rc
+  dir="$TMP_ROOT/cap-force"; mkdir -p "$dir"
+  schema="$dir/schema.json"
+  write_herdr_schema "$schema" nothing.useful
+  result=$(events_capable_probe "$dir" "$schema" 1)
+  rc=${result%%|*}
+  [ "$rc" = 0 ] || fail "FM_BACKEND_HERDR_EVENTS_FORCE=1 must return 0 without consulting the schema, got $rc"
+  write_herdr_schema "$schema" events.subscribe pane.agent_status_changed
+  result=$(events_capable_probe "$dir" "$schema" 0)
+  rc=${result%%|*}
+  [ "$rc" = 1 ] || fail "FM_BACKEND_HERDR_EVENTS_FORCE=0 must return 1 even on a capable schema, got $rc"
+  pass "fm_backend_herdr_events_capable: FM_BACKEND_HERDR_EVENTS_FORCE still overrides the whole verdict"
+}
+
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
 
@@ -4490,3 +4634,9 @@ test_wait_transition_stream_absorb_clears_then_timeout
 test_wait_transition_reader_failure_returns_2
 test_wait_transition_bad_ack_returns_2_and_cleans_up
 test_wait_transition_clean_timeout_returns_1
+test_events_capable_full_schema_is_silent
+test_events_capable_silent_under_short_circuit_grep
+test_events_capable_missing_subscribe_is_incapable
+test_events_capable_missing_status_event_is_incapable
+test_events_capable_tokens_are_fixed_strings
+test_events_capable_force_override_short_circuits

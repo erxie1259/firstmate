@@ -711,6 +711,12 @@ test_self_announced_append_guards() {
   pass "self-announced appends suppress only their own bytes and fail toward waking"
 }
 
+# Reports yes when a subshell gets its own pid via BASHPID (bash 4+), probed
+# through the same interpreter the lock legs below run under.
+subshell_pid_is_distinct() {
+  bash -c '( [ -n "${BASHPID:-}" ] && [ "$BASHPID" != "$$" ] && echo yes )' 2>/dev/null || true
+}
+
 # A trap that fires inside a lock's critical section abandons the holding
 # frame, and the exit path then re-acquires the same lock (a TERM inside a
 # recovery-marker section is the reproduced case: the watcher's reap wedged
@@ -731,6 +737,17 @@ test_self_held_lock_reclaims_instead_of_deadlocking() {
     [ ! -e "$lock" ] && [ ! -L "$lock" ] || exit 12
   ' _ "$ROOT/bin/fm-wake-lib.sh" "$state" || rc=$?
   [ "$rc" -eq 0 ] || fail "self-held lock was not reclaimed cleanly (rc=$rc)"
+
+  # The subshell leg needs a pid that is distinct per subshell. Bash 3.2 has no
+  # BASHPID, so a subshell reports its parent's pid and is indistinguishable
+  # from the abandoned same-process frame above, which it then legitimately
+  # reclaims. Probe the capability rather than the version, and skip only this
+  # leg where it is missing.
+  if [ "$(subshell_pid_is_distinct)" != yes ]; then
+    pass "an abandoned same-process lock hold is reclaimed; parent's-live-hold leg skipped, no per-subshell BASHPID on this bash (needs bash 4+)"
+    return
+  fi
+
   rc=0
   FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"

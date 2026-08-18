@@ -403,19 +403,56 @@ fm_lock_claim() {
   return 0
 }
 
+# A failed create is either contention (someone else owns the path) or an
+# environmental refusal (no space, no write permission, missing parent). Both
+# leave the caller with no pid to read, so nothing downstream can tell them
+# apart: a full disk during the 2026-08-13 episode looked exactly like a held
+# lock and drove the steal arbitration below into a runaway path name.
+# fm_lock_try_create records the environmental case here; contention leaves it
+# empty. Read it only immediately after a failed fm_lock_try_create.
+FM_LOCK_CREATE_ERROR=
+FM_LOCK_CREATE_ERROR_REPORTED=
+
+# Reports an environmental create failure once per lock path per process, so a
+# retry loop cannot bury the one line that names the real problem.
+fm_lock_report_create_error() {  # <lockdir>
+  local lockdir=$1 reason=${FM_LOCK_CREATE_ERROR:-} key
+  [ -n "$reason" ] || return 0
+  key="|$lockdir|"
+  case "$FM_LOCK_CREATE_ERROR_REPORTED" in
+    *"$key"*) return 0 ;;
+  esac
+  FM_LOCK_CREATE_ERROR_REPORTED="$FM_LOCK_CREATE_ERROR_REPORTED$key"
+  printf 'fm-lock: %s: %s (not lock contention: check free space and write permission on %s)\n' \
+    "$lockdir" "$reason" "$(dirname "$lockdir")" >&2
+}
+
 fm_lock_try_create() {
   local lockdir=$1 allowed_steal_owner=${2:-} ownerdir
   FM_LOCK_OWNER_DIR=
-  ownerdir=$(fm_lock_owner_dir "$lockdir") || return 1
+  FM_LOCK_CREATE_ERROR=
+  if ! ownerdir=$(fm_lock_owner_dir "$lockdir"); then
+    FM_LOCK_CREATE_ERROR='cannot create lock owner directory'
+    return 1
+  fi
   if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
     fm_lock_discard_owner "$ownerdir"
     return 1
   fi
   if ! fm_lock_prepare_owner "$ownerdir"; then
+    FM_LOCK_CREATE_ERROR='cannot write lock owner record'
     fm_lock_discard_owner "$ownerdir"
     return 1
   fi
-  if ln -s "$ownerdir" "$lockdir" 2>/dev/null && fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
+  if ! ln -s "$ownerdir" "$lockdir" 2>/dev/null; then
+    if [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ]; then
+      FM_LOCK_CREATE_ERROR='cannot create lock link'
+    fi
+    fm_lock_remove_stray_owner_link "$lockdir" "$ownerdir"
+    fm_lock_discard_owner "$ownerdir"
+    return 1
+  fi
+  if fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
     if fm_lock_claim "$lockdir" "$ownerdir" "$allowed_steal_owner"; then
       FM_LOCK_OWNER_DIR=$ownerdir
       return 0
@@ -723,6 +760,69 @@ fm_recovery_marker_arm_check() {
   fm_recovery_transition "$1" arm-check
 }
 
+# Acquires the "<lock>.steal" arbitration mutex WITHOUT recursing, which caps
+# steal arbitration at exactly one level.
+#
+# fm_lock_try_acquire used to call itself on the steal path. That normally
+# terminated because the fresh steal path was created outright, but an
+# environmental create failure is not contention and does not terminate: there
+# is no pid to read, no live holder, and no mid-acquire freshness, so control
+# fell through to arbitrate "<lock>.steal.steal", then ".steal.steal.steal",
+# growing the name until the filesystem refused it (observed under ENOSPC on
+# 2026-08-13). One level is all the algorithm ever needs, so a stale steal mutex
+# is reclaimed here directly under the same staleness proof the primary path
+# uses, and an environmental failure stops loudly instead of nesting.
+_fm_lock_try_acquire_steal() {  # <steal-lock-path>
+  local steal=$1 pid owner
+  FM_LOCK_OWNER_DIR=
+  # Nothing arbitrates a second level any more, so a "<lock>.steal.steal" path
+  # can only be residue from the pre-fix runaway. fm_lock_claim refuses every
+  # claim of a path whose own ".steal" exists, so leaving that residue in place
+  # would wedge this mutex - and therefore the primary lock - forever.
+  if [ -e "$steal.steal" ] || [ -L "$steal.steal" ]; then
+    fm_lock_remove_path "$steal.steal" || true
+  fi
+  if fm_lock_try_create "$steal"; then
+    return 0
+  fi
+  if [ -n "$FM_LOCK_CREATE_ERROR" ]; then
+    fm_lock_report_create_error "$steal"
+    return 1
+  fi
+  # Compare against ${BASHPID:-$$} inline, never via a command substitution:
+  # $() forks a subshell whose BASHPID is not this frame's pid.
+  pid=$(cat "$steal/pid" 2>/dev/null || true)
+  if [ -n "$pid" ] && [ "$pid" = "${BASHPID:-$$}" ]; then
+    # Same abandoned-frame case the primary path documents below: a steal mutex
+    # recorded to this very process can only be an interrupted acquire, and
+    # nothing will ever release it, so the waiting caller would spin forever.
+    fm_lock_remove_path "$steal" || true
+    fm_lock_try_create "$steal" && return 0
+    fm_lock_report_create_error "$steal"
+    return 1
+  fi
+  if fm_pid_alive "$pid"; then
+    return 1
+  fi
+  if fm_lock_mid_acquire_is_fresh "$steal" "$pid"; then
+    return 1
+  fi
+  owner=
+  if [ -L "$steal" ]; then
+    owner=$(fm_lock_link_owner "$steal" 2>/dev/null || true)
+  fi
+  pid=$(cat "$steal/pid" 2>/dev/null || true)
+  if ! fm_lock_recheck_stale_owner "$steal" "$owner" "$pid"; then
+    return 1
+  fi
+  fm_lock_remove_path "$steal" || true
+  # Losing this create means another acquirer reclaimed the same stale mutex
+  # first; the caller retries against whatever it left behind.
+  fm_lock_try_create "$steal" && return 0
+  fm_lock_report_create_error "$steal"
+  return 1
+}
+
 fm_lock_try_acquire() {
   local lockdir=$1 pid steal cur rc steal_owner primary_owner
   FM_LOCK_HELD_PID=
@@ -731,6 +831,12 @@ fm_lock_try_acquire() {
 
   if fm_lock_try_create "$lockdir"; then
     return 0
+  fi
+  if [ -n "$FM_LOCK_CREATE_ERROR" ]; then
+    # Not contention: no arbitration, retry, or steal can fix a path that
+    # cannot be written at all, so fail here and say why exactly once.
+    fm_lock_report_create_error "$lockdir"
+    return 1
   fi
 
   # Compare against ${BASHPID:-$$} inline, never via a command substitution:
@@ -749,6 +855,7 @@ fm_lock_try_acquire() {
     if fm_lock_try_create "$lockdir"; then
       return 0
     fi
+    fm_lock_report_create_error "$lockdir"
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     return 1
   fi
@@ -762,7 +869,7 @@ fm_lock_try_acquire() {
   fi
 
   steal="$lockdir.steal"
-  if ! fm_lock_try_acquire "$steal"; then
+  if ! _fm_lock_try_acquire_steal "$steal"; then
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=
     return 1
@@ -816,6 +923,7 @@ fm_lock_try_acquire() {
     FM_LOCK_RECOVERED_PID=$cur
   fi
   if [ "$rc" -ne 0 ]; then
+    fm_lock_report_create_error "$lockdir"
     # shellcheck disable=SC2034 # Read by callers after fm_lock_try_acquire returns.
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=

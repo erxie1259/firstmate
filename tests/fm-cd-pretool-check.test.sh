@@ -6,11 +6,13 @@
 # it reuses the shell classifier owned by bin/fm-arm-command-policy.mjs.
 # bin/fm-cd-pretool-check.sh is the stable transport: it scopes the guard to the
 # real primary checkout, then drives all five harness entry forms. This suite
-# proves the decision matrix, the harness-output shaping, the primary-checkout
-# scoping (including the deliberate secondmate-home difference from the turn-end
-# guard), the fail-open transport behavior, the prefilter fast path, the
-# end-to-end cwd-leak regression, and the per-harness wiring. No harness is
-# spawned; live per-harness evidence lives in docs/cd-guard.md.
+# proves the decision matrix (including both sides of the home carve-out, where
+# a cd that provably resolves to the primary home is allowed and every
+# near-miss target still denies), the harness-output shaping, the
+# primary-checkout scoping (including the deliberate secondmate-home difference
+# from the turn-end guard), the fail-open transport behavior, the prefilter fast
+# path, the end-to-end cwd-leak regression, and the per-harness wiring. No
+# harness is spawned; live per-harness evidence lives in docs/cd-guard.md.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -64,6 +66,11 @@ make_child_worktree_fixture() {
 PRIMARY=$(make_primary_fixture "$TMP_ROOT/primary")
 CHECK="$PRIMARY/bin/fm-cd-pretool-check.sh"
 
+# A symlink to the same primary checkout: a cd through it still lands on the
+# home, so the home carve-out must resolve it rather than reading the spelling.
+PRIMARY_LINK="$TMP_ROOT/primary-link"
+ln -s primary "$PRIMARY_LINK"
+
 # --- full cross-harness acceptance matrix ----------------------------------
 
 MATRIX_IDS=()
@@ -104,6 +111,36 @@ matrix_case B24 deny 'command builtin cd projects/foo'
 matrix_case B25 deny 'builtin command cd projects/foo'
 matrix_case B26 deny 'command -p cd projects/foo'
 matrix_case B27 deny 'command -- cd projects/foo'
+
+# BLOCK: a cd whose target is NOT provably the home itself. The home carve-out
+# never widens to a target that only looks home-adjacent, and never to a target
+# whose destination depends on expansion this classifier must not perform.
+matrix_case H01 deny "cd $PRIMARY/bin"
+matrix_case H02 deny "cd $PRIMARY/.."
+matrix_case H03 deny "cd $PRIMARY/bi*"
+matrix_case H04 deny "cd -- $PRIMARY"
+matrix_case H05 deny "cd $PRIMARY extra"
+matrix_case H06 deny "pushd $PRIMARY"
+matrix_case H07 deny "cd $PRIMARY; cd projects/foo"
+matrix_case H08 deny 'cd "$FM_HOME"'
+matrix_case H09 deny 'cd $(pwd)'
+matrix_case H10 deny 'cd ~'
+matrix_case H11 deny 'cd ~root'
+
+# ALLOW: a cd that provably lands on the primary home itself, in every spelling
+# that resolves there. It cannot move the shell out of the home, so blocking it
+# was a false positive.
+matrix_case H12 allow "cd $PRIMARY"
+matrix_case H13 allow "cd $PRIMARY/"
+matrix_case H14 allow "cd $PRIMARY/bin/.."
+matrix_case H15 allow "cd $PRIMARY_LINK"
+matrix_case H16 allow "cd '$PRIMARY'"
+matrix_case H17 allow "cd \"$PRIMARY\""
+matrix_case H18 allow "cd $PRIMARY && tasks-axi add x"
+matrix_case H19 allow "cd $PRIMARY >/dev/null"
+matrix_case H20 allow "X=1 cd $PRIMARY"
+matrix_case H21 allow "builtin cd $PRIMARY"
+matrix_case H22 allow "command cd $PRIMARY"
 
 # ALLOW: not a persistent top-level cwd change (scoped, data, or non-cd).
 matrix_case A01 allow 'git -C projects/foo status'
@@ -371,6 +408,22 @@ test_policy_cli_direct() {
   pass "cd-guard: fm-cd-command-policy.mjs CLI honors the deny/allow output contract"
 }
 
+# The policy is a pure function of its inputs: it never discovers the home, so
+# without --home it cannot know any cd is safe and must deny every one of them.
+test_policy_home_is_an_explicit_input() {
+  local policy
+  policy="$ROOT/bin/fm-cd-command-policy.mjs"
+  [ "$(node "$policy" --command "cd $PRIMARY" | cut -f1)" = deny ] \
+    || fail "policy CLI must deny a home-targeting cd when no --home is supplied"
+  [ "$(node "$policy" --command "cd $PRIMARY" --home "$PRIMARY")" = allow ] \
+    || fail "policy CLI must allow a home-targeting cd when --home names that home"
+  [ "$(node "$policy" --command "cd $PRIMARY" --home "$TMP_ROOT" | cut -f1)" = deny ] \
+    || fail "policy CLI must deny when --home names a different directory"
+  [ "$(node "$policy" --command "cd $PRIMARY" --home "$TMP_ROOT/does-not-exist" | cut -f1)" = deny ] \
+    || fail "policy CLI must deny when --home cannot be resolved"
+  pass "cd-guard: the home path is an explicit policy input, never discovered by the policy"
+}
+
 # --- per-harness wiring -----------------------------------------------------
 
 # Delegated to bin/fm-lint.sh, the single owner of the lint definition including
@@ -397,4 +450,5 @@ test_fail_open_missing_node
 test_fail_open_missing_jq_on_stdin
 test_prefilter_skips_node_without_cd_substring
 test_policy_cli_direct
+test_policy_home_is_an_explicit_input
 test_scripts_are_shellcheck_clean

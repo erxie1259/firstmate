@@ -775,6 +775,13 @@ fm_recovery_marker_arm_check() {
 _fm_lock_try_acquire_steal() {  # <steal-lock-path>
   local steal=$1 pid owner
   FM_LOCK_OWNER_DIR=
+  # Nothing arbitrates a second level any more, so a "<lock>.steal.steal" path
+  # can only be residue from the pre-fix runaway. fm_lock_claim refuses every
+  # claim of a path whose own ".steal" exists, so leaving that residue in place
+  # would wedge this mutex - and therefore the primary lock - forever.
+  if [ -e "$steal.steal" ] || [ -L "$steal.steal" ]; then
+    fm_lock_remove_path "$steal.steal" || true
+  fi
   if fm_lock_try_create "$steal"; then
     return 0
   fi

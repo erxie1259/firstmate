@@ -502,6 +502,34 @@ test_lock_stale_steal_mutex_is_reclaimed_without_nesting() {
   pass "a stale steal mutex is reclaimed without nesting"
 }
 
+test_lock_nested_steal_residue_does_not_wedge() {
+  local dir state lockdir dead out newpid
+  dir=$(make_case lock-steal-residue)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  dead=$(dead_pid)
+  # Exactly what the 2026-08-13 runaway left on disk. fm_lock_claim refuses any
+  # claim of a path whose own ".steal" exists, so this residue used to block the
+  # steal mutex - and with it every acquire of the primary lock - forever.
+  mkdir "$lockdir" "$lockdir.steal.steal"
+  printf '%s\n' "$dead" > "$lockdir/pid"
+  out=$(FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then rc=0; else rc=1; fi
+    printf "rc=%s pid=%s\n" "$rc" "$(cat "$2/pid" 2>/dev/null || true)"
+  ' _ "$LIB" "$lockdir")
+  case "$out" in
+    *"rc=0"*) ;;
+    *) fail "leftover nested steal residue wedged the acquire: $out" ;;
+  esac
+  newpid=${out#*pid=}; newpid=${newpid%% *}
+  [ -n "$newpid" ] || fail "reclaimed lock has no pid recorded: $out"
+  [ "$newpid" != "$dead" ] || fail "stale dead-pid lock was not replaced: $out"
+  [ ! -e "$lockdir.steal.steal" ] && [ ! -L "$lockdir.steal.steal" ] \
+    || fail "nested steal residue survived the acquire"
+  pass "leftover nested steal residue is cleared instead of wedging the lock"
+}
+
 test_lock_late_claim_loses_after_recreate() {
   local dir state lockdir out
   dir=$(make_case lock-late-claim)
@@ -1258,6 +1286,7 @@ test_lock_empty_pid_uses_minimum_grace
 test_lock_steal_arbitration_never_recurses
 test_lock_create_failure_is_loud_and_never_arbitrated
 test_lock_stale_steal_mutex_is_reclaimed_without_nesting
+test_lock_nested_steal_residue_does_not_wedge
 test_lock_late_claim_loses_after_recreate
 test_lock_paused_mid_acquire_claim_fails_during_steal
 test_watch_restart_rejects_reused_pid

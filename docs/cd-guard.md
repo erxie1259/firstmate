@@ -62,6 +62,7 @@ It fired often enough in practice to be raised as an annoyance, and false positi
 The carve-out is deliberately narrow.
 A `cd` is allowed only when it carries exactly one argument word, that word is a literal absolute path with no variable, command substitution, glob, or other expansion in it, and `realpath` resolves it to the same directory `realpath` resolves the home to.
 Resolving both sides is what makes a symlinked or `..`-containing spelling such as `<home>/bin/..` allowed while keeping a symlink or `..` segment from smuggling a different destination past the test.
+The carve-out applies on those same terms to the prefixed and redirected `cd` forms the block list above enumerates, so `X=1 cd <home>`, `builtin cd <home>`, `command cd <home>`, and `cd <home> >/dev/null` are allowed too: leading assignments and a `command`/`builtin` prefix do not change which directory the shell lands in, and a redirection is not an argument word.
 
 Everything else still denies, unchanged:
 

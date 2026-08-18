@@ -10,6 +10,9 @@
 # wrapper only scopes the guard to the real primary checkout, acquires the
 # harness payload, invokes that policy, and renders the established harness
 # responses. It never executes, sources, evaluates, or expands the command.
+# Because this wrapper is the side that knows where the primary home is, it
+# passes that resolved path to the policy as --home, which the policy needs for
+# its one carve-out: a cd whose target provably resolves to the home itself.
 # See docs/cd-guard.md for the complete contract and validation record.
 #
 # Usage:
@@ -54,6 +57,8 @@ toolInput.command, or Claude/Codex tool_input.command).
 Fires only in the real primary firstmate checkout; it is a silent no-op in a
 crewmate/scout task worktree or any non-firstmate repo.
 Exits 0 to allow and 2 to deny a persistent top-level cwd change.
+A cd whose single literal argument resolves to the primary home itself is
+allowed, because it cannot move the shell out of the home.
 The deny reason is written to stderr, with a Grok decision object on stdout
 unless --claude is supplied.
 With --cursor, a deny is Cursor's own decision object on stdout and exit 0,
@@ -163,7 +168,7 @@ POLICY="$FM_ROOT/bin/fm-cd-command-policy.mjs"
 command -v node >/dev/null 2>&1 || exit 0
 [ -f "$POLICY" ] || exit 0
 
-POLICY_OUTPUT=$(node "$POLICY" --command "$CMD" 2>/dev/null) || exit 0
+POLICY_OUTPUT=$(node "$POLICY" --command "$CMD" --home "$FM_ROOT" 2>/dev/null) || exit 0
 [ -n "$POLICY_OUTPUT" ] || exit 0
 
 TAB=$(printf '\t')

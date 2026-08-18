@@ -9,6 +9,12 @@
 // scoping to the real primary checkout lives in the bin/fm-cd-pretool-check.sh
 // transport, not here. See docs/cd-guard.md for the full contract.
 //
+// The one carve-out is a `cd` whose single literal argument provably resolves
+// to the primary home itself: that is the one directory change that cannot move
+// the shell out of the home, so denying it is a false positive. The home path
+// is an explicit input supplied by the transport, which owns knowing where the
+// home is; this policy never discovers it.
+//
 // The shell tokenizer and command-position analysis are imported from
 // bin/fm-arm-command-policy.mjs, the sole owner of firstmate's shell
 // classification, so this guard never duplicates shell lexing. This policy
@@ -68,7 +74,27 @@ function hasCommandQueryPrefix(position) {
   return false;
 }
 
-function decision(command) {
+// The carve-out: a `cd` that provably lands on the primary home itself. Only a
+// single literal absolute path argument qualifies, resolved with realpath so a
+// symlink or `..` segment cannot smuggle a different destination past this test.
+// Everything whose destination depends on expansion this classifier must not
+// perform - a bare `cd`, `cd -`, a tilde form, a variable, a command
+// substitution, a glob - is not literal-absolute and therefore still denied, as
+// is any relative target, whose meaning depends on a cwd this policy cannot see.
+function targetsHome(words, wordIndex, home) {
+  if (!home) return false;
+  if (words.length !== wordIndex + 2) return false;
+  const argument = words[wordIndex + 1];
+  if (!argument.literal || argument.unquotedExpansion || argument.subs.length > 0) return false;
+  if (!argument.value.startsWith("/")) return false;
+  try {
+    return realpathSync(argument.value) === realpathSync(home);
+  } catch {
+    return false;
+  }
+}
+
+function decision(command, home = "") {
   const lexed = new Lexer(command).tokenize();
   // Fail open on syntax this classifier cannot tokenize. The cd-guard's threat
   // model is agent mistakes - an accidental bare `cd projects/foo` always
@@ -94,13 +120,16 @@ function decision(command) {
     if (!command) continue;
     if (!CD_BUILTINS.has(command.value)) continue;
     if (position.wrappers.some((wrapper) => FORKING_WRAPPERS.has(wrapper))) continue;
+    // pushd and popd maintain a stack, so neither is exempt even when a pushd
+    // argument resolves to the home.
+    if (command.value === "cd" && targetsHome(position.words, wordIndex, home)) continue;
     return deny("persistent-cd");
   }
   return { decision: "allow" };
 }
 
 function parseArguments(argv) {
-  const result = { command: "", commandSet: false };
+  const result = { command: "", commandSet: false, home: "" };
   for (let i = 0; i < argv.length; i += 1) {
     const name = argv[i];
     if (name === "--command") {
@@ -113,6 +142,16 @@ function parseArguments(argv) {
     if (name.startsWith("--command=")) {
       result.command = name.slice("--command=".length);
       result.commandSet = true;
+      continue;
+    }
+    if (name === "--home") {
+      if (i + 1 >= argv.length) throw new Error("--home requires a value");
+      result.home = argv[i + 1];
+      i += 1;
+      continue;
+    }
+    if (name.startsWith("--home=")) {
+      result.home = name.slice("--home=".length);
       continue;
     }
     throw new Error(`unknown argument: ${name}`);
@@ -137,7 +176,7 @@ if (invokedDirectly()) {
     if (!args.commandSet || !args.command) {
       process.stdout.write("allow\n");
     } else {
-      const result = decision(args.command);
+      const result = decision(args.command, args.home);
       if (result.decision === "allow") {
         process.stdout.write("allow\n");
       } else {

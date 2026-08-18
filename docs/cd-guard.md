@@ -13,7 +13,7 @@ the watcher-arm PreToolUse seatbelt (`bin/fm-arm-pretool-check.sh`, `docs/arm-pr
 The primary firstmate shell persists its working directory across tool calls.
 A stray persistent top-level `cd projects/<clone>` therefore silently relocates the shell, so the next firstmate-owned command - a backlog write, an `fm-*` lifecycle call, `tasks-axi` - runs inside a project clone instead of the home.
 That has actually happened: a persistent top-level `cd` caused a firstmate-owned backlog write to execute inside a project clone rather than the home.
-The seatbelt denies exactly that command shape - a cwd change that persists to the primary shell - before it runs.
+The seatbelt denies exactly that command shape - a cwd change that persists to the primary shell and moves it somewhere other than the home - before it runs.
 
 This guard is not a general sandbox.
 It classifies shell command positions only; it never evaluates, expands, sources, or runs any byte of the submitted command.
@@ -38,7 +38,9 @@ Secondmate child crew and scout worktrees are likewise inert under the linked-wo
 The discriminator is persistence to the parent shell's cwd, not the mere presence of the token `cd`.
 
 The guard **blocks** a `cd`, `pushd`, or `popd` builtin that runs in an executed top-level position in the parent shell, because such a command persistently changes the primary shell's own working directory.
-This covers a bare `cd projects/foo`, `cd ..`, `cd`, `cd -`, an absolute `cd /some/path` (still a persistent relocation of the parent shell), `pushd <dir>`, `popd`, a leading-assignment form such as `X=1 cd foo`, quoted or escaped command-word fragments that cook to a bare builtin, and any list form where the builtin runs in the parent shell (`cd x && cmd`, `cmd; cd x`, `cmd || cd x`, `command cd x`, `command -p cd x`, `command -- cd x`, `builtin cd x`, `command builtin cd x`, `cd x >/dev/null`, and newline-separated lists).
+This covers a bare `cd projects/foo`, `cd ..`, `cd`, `cd -`, an absolute `cd /some/path` outside the home (still a persistent relocation of the parent shell), `pushd <dir>`, `popd`, a leading-assignment form such as `X=1 cd foo`, quoted or escaped command-word fragments that cook to a bare builtin, and any list form where the builtin runs in the parent shell (`cd x && cmd`, `cmd; cd x`, `cmd || cd x`, `command cd x`, `command -p cd x`, `command -- cd x`, `builtin cd x`, `command builtin cd x`, `cd x >/dev/null`, and newline-separated lists).
+
+The one exception is the home carve-out below: a `cd` whose target provably resolves to the primary home itself is allowed, because it is the one directory change that cannot move the shell out of the home.
 
 The guard **allows** everything else, including these safe scoped forms that must never be blocked:
 
@@ -49,8 +51,30 @@ The guard **allows** everything else, including these safe scoped forms that mus
 - A `command` query such as `command -v cd`, `command -V cd`, or a clustered form such as `command -pv cd`, because it reports command resolution without executing the named builtin.
 - The token `cd` appearing as data: quoted text (`echo "cd projects/foo"`), a comment, a substring of another word (`cdk`, `abcd`, `record`), a `printf` payload, or any later argument word.
 
-An absolute-path `cd` is blocked on purpose: the ALLOW carve-out for absolute paths is for commands that address a target by absolute path, not for `cd`, which relocates the shell itself regardless of whether its argument is relative or absolute.
-Blocking a top-level `cd` is safe in the strong sense: the guard's steady state is "always at the home", so a return-to-home `cd` is redundant rather than necessary, and the block never causes a wrong-directory write.
+An absolute-path `cd` to anywhere other than the home is blocked on purpose: the ALLOW carve-out for absolute paths is for commands that address a target by absolute path, not for `cd`, which relocates the shell itself regardless of whether its argument is relative or absolute.
+Blocking a top-level `cd` is safe in the strong sense: the guard's steady state is "always at the home", so a `cd` that leaves the home is never necessary, and the block never causes a wrong-directory write.
+
+### The home carve-out
+
+A `cd` whose target is the primary home itself does the opposite of the threat this guard exists for: it cannot relocate the shell out of the home, so denying it was a false positive.
+It fired often enough in practice to be raised as an annoyance, and false positives on a safety guard are corrosive - they train every reader to treat the deny message as noise, which is exactly when a real block gets ignored.
+
+The carve-out is deliberately narrow.
+A `cd` is allowed only when it carries exactly one argument word, that word is a literal absolute path with no variable, command substitution, glob, or other expansion in it, and `realpath` resolves it to the same directory `realpath` resolves the home to.
+Resolving both sides is what makes a symlinked or `..`-containing spelling such as `<home>/bin/..` allowed while keeping a symlink or `..` segment from smuggling a different destination past the test.
+
+Everything else still denies, unchanged:
+
+- A bare `cd` (it goes to `$HOME`, leaving the checkout), `cd -`, `cd ~`, `cd ~user`, `cd ..`, `cd .`, and any other relative target, whose destination depends on a working directory this classifier cannot see.
+- Any target reached only through expansion the classifier must not perform: `cd "$FM_HOME"`, `cd $(pwd)`, `cd <home>/bi*`.
+- Any target that is not the home, including `<home>/projects/<clone>`, `<home>/bin`, and the home's own parent.
+- `pushd` and `popd` in every form, including `pushd <home>`, because they maintain a directory stack rather than a single cwd.
+- Any `cd` carrying extra words, such as `cd -- <home>`, `cd -P <home>`, or `cd <home> extra`.
+
+The ownership split is what keeps the policy pure.
+`bin/fm-cd-command-policy.mjs` still knows nothing about where the home is; it takes the resolved home path as an explicit `--home` input from `bin/fm-cd-pretool-check.sh`, which already owns scoping the guard to the real primary checkout.
+Without `--home` the policy cannot prove any target is the home and denies every persistent `cd`, exactly as it did before the carve-out.
+The policy still never evaluates, expands, sources, or runs any byte of the submitted command.
 
 ### Accepted non-goals
 
@@ -70,7 +94,7 @@ Every deny carries one stable code in square brackets before its prose reason.
 | `persistent-cd` | A top-level `cd`/`pushd`/`popd` would persistently change the primary shell's own working directory. |
 
 The reason directs the caller to reach the target without moving the shell by using `git -C <dir>`, placing an absolute path on the intended command itself, or scoping the `cd` to a subshell.
-It does not permit `cd /home/project`, because an absolute-path `cd` remains a persistent directory change and is denied.
+It does not permit `cd /home/project`, because an absolute-path `cd` to anywhere other than the home remains a persistent directory change and is denied.
 
 ## Transport and fail-open behavior
 
@@ -127,6 +151,8 @@ Every shell variable reference in the Grok hook command carries an inline defaul
 
 `tests/fm-cd-pretool-check.test.sh` owns the acceptance matrix.
 Every block and allow case runs through Codex-shaped stdin, Claude-shaped stdin, Grok-shaped stdin, OpenCode-shaped CLI, and Pi-shaped CLI entry forms.
+Both sides of the home carve-out are in that matrix: the resolve-to-home spellings that must now be allowed, and the near-miss targets, expansion forms, stack builtins, and extra-argument forms that must still deny.
+A separate case proves the home stays an explicit policy input - the policy denies a home-targeting `cd` when no `--home` is supplied, when `--home` names another directory, and when `--home` cannot be resolved.
 The suite also proves the end-to-end cwd-leak regression (a firstmate-owned backlog write leaking into a project clone, then denied at the exact command), the checkout scoping (fires in a git-cloned secondmate fixture, inert in a crewmate/scout linked worktree, inert outside a firstmate checkout, inert outside a git repo), the fail-open transport behavior, the prefilter fast path, the policy CLI output contract, and the per-harness wiring.
 
 Run:

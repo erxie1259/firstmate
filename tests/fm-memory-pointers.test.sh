@@ -556,17 +556,17 @@ PY
   pass "fm-memory-pointers: removing a lane's last project retires the pointer it left behind"
 }
 
-test_an_incomplete_derivation_retires_nothing_and_says_so() {
+test_an_unreadable_source_spares_only_its_own_keys() {
   local home dir out status
-  skip_without_library "the incomplete-derivation guard test" && return
+  skip_without_library "the scoped-derivation guard test" && return
   home=$(make_home guard-home)
   dir=$(make_lanes guard-dir shared fleet-infra products)
   fm_pointers "$home" "$dir" write >/dev/null || fail "the first pointer run failed"
 
-  # An unreadable canonical file derives no sections, which reads exactly like
-  # every section having been deleted. Retiring on that reading would empty a
-  # lane on the strength of a missing file, so a run that reports any problem
-  # must retire nothing - including in the lane emptied alongside it.
+  # data/learnings.md cannot be read, so nothing it owns can be called deleted.
+  # data/projects.md reads fine, so dropping a project from it IS a deletion
+  # and must still be reconciled: one source coming up short cannot freeze the
+  # lanes the other sources feed.
   rm "$home/data/learnings.md"
   python3 - "$home/data/projects.md" <<'PY'
 import sys
@@ -578,15 +578,59 @@ PY
   status=0
   out=$(fm_pointers "$home" "$dir" write) || status=$?
   [ "$status" -eq 1 ] || fail "a run with an unreadable canonical file exited $status, not 1"
-  [ "$(json_field "$out" "d['counts']['expired']")" = "0" ] \
-    || fail "an incomplete derivation retired pointers: $out"
   [ "$(live_pointer_rows "$dir" fleet-infra)" = "3" ] \
     || fail "the learnings pointers were retired because their file could not be read"
-  [ "$(live_pointer_rows "$dir" products)" = "1" ] \
-    || fail "a lane with no derived pointers was emptied on an incomplete derivation"
+  [ "$(json_field "$out" "d['counts']['expired']")" = "1" ] \
+    || fail "the genuinely deregistered project was not retired: $out"
+  [ "$(live_pointer_rows "$dir" products)" = "0" ] \
+    || fail "a project dropped from a readable registry kept its live pointer"
   [ "$(json_field "$out" "sorted(l['lane'] for l in d['skipped_reconciliation'])")" \
-    = "['fleet-infra', 'products']" ] || fail "the run did not report which lanes it left alone: $out"
-  pass "fm-memory-pointers: a derivation that reported problems retires nothing and names what it skipped"
+    = "['fleet-infra']" ] || fail "the run did not report exactly what it left alone: $out"
+  [ "$(json_field "$out" "sorted({s.split('#')[0] for l in d['skipped_reconciliation'] for s in l['keys']})")" \
+    = "['data/learnings.md']" ] || fail "keys from a healthy source were left alone too: $out"
+  pass "fm-memory-pointers: a source that came up short spares its own keys and no others"
+}
+
+test_a_lazily_absent_learnings_file_is_not_a_problem() {
+  local home dir out
+  skip_without_library "the lazy-learnings test" && return
+  home=$(make_home lazy-home)
+  dir=$(make_lanes lazy-dir shared fleet-infra products)
+  # AGENTS.md creates data/learnings.md lazily, so a home that has recorded no
+  # learning yet is an ordinary state, not a derivation that came up short.
+  : > "$home/data/learnings.md"
+
+  out=$(fm_pointers "$home" "$dir" write) || fail "a home with no learnings yet failed: $out"
+  [ "$(json_field "$out" "d['problems']")" = "[]" ] \
+    || fail "an empty learnings file with nothing indexed was reported as a problem: $out"
+  [ "$(json_field "$out" "d['counts']['expired'] + d['counts']['refused']")" = "0" ] \
+    || fail "a home with no learnings retired or refused something: $out"
+  [ "$(live_pointer_rows "$dir" fleet-infra)" = "1" ] \
+    || fail "the fleet-infra project pointer did not land"
+  pass "fm-memory-pointers: a home that has recorded no learning yet runs normally"
+}
+
+test_an_emptied_learnings_file_with_pointers_indexed_refuses() {
+  local home dir out status
+  skip_without_library "the emptied-learnings test" && return
+  home=$(make_home emptied-learnings-home)
+  dir=$(make_lanes emptied-learnings-dir shared fleet-infra products)
+  fm_pointers "$home" "$dir" write >/dev/null || fail "the first pointer run failed"
+
+  # Once the ledger holds its keys, the same empty file has everything to lose:
+  # retiring on it is unrecoverable, so the run refuses instead.
+  : > "$home/data/learnings.md"
+
+  status=0
+  out=$(fm_pointers "$home" "$dir" write) || status=$?
+  [ "$status" -eq 1 ] || fail "an emptied learnings file with pointers indexed exited $status, not 1"
+  [ "$(json_field "$out" "d['counts']['expired']")" = "0" ] \
+    || fail "an emptied learnings file retired its pointers: $out"
+  [ "$(live_pointer_rows "$dir" fleet-infra)" = "3" ] \
+    || fail "the learnings pointers were retired on the strength of an empty file"
+  [ "$(json_field "$out" "any('learnings.md' in p for p in d['problems'])")" = "True" ] \
+    || fail "the emptied learnings file was not reported as a problem: $out"
+  pass "fm-memory-pointers: an emptied source whose pointers are indexed is refused"
 }
 
 test_an_emptied_canonical_file_retires_nothing_and_refuses() {
@@ -639,38 +683,47 @@ MD
   pass "fm-memory-pointers: a canonical file that derives no sections is refused, never obeyed"
 }
 
-test_a_ledger_from_another_home_reconciles_nothing() {
-  local home other dir out
+test_a_ledger_from_another_home_neither_retires_nor_supersedes() {
+  local home other dir out status
   skip_without_library "the mismatched-home test" && return
   home=$(make_home ledger-home-a)
   dir=$(make_lanes ledger-home-dir shared fleet-infra products)
   fm_pointers "$home" "$dir" write >/dev/null || fail "the first pointer run failed"
 
-  # A second tree derives a complete, problem-free set of its own. Nothing it
-  # fails to produce was deleted - it was simply never this home's - so a run
-  # against it must not retire the first home's index.
+  # A second checkout carries the SAME headings with different text, so every
+  # ledger key matches and only the digest differs. Chaining onto the first
+  # home's rows would retire them exactly as irreversibly as expiring them, so
+  # a foreign ledger is written past, never through.
   other=$(make_home ledger-home-b)
   python3 - "$other/data/captain.md" <<'PY'
 import sys
-open(sys.argv[1], "w").write(
-    "# Captain preferences\n\n## A different tree entirely\n\nIts own sections, its own facts.\n")
+p = sys.argv[1]
+text = open(p).read()
+open(p, "w").write(text.replace(
+    "Never send routine acknowledgements.",
+    "This second checkout says something else entirely about chat."))
 PY
 
-  out=$(fm_pointers "$other" "$dir" write) || fail "the run from another home failed: $out"
+  status=0
+  out=$(fm_pointers "$other" "$dir" write) || status=$?
+  [ "$status" -eq 1 ] || fail "a run that skipped reconciliation reported success: exit $status"
+  [ "$(json_field "$out" "d['counts']['updated']")" = "0" ] \
+    || fail "a run from another home superseded this home's rows: $out"
   [ "$(json_field "$out" "d['counts']['expired']")" = "0" ] \
     || fail "a run from another home retired this home's pointers: $out"
-  [ "$(live_rows_claiming "$dir" shared "Chat is for outcomes only")" = "1" ] \
+  [ "$(live_rows_claiming "$dir" shared "Never send routine acknowledgements")" = "1" ] \
     || fail "the first home's pointer was retired by a run from another tree"
-  [ "$(json_field "$out" "sorted({l['lane'] for l in d['skipped_reconciliation']})")" \
-    = "['shared']" ] || fail "the run did not report the lane it left alone: $out"
   [ "$(json_field "$out" "all('ledger-home-a' in l['reason'] for l in d['skipped_reconciliation'])")" \
     = "True" ] || fail "the report does not name the home the ledger belongs to: $out"
+
   # And the first home still reconciles normally, so the binding is not a
   # one-way lock on the ledger.
   out=$(fm_pointers "$home" "$dir" write) || fail "the run from the original home failed: $out"
   [ "$(json_field "$out" "'skipped_reconciliation' in d")" = "False" ] \
     || fail "the original home was locked out of its own ledger: $out"
-  pass "fm-memory-pointers: a ledger written from another home reconciles nothing and says so"
+  [ "$(live_rows_claiming "$dir" shared "Never send routine acknowledgements")" = "1" ] \
+    || fail "the original home no longer holds exactly one live pointer for its section"
+  pass "fm-memory-pointers: a ledger from another home is neither retired from nor superseded through"
 }
 
 test_two_sections_sharing_a_heading_keep_one_live_pointer_each() {
@@ -796,8 +849,9 @@ mod = importlib.util.module_from_spec(spec)
 loader.exec_module(mod)
 mod.BRIDGE = Path(stub)
 
-pointers, problems = mod.derive(Path(home))
-result = mod.write_pointers(Path(home), Path(data_dir), pointers, problems)
+derived = mod.derive(Path(home))
+pointers, problems = derived.pointers, list(derived.problems)
+result = mod.write_pointers(Path(home), Path(data_dir), pointers, derived.troubled, derived.empty)
 ledger, _ = mod.read_ledger(Path(data_dir), "shared")
 print(json.dumps({"total": len(pointers), "problems": problems, "ledger": ledger, **result}))
 PY
@@ -868,7 +922,7 @@ mod = importlib.util.module_from_spec(spec)
 loader.exec_module(mod)
 mod.BRIDGE = Path(stub)
 
-pointers, _ = mod.derive(Path(home))
+pointers = mod.derive(Path(home)).pointers
 result = mod.write_pointers(Path(home), Path(data_dir), pointers)
 ledger, _ = mod.read_ledger(Path(data_dir), "shared")
 print(json.dumps({"total": len(pointers), "ledger": ledger, **result}))
@@ -991,10 +1045,12 @@ test_a_deleted_section_leaves_no_live_pointer_claiming_it
 test_deleting_the_first_of_two_same_heading_sections_keeps_the_survivor
 test_re_laning_a_project_retires_the_pointer_in_the_lane_it_left
 test_removing_a_lanes_last_project_retires_its_pointer
-test_an_incomplete_derivation_retires_nothing_and_says_so
+test_an_unreadable_source_spares_only_its_own_keys
+test_a_lazily_absent_learnings_file_is_not_a_problem
+test_an_emptied_learnings_file_with_pointers_indexed_refuses
 test_an_emptied_canonical_file_retires_nothing_and_refuses
 test_a_canonical_file_with_no_sections_retires_nothing_and_refuses
-test_a_ledger_from_another_home_reconciles_nothing
+test_a_ledger_from_another_home_neither_retires_nor_supersedes
 test_two_sections_sharing_a_heading_keep_one_live_pointer_each
 test_a_lost_ledger_costs_a_duplicate_pointer_not_a_wrong_answer
 test_a_bridge_that_dies_midlane_still_reports_every_lane

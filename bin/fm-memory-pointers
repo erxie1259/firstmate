@@ -80,19 +80,33 @@ RECONCILIATION
   lanes that still derive pointers: a lane emptied to its last project - by a
   re-lane or by dropping the line - derives nothing, and walking only the
   derived set would leave its rows claiming a project that lives elsewhere now.
-  It runs ONLY on a derivation that reported no problems. A canonical file that
-  is absent, unreadable, or READABLE BUT EMPTY yields no sections and a
-  problem, which is indistinguishable here from every section being deleted, so
-  a run with any problem retires nothing at all, exits nonzero, and reports the
-  keys it left alone under `skipped_reconciliation`. A refusal costs one
-  re-run; a wrongly retired pointer can never be written again, so the two are
-  not weighed the same.
+  A key is only retired when the source that owns it derived normally. A
+  canonical file that is absent, unreadable, or READABLE BUT EMPTY yields no
+  sections, which is indistinguishable here from every one of its sections
+  being deleted, so ITS keys are left exactly as they are while every other
+  source's keys reconcile as usual. A refusal costs one re-run; a wrongly
+  retired pointer can never be written again, so the two are not weighed the
+  same.
+  A source that derived nothing is only a problem when a ledger still holds its
+  keys, because that is the only case with anything to lose. data/learnings.md
+  is created lazily, so a home that has recorded no learning yet derives none,
+  reports none, and runs normally.
+  Only a WHOLLY empty source is caught this way. A canonical file truncated
+  part of the way through still derives the sections that survived, and those
+  read exactly like deletions of the rest, so a partial loss is still
+  reconciled and its missing pointers are still retired. Telling that apart
+  from real deletions is not possible from here, and it is an accepted bound.
   Each ledger records the home its pointers were derived from, and a lane whose
-  ledger names another home reconciles nothing: a derivation from another tree
-  does not produce this one's pointers either, and reading that as deletion
-  would retire the lot. Such a ledger keeps the home it was written from rather
-  than being rebound. A ledger written before homes were recorded is adopted,
-  retiring nothing on the run that adopts it.
+  ledger names another home neither retires from nor supersedes through it: a
+  derivation from another tree does not produce this one's pointers either, and
+  chaining onto a row this run did not create retires it exactly as
+  irreversibly as expiring it would. Such a run writes plainly, and the ledger
+  keeps the home it was written from rather than being rebound. A ledger
+  written before homes were recorded is adopted, retiring nothing on the run
+  that adopts it.
+  Anything left alone is reported under `skipped_reconciliation`, and the run
+  exits nonzero: a run that deliberately did less than it was asked must never
+  look like one that did everything.
   A key whose row this run rebound to a surviving pointer is dropped from the
   ledger rather than expired, because that row is the survivor.
   Expiry respects the same isolation as writing: a lane whose bridge will not
@@ -139,7 +153,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 BRIDGE = Path(__file__).resolve().parent / "fm-memory-mcp"
 PROJECT_MODE = Path(__file__).resolve().parent / "fm-project-mode.sh"
@@ -275,10 +289,10 @@ def pointer(
     }
 
 
-def captain_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
+def captain_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str], bool]:
     lines = read_lines(home / "data" / "captain.md")
     if lines is None:
-        return ([], ["data/captain.md is absent"])
+        return ([], ["data/captain.md is absent"], False)
     out = []
     for line_no, heading, body in sections(lines):
         decided = any(marker in heading.lower() for marker in DECISION_MARKERS)
@@ -296,13 +310,13 @@ def captain_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
                 veracity="stated",
             )
         )
-    return (out, [] if out else [EMPTY_SOURCE.format(path="data/captain.md")])
+    return (out, [], True)
 
 
-def learning_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
+def learning_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str], bool]:
     lines = read_lines(home / "data" / "learnings.md")
     if lines is None:
-        return ([], ["data/learnings.md is absent"])
+        return ([], ["data/learnings.md is absent"], False)
     out = []
     for line_no, heading, body in sections(lines):
         out.append(
@@ -319,7 +333,7 @@ def learning_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
                 veracity="tool",
             )
         )
-    return (out, [] if out else [EMPTY_SOURCE.format(path="data/learnings.md")])
+    return (out, [], True)
 
 
 def project_lane(home: Path, project: str) -> Optional[str]:
@@ -335,10 +349,10 @@ def project_lane(home: Path, project: str) -> Optional[str]:
     return lane if result.returncode == 0 and lane else None
 
 
-def project_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
+def project_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str], bool]:
     lines = read_lines(home / "data" / "projects.md")
     if lines is None:
-        return ([], ["data/projects.md is absent"])
+        return ([], ["data/projects.md is absent"], False)
     out: List[Dict[str, Any]] = []
     unrouted: List[str] = []
     for line_no, line in enumerate(lines, start=1):
@@ -370,10 +384,7 @@ def project_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
                 veracity="stated",
             )
         )
-    problems = [f"{name} carries no lane in data/projects.md" for name in unrouted]
-    if not out:
-        problems.append(EMPTY_SOURCE.format(path="data/projects.md"))
-    return (out, problems)
+    return (out, [f"{name} carries no lane in data/projects.md" for name in unrouted], True)
 
 
 def disambiguate_keys(pointers: List[Dict[str, Any]]) -> None:
@@ -394,15 +405,48 @@ def disambiguate_keys(pointers: List[Dict[str, Any]]) -> None:
             entry["key"] = f"{key}#{occurrence}"
 
 
-def derive(home: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
+class Derivation(NamedTuple):
+    """One pass over the canonical files, and what it could not account for.
+
+    `troubled` names the sources whose derivation came up short, so a lane can
+    refuse to retire THOSE keys while still reconciling everything the other
+    sources say. `empty` names sources that read fine and produced nothing,
+    which is only dangerous once a ledger holds keys for them.
+    """
+
+    pointers: List[Dict[str, Any]]
+    problems: List[str]
+    troubled: List[str]
+    empty: List[str]
+
+
+SOURCES = (
+    ("data/captain.md", captain_pointers),
+    ("data/learnings.md", learning_pointers),
+    ("data/projects.md", project_pointers),
+)
+
+
+def key_source(key: str) -> str:
+    """The canonical file a ledger key came from."""
+    return key.split("#", 1)[0]
+
+
+def derive(home: Path) -> Derivation:
     pointers: List[Dict[str, Any]] = []
     problems: List[str] = []
-    for producer in (captain_pointers, learning_pointers, project_pointers):
-        found, trouble = producer(home)
+    troubled: List[str] = []
+    empty: List[str] = []
+    for path, producer in SOURCES:
+        found, trouble, readable = producer(home)
         pointers.extend(found)
         problems.extend(trouble)
+        if trouble:
+            troubled.append(path)
+        elif readable and not found:
+            empty.append(path)
     disambiguate_keys(pointers)
-    return (pointers, problems)
+    return Derivation(pointers, problems, troubled, empty)
 
 
 # --- the ledger --------------------------------------------------------------
@@ -540,15 +584,6 @@ def write_arguments(entry: Dict[str, Any]) -> Dict[str, Any]:
     return args
 
 
-def ledger_record(entry: Dict[str, Any], memory_id: str) -> Dict[str, Any]:
-    """What the ledger remembers about one pointer that landed."""
-    return {
-        "memory_id": memory_id,
-        "canonical_sha": entry["canonical_sha"],
-        "canonical_line": entry["metadata"]["canonical_line"],
-    }
-
-
 def stale_keys(ledger: Dict[str, Any], current_keys: Iterable[str]) -> List[str]:
     """Ledger keys this derivation no longer produces."""
     current = set(current_keys)
@@ -585,24 +620,27 @@ def ledger_record(entry: Dict[str, Any], memory_id: str) -> Dict[str, Any]:
     }
 
 
-def reconciliation_state(
-    recorded_home: Optional[str], home_key: str, derivation_complete: bool
-) -> Tuple[bool, str]:
-    """Whether this lane may retire anything, and why not when it may not."""
-    if not derivation_complete:
-        return (False, "the derivation reported problems, so nothing was retired")
+def reconciliation_state(recorded_home: Optional[str], home_key: str) -> Tuple[bool, bool, str]:
+    """(may retire, may chain onto recorded ids, why not).
+
+    A ledger naming another tree records rows this run did not create, and a
+    derivation from another tree does not produce them either. Chaining onto
+    them would retire them exactly as irreversibly as expiring them, so a
+    foreign ledger is neither retired from nor superseded through: this run
+    writes plainly and leaves those rows alone.
+    """
     if recorded_home is None:
-        return (False, "the ledger recorded no home, so it was adopted and nothing was retired")
+        return (False, True, "the ledger recorded no home, so it was adopted and nothing was retired")
     if recorded_home != home_key:
-        return (False, f"the ledger was written from {recorded_home}, not from {home_key}")
-    return (True, "")
+        return (False, False, f"the ledger was written from {recorded_home}, not from {home_key}")
+    return (True, True, "")
 
 
 def reconcile_lane(
     session: BridgeSession,
     lane: str,
     ledger: Dict[str, Any],
-    current_keys: Iterable[str],
+    keys: List[str],
     counts: Dict[str, int],
     refusals: List[Dict[str, Any]],
     accounted: Set[str],
@@ -613,16 +651,14 @@ def reconcile_lane(
     same way from here: a ledger key the run did not derive. Its row is still
     live and still claims a canonical section that is gone, which is the stale
     knowledge the whole index exists to prevent, so it is expired through the
-    bridge. A key whose row this run rebound to a surviving pointer is dropped
-    rather than expired, because that row is the survivor.
+    bridge.
     """
-    retirable = set(retirable_keys(ledger, current_keys))
-    for key in stale_keys(ledger, current_keys):
-        if key not in retirable:
+    for key in keys:
+        memory_id = (ledger.get(key) or {}).get("memory_id")
+        if not memory_id:
             accounted.add(key)
-            del ledger[key]
+            ledger.pop(key, None)
             continue
-        memory_id = ledger[key]["memory_id"]
         ok, payload = session.call_tool("memory_expire", {"memory_id": memory_id})
         error = payload.get("error") or {}
         accounted.add(key)
@@ -662,45 +698,68 @@ def write_pointers(
     home: Path,
     data_dir: Path,
     pointers: List[Dict[str, Any]],
-    problems: Iterable[str] = (),
+    troubled: Iterable[str] = (),
+    empty: Iterable[str] = (),
 ) -> Dict[str, Any]:
     """Write every pointer through the bridge, one serve process per lane."""
     by_lane: Dict[str, List[Dict[str, Any]]] = {}
     for entry in pointers:
         by_lane.setdefault(entry["lane"], []).append(entry)
+    for lane in ledger_lanes(data_dir):
+        by_lane.setdefault(lane, [])
+
+    ledgers = {lane: read_ledger(data_dir, lane) for lane in sorted(by_lane)}
+    # A source that read fine and derived nothing is only dangerous once a
+    # ledger holds its keys, because that is the case where reconciliation
+    # would retire them. An empty data/learnings.md on a home that has never
+    # recorded a learning has nothing to lose and is not a problem at all.
+    at_risk = sorted({
+        key_source(key)
+        for records, _ in ledgers.values()
+        for key in records
+    })
+    dangerous = [path for path in sorted(set(empty)) if path in at_risk]
+    troubled_sources = set(troubled) | set(dangerous)
 
     counts = {"written": 0, "skipped_duplicate": 0, "updated": 0,
               "expired": 0, "refused": 0, "expiry_refused": 0}
     refusals: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
-    # Nothing is retired on a derivation that came up short. A canonical file
-    # that is absent, unreadable, or readable but empty yields no sections and
-    # a problem, which reads from here exactly like every section being deleted
-    # - and acting on it would empty a lane on the strength of a missing file.
-    derivation_complete = not list(problems)
-    for lane in ledger_lanes(data_dir):
-        by_lane.setdefault(lane, [])
     # Compared as a resolved path, so a trailing slash or a symlinked tmp root
     # is not read as a different tree.
     home_key = str(home.resolve())
     for lane in sorted(by_lane):
-        ledger, recorded_home = read_ledger(data_dir, lane)
-        reconciling, reason = reconciliation_state(recorded_home, home_key, derivation_complete)
+        ledger, recorded_home = ledgers[lane]
+        reconciling, chaining, reason = reconciliation_state(recorded_home, home_key)
         # A ledger bound to another tree stays bound to it: rebinding here
         # would retire this home's absent keys on the very next run.
         ledger_home = home_key if recorded_home in (None, home_key) else recorded_home
         entries = by_lane[lane]
         current_keys = [entry["key"] for entry in entries]
+        stale = stale_keys(ledger, current_keys)
+        # A source that came up short cannot say anything was deleted, so its
+        # keys are left exactly as they are while the rest of the lane
+        # reconciles normally.
+        guarded = [key for key in stale if key_source(key) in troubled_sources]
+        reconcilable = [key for key in stale if key not in set(guarded)]
 
-        def leave_alone(keys: List[str]) -> None:
+        def leave_alone(keys: List[str], why: str) -> None:
             if keys:
-                skipped.append({"lane": lane, "keys": keys, "reason": reason})
+                skipped.append({"lane": lane, "keys": keys, "reason": why})
 
-        if not entries and (not ledger or not reconciling):
-            # Nothing to write and nothing this run may retire, so the bridge
-            # is not started at all: the lane is reported and left as it is.
+        if guarded:
+            leave_alone(guarded, "the canonical source that owns these keys derived nothing")
+        if not reconciling:
+            # A foreign ledger is reported even with nothing stale in it: this
+            # run wrote past rows it does not own and reconciled none of them,
+            # which is not the same outcome as a run that reconciled the lane.
+            if reconcilable or (ledger and not chaining):
+                skipped.append({"lane": lane, "keys": reconcilable, "reason": reason})
+            reconcilable = []
+        retirable = [key for key in reconcilable if key in set(retirable_keys(ledger, current_keys))]
+
+        if not entries and not reconcilable:
             if ledger:
-                leave_alone(stale_keys(ledger, current_keys))
                 write_ledger(data_dir, lane, ledger, ledger_home)
             continue
         # A lane whose bridge will not start - an unprovisioned or wiped bank -
@@ -716,16 +775,12 @@ def write_pointers(
                     "kind": "write", "lane": lane, "keys": current_keys,
                     "error": lane_failure(exc),
                 })
-            retirable = retirable_keys(ledger, current_keys)
-            if reconciling:
-                counts["expiry_refused"] += len(retirable)
-                if retirable:
-                    refusals.append({
-                        "kind": "expiry", "lane": lane, "keys": retirable,
-                        "error": lane_failure(exc),
-                    })
-            else:
-                leave_alone(stale_keys(ledger, current_keys))
+            counts["expiry_refused"] += len(retirable)
+            if retirable:
+                refusals.append({
+                    "kind": "expiry", "lane": lane, "keys": retirable,
+                    "error": lane_failure(exc),
+                })
             continue
         try:
             walked = True
@@ -733,7 +788,8 @@ def write_pointers(
                 recorded = ledger.get(entry["key"]) or {}
                 args = write_arguments(entry)
                 superseding = bool(
-                    recorded.get("memory_id")
+                    chaining
+                    and recorded.get("memory_id")
                     and recorded.get("canonical_sha")
                     and recorded["canonical_sha"] != entry["canonical_sha"]
                 )
@@ -764,16 +820,12 @@ def write_pointers(
                     })
                     # The expiry half of this lane is lost with the same bridge,
                     # so it is reported here rather than left unaccounted.
-                    retirable = retirable_keys(ledger, current_keys)
-                    if reconciling:
-                        counts["expiry_refused"] += len(retirable)
-                        if retirable:
-                            refusals.append({
-                                "kind": "expiry", "lane": lane, "keys": retirable,
-                                "error": lane_failure(exc),
-                            })
-                    else:
-                        leave_alone(stale_keys(ledger, current_keys))
+                    counts["expiry_refused"] += len(retirable)
+                    if retirable:
+                        refusals.append({
+                            "kind": "expiry", "lane": lane, "keys": retirable,
+                            "error": lane_failure(exc),
+                        })
                     walked = False
                     break
                 # A result the bridge called successful still has to name the
@@ -798,34 +850,37 @@ def write_pointers(
                     continue
                 counts["written" if payload.get("created") else "skipped_duplicate"] += 1
                 ledger[entry["key"]] = ledger_record(entry, memory_id)
-            if walked and reconciling:
+            if walked and reconcilable:
                 # Only once the walk finished: a lane that lost its bridge has
                 # nothing to expire through, and its unreconciled keys have to
                 # stay in the ledger or the ids needed to retire them later are
-                # stranded with no way back.
+                # stranded with no way back. Recomputed here because the walk
+                # may have rebound a recorded row onto a surviving pointer.
                 accounted: Set[str] = set()
+                allowed = set(reconcilable)
+                pending = [key for key in retirable_keys(ledger, current_keys) if key in allowed]
+                for key in [key for key in reconcilable if key not in set(pending)]:
+                    ledger.pop(key, None)
                 try:
-                    reconcile_lane(
-                        session, lane, ledger, current_keys, counts, refusals, accounted)
+                    reconcile_lane(session, lane, ledger, pending, counts, refusals, accounted)
                 except Exception as exc:  # noqa: BLE001
                     # Only the keys reconciliation never reached: one already
                     # reported as refused is not stale twice.
-                    stranded = [key for key in retirable_keys(ledger, current_keys)
-                                if key not in accounted]
+                    stranded = [key for key in pending if key not in accounted]
                     counts["expiry_refused"] += len(stranded)
                     if stranded:
                         refusals.append({
                             "kind": "expiry", "lane": lane, "keys": stranded,
                             "error": lane_failure(exc),
                         })
-            elif walked:
-                leave_alone(stale_keys(ledger, current_keys))
         finally:
             session.close()
             write_ledger(data_dir, lane, ledger, ledger_home)
     result: Dict[str, Any] = {"counts": counts, "refusals": refusals}
     if skipped:
         result["skipped_reconciliation"] = skipped
+    if dangerous:
+        result["problems"] = [EMPTY_SOURCE.format(path=path) for path in dangerous]
     return result
 
 
@@ -851,7 +906,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     home = Path(args.home or os.environ.get("FM_HOME") or Path(__file__).resolve().parent.parent)
-    pointers, problems = derive(home)
+    derived = derive(home)
+    pointers, problems = derived.pointers, list(derived.problems)
 
     if args.command == "plan":
         print(json.dumps({
@@ -874,14 +930,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         raw = os.environ.get("MNEMOSYNE_DATA_DIR")
         data_dir = Path(raw).expanduser() if raw else Path.home() / ".hermes" / "mnemosyne" / "data"
     try:
-        result = write_pointers(home, data_dir, pointers, problems)
+        result = write_pointers(home, data_dir, pointers, derived.troubled, derived.empty)
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"status": "error", "error": str(exc) or exc.__class__.__name__}, indent=2))
         return 1
+    # A source that derived nothing only becomes a problem once a ledger holds
+    # its keys, which only the run can know.
+    problems.extend(result.get("problems", []))
+    # A run that deliberately did less than it was asked must never look like
+    # one that did everything.
     failed = (
         bool(problems)
         or result["counts"]["refused"]
         or result["counts"]["expiry_refused"]
+        or bool(result.get("skipped_reconciliation"))
     )
     report = {
         "status": "error" if failed else "ok",

@@ -663,18 +663,45 @@ def write_memory(
     }
 
 
+def dedupe_key(content: str) -> str:
+    """The exact text the library will match its dedupe on.
+
+    beam.remember() sanitizes content before it looks for a duplicate: a data:
+    URI, anything over 1 MB, and high-entropy content over 100 KB are all
+    rewritten to a content-addressed stub. A check keyed on what the caller
+    sent would therefore miss the very row the write is about to mutate, which
+    is how a memory silently leaves the project that wrote it. The sanitizer is
+    deterministic and idempotent, and the bytes it extracts land in the
+    lane-pinned blob dir this write would put them in anyway.
+    """
+    try:
+        from mnemosyne.core.content_sanitizer import sanitize_content  # noqa: PLC0415
+    except ImportError as exc:
+        raise BridgeError(
+            "library_unavailable",
+            f"cannot import mnemosyne's content sanitizer under {sys.executable}: {exc}",
+            "Without the store's own dedupe key a write could silently mutate another project's memory.",
+        ) from exc
+    try:
+        sanitized, _blob_meta = sanitize_content(content)
+    except Exception as exc:  # noqa: BLE001 - surface any library failure as typed
+        raise BridgeError("write_failed", f"cannot compute the store's dedupe key: {exc}") from exc
+    return sanitized
+
+
 def duplicate_row(store, content: str) -> Optional[Dict[str, Any]]:
     """The row the store's dedupe would update in place instead of writing anew.
 
-    The library dedupes on (session_id, content) and returns the matched row's
-    id, so a caller that needs to know whether a write creates or mutates has to
-    ask the same question first - after the fact the mutation has already landed.
-    Its channel comes back too, because the dedupe update overwrites it.
+    The library dedupes on (session_id, sanitized content) and returns the
+    matched row's id, so a caller that needs to know whether a write creates or
+    mutates has to ask the same question, on the same key, first - after the
+    fact the mutation has already landed. The channel comes back too, because
+    the dedupe update overwrites it.
     """
     try:
         row = store.conn.execute(
             "SELECT id, channel_id FROM working_memory WHERE session_id = ? AND content = ? LIMIT 1",
-            (store.session_id, content),
+            (store.session_id, dedupe_key(content)),
         ).fetchone()
     except sqlite3.Error as exc:
         raise BridgeError("read_failed", f"cannot check working_memory for a duplicate: {exc}") from exc

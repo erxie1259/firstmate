@@ -936,6 +936,52 @@ test_recall_honors_the_session_it_is_told_to_act_as() {
   pass "fm-memory-mcp: recall acts as the session it is told to act as, and reports it"
 }
 
+test_extracted_content_is_never_relocated_out_of_its_project() {
+  local dir first second row
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the extracted-content dedupe test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the extracted-content dedupe test"
+    return
+  fi
+  # The store rewrites a data: URI to a content-addressed stub before it dedupes,
+  # so two projects sending the same payload collide on content neither of them
+  # sent. A cross-project guard keyed on what the caller wrote cannot see that,
+  # and the row leaves the project that wrote it without a word.
+  dir="$TMP_ROOT/extracted-dedupe"
+  mkdir -p "$dir"
+  export FM_MEMORY_TEST_HOME="$TMP_ROOT/extracted-home"
+  mkdir -p "$FM_MEMORY_TEST_HOME/.hermes"
+  [ -d "$HOME/.hermes/cache" ] && ln -sfn "$HOME/.hermes/cache" "$FM_MEMORY_TEST_HOME/.hermes/cache"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+
+  first=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB","project":"alpha"}}}' \
+    | tail -n 1)
+  first=$(tool_payload "$first")
+  [ "$(json_field "$first" "d['isError']")" = "False" ] || fail "the first extracted write failed: $first"
+  first=$(json_field "$first" "d['payload']['id']")
+
+  second=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB","project":"beta"}}}' \
+    | tail -n 1)
+  second=$(tool_payload "$second")
+  [ "$(json_field "$second" "d['isError']")" = "True" ] \
+    || fail "the same extracted payload was accepted under a second project: $second"
+  [ "$(json_field "$second" "d['payload']['error']['code']")" = "duplicate_in_other_project" ] \
+    || fail "the refusal was not typed duplicate_in_other_project: $second"
+
+  row=$(python3 - "$dir/banks/lane-products/mnemosyne.db" "$first" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+r = conn.execute("SELECT channel_id FROM working_memory WHERE id = ?", (sys.argv[2],)).fetchone()
+print(r[0])
+PY
+)
+  [ "$row" = "alpha" ] || fail "the extracted memory was relocated out of the project that wrote it: $row"
+  unset FM_MEMORY_TEST_HOME
+  pass "fm-memory-mcp: extracted content is refused under a second project, not relocated"
+}
+
 test_preflight_refuses_missing_data_dir
 test_preflight_refuses_missing_bank
 test_preflight_refuses_unprovisioned_bank
@@ -970,3 +1016,4 @@ test_stats_names_the_lane_bank_and_leaves_no_stray_directory
 test_the_same_content_is_never_relocated_out_of_its_project
 test_supersede_refuses_content_the_store_matched_onto_the_target
 test_recall_honors_the_session_it_is_told_to_act_as
+test_extracted_content_is_never_relocated_out_of_its_project

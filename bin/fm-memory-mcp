@@ -96,7 +96,11 @@ WRITE POLICY
   success shape for a memory no recall can return. Reviving one stays a
   deliberate act, and this phase exposes no tool for it. A `valid_until` that
   is malformed or already past is refused for the same reason: a write nobody
-  can recall must never be reported as a pinned durable success.
+  can recall must never be reported as a pinned durable success. It is judged,
+  and stored, as the canonical local timestamp the store's own text compare
+  will see, so the bridge's verdict and the store's filter cannot disagree.
+  Refusals that point at a replacement follow the chain to the row still
+  claimed to be true, never to one that was itself retired.
 
 TOOLS
   memory_remember           durable write: scope, lane, channel_id, memory_type,
@@ -621,7 +625,7 @@ def write_memory(
         raise BridgeError("invalid_argument", "importance must be a number between 0 and 1") from None
     if not 0.0 <= importance <= 1.0:
         raise BridgeError("invalid_argument", "importance must be between 0 and 1")
-    check_valid_until(valid_until)
+    valid_until = check_valid_until(valid_until)
 
     if store is None:
         store = open_store(data_dir, lane, channel_id, session_id)
@@ -640,7 +644,7 @@ def write_memory(
                 f"lane {lane} holds this exact content under project {existing['channel_id']!r} as memory "
                 f"{existing['id']}, which was already {retired}; writing it under {channel_id!r} would drag "
                 f"that retired row into this project and it would still be returned by no recall",
-                retired_hint(existing),
+                retired_hint(store, existing),
             )
         raise BridgeError(
             "duplicate_in_other_project",
@@ -660,7 +664,7 @@ def write_memory(
             f"memory {existing['id']} in lane {lane} already holds this exact content and was {retired}; "
             f"the store would update that row in place and it would stay {retired}, so nothing written here "
             f"could be recalled",
-            retired_hint(existing),
+            retired_hint(store, existing),
         )
     try:
         memory_id = store.beam.remember(
@@ -734,7 +738,31 @@ def retired_state(row: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def retired_hint(row: Dict[str, Any]) -> str:
+def live_head(store, memory_id: Optional[str]) -> Optional[str]:
+    """Follow superseded_by from here to the row still claimed to be true.
+
+    A chain grows every time a fact is revised, so the row that directly
+    replaced a retired memory is often retired itself. Naming it would send a
+    caller to another dead row. invalidate() writes superseded_by
+    unconditionally, so a row can also carry a self-link or a cycle; the visited
+    set makes the walk terminate on those instead of spinning. Returns None when
+    the chain ends without a live row, which is what an expired memory with no
+    replacement looks like.
+    """
+    seen: set = set()
+    current = memory_id
+    while current and current not in seen:
+        seen.add(current)
+        row = read_memory(store, current)
+        if row is None:
+            return None
+        if not retired_state(row):
+            return current
+        current = row.get("superseded_by")
+    return None
+
+
+def retired_hint(store, row: Dict[str, Any]) -> str:
     """What a caller can actually do about content that is already retired.
 
     Never "supersede the retired row": that overwrites the link it carries to
@@ -743,27 +771,32 @@ def retired_hint(row: Dict[str, Any]) -> str:
     this bridge does not expose yet, and saying so is more use than a suggestion
     that cannot work.
     """
-    replacement = row.get("superseded_by")
+    head = live_head(store, row.get("superseded_by"))
     opening = (
         f"This content is retired as memory {row['id']}, and deliberate revival is not a tool this "
         f"bridge exposes yet. "
     )
-    if replacement:
-        return opening + f"Supersede {replacement}, the live replacement, or write distinct content."
+    if head:
+        return opening + f"Supersede {head}, the live replacement, or write distinct content."
     return opening + "Write distinct content."
 
 
-def check_valid_until(valid_until: Optional[str]) -> None:
-    """A shelf life has to be a real timestamp, and it has to be in the future.
+def check_valid_until(valid_until: Optional[str]) -> Optional[str]:
+    """Validate a shelf life and return the exact string the store should hold.
 
-    The library string-compares valid_until against an ISO timestamp and never
-    validates it, so 'next week' becomes either permanent or immediately dead
-    depending on its first character, and a past timestamp writes a row that
-    every recall filters out - a pinned durable success for a memory nobody can
-    ever read. That is the shape the whole contract exists to forbid.
+    The library never parses this field: it writes whatever it is given and
+    every recall filters it with the text compare `valid_until > <now as an ISO
+    string>`. So a value is judged here by that same predicate, on the same
+    canonical form the store will hold - naive local isoformat, which is what
+    the store compares against. Without that, lexical and chronological order
+    can disagree: '2026-08-20 23:00:00' is hours away by the clock but sorts
+    below the 'T' separator and is dead on arrival, and an offset timestamp
+    sorts by its wall-clock digits rather than the instant it names. Either way
+    the write would be reported pinned and durable while no recall could ever
+    return it, which is the shape this whole contract forbids.
     """
     if valid_until is None:
-        return
+        return None
     if not isinstance(valid_until, str) or not valid_until.strip():
         raise BridgeError("invalid_argument", "valid_until must be an ISO 8601 timestamp string")
     try:
@@ -774,14 +807,17 @@ def check_valid_until(valid_until: Optional[str]) -> None:
             f"valid_until {valid_until!r} is not an ISO 8601 timestamp",
             "Use a timestamp like 2027-03-01T00:00:00; the store never parses this field, it compares it as text.",
         ) from None
-    now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
-    if parsed <= now:
+    if parsed.tzinfo:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    canonical = parsed.isoformat()
+    if canonical <= now_iso():
         raise BridgeError(
             "valid_until_in_the_past",
-            f"valid_until {valid_until!r} has already passed, so the memory would be expired the moment it "
-            f"was written and no recall could ever return it",
+            f"valid_until {valid_until!r} is {canonical} here, which has already passed, so the memory would "
+            f"be expired the moment it was written and no recall could ever return it",
             "Give a future timestamp, omit it for a memory with no shelf life, or use memory_expire to retire one.",
         )
+    return canonical
 
 
 def duplicate_row(store, content: str) -> Optional[Dict[str, Any]]:
@@ -1088,15 +1124,16 @@ class Bridge:
         target_retired = retired_state(target)
         if target_retired:
             replacement = target.get("superseded_by")
+            head = live_head(store, replacement)
             raise BridgeError(
                 "supersede_target_retired",
                 f"memory {memory_id} in lane {lane} was already {target_retired}"
                 + (f", replaced by memory {replacement}" if replacement else "")
                 + "; superseding it again would discard that link and leave two live rows claiming the same fact",
                 (
-                    f"Supersede {replacement} instead - that is the row still claimed to be true."
-                    if replacement
-                    else "An expired memory has no live replacement; write this as a new memory instead."
+                    f"Supersede {head} instead - that is the row still claimed to be true."
+                    if head
+                    else "Nothing live replaces it; write this as a new memory instead."
                 ),
             )
         # Ask before writing: the store dedupes on (session_id, content), so

@@ -1215,6 +1215,136 @@ test_a_malformed_valid_until_is_refused() {
   pass "fm-memory-mcp: a malformed valid_until is refused rather than compared as text"
 }
 
+test_a_non_canonical_shelf_life_is_recallable_not_dead_on_arrival() {
+  local dir spaced offset out
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the canonical-shelf-life test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the canonical-shelf-life test"
+    return
+  fi
+  # The store never parses this field: it holds the string and every recall
+  # filters it with a text compare against an ISO timestamp. A space separator
+  # sorts below 'T', so a same-day deadline written that way is dead the moment
+  # it lands even though the clock says hours away; an offset timestamp sorts by
+  # its wall-clock digits rather than the instant it names. Anything reported
+  # pinned and durable has to actually be recallable.
+  #
+  # Both values are the last second of today, which is what puts the separator
+  # and the offset digits where the compare actually reaches them - a later date
+  # would sort correctly whatever follows it. Within the final minute of the day
+  # there is no same-day future second, so the value rolls to tomorrow and the
+  # assertions still hold, just without that pressure.
+  dir="$TMP_ROOT/canonical-shelf-life"
+  mkdir -p "$dir"
+  spaced=$(python3 -c "
+from datetime import datetime, timedelta
+now = datetime.now()
+end = now.replace(hour=23, minute=59, second=59, microsecond=0)
+if end <= now + timedelta(seconds=30):
+    end += timedelta(days=1)
+print(end.strftime('%Y-%m-%d %H:%M:%S'))")
+  offset=$(python3 -c "
+from datetime import datetime, timedelta
+now = datetime.now().astimezone()
+end = now.replace(hour=23, minute=59, second=59, microsecond=0)
+if end <= now + timedelta(seconds=30):
+    end += timedelta(days=1)
+print(end.isoformat())")
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_remember\",\"arguments\":{\"content\":\"Zarquon holds until the space-separated deadline.\",\"project\":\"alpha\",\"valid_until\":\"$spaced\"}}}" \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "False" ] || fail "a space-separated future timestamp was refused: $out"
+
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_remember\",\"arguments\":{\"content\":\"Quuxbar holds until the offset deadline.\",\"project\":\"alpha\",\"valid_until\":\"$offset\"}}}" \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "False" ] || fail "a timezone-aware future timestamp was refused: $out"
+
+  # The write was reported durable, so recall has to be able to return it.
+  out=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"query":"Zarquon","project":"alpha","include_awareness":false}}}' \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "sum(1 for r in d['payload']['results'] if 'Zarquon' in r['content'])")" = "1" ] \
+    || fail "a write reported pinned and durable was already expired to recall: $out"
+
+  out=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"query":"Quuxbar","project":"alpha","include_awareness":false}}}' \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "sum(1 for r in d['payload']['results'] if 'Quuxbar' in r['content'])")" = "1" ] \
+    || fail "an offset-timestamp write reported durable was already expired to recall: $out"
+  pass "fm-memory-mcp: a non-canonical future shelf life is stored recallable, not dead on arrival"
+}
+
+test_retired_refusals_name_the_live_head_of_the_chain() {
+  local dir first second third out hint
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the chain-head test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the chain-head test"
+    return
+  fi
+  # A fact revised twice leaves a chain: X -> Y -> Z. Y is retired, so pointing
+  # a caller at Y just earns another refusal; only Z is actionable.
+  dir="$TMP_ROOT/chain-head"
+  mkdir -p "$dir"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+  first=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"Standups are at nine.","project":"alpha"}}}' \
+    | tail -n 1)
+  first=$(json_field "$(tool_payload "$first")" "d['payload']['id']")
+  second=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_supersede\",\"arguments\":{\"memory_id\":\"$first\",\"content\":\"Standups are at ten.\",\"project\":\"alpha\"}}}" \
+    | tail -n 1)
+  second=$(json_field "$(tool_payload "$second")" "d['payload']['id']")
+  third=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_supersede\",\"arguments\":{\"memory_id\":\"$second\",\"content\":\"Standups are at eleven.\",\"project\":\"alpha\"}}}" \
+    | tail -n 1)
+  third=$(tool_payload "$third")
+  [ "$(json_field "$third" "d['isError']")" = "False" ] || fail "superseding the live replacement failed: $third"
+  third=$(json_field "$third" "d['payload']['id']")
+  [ -n "$first" ] && [ -n "$second" ] && [ -n "$third" ] || fail "the chain was not built: $first $second $third"
+
+  # Re-asserting the oldest text must point at the head, not at the middle.
+  out=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"Standups are at nine.","project":"alpha"}}}' \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['payload']['error']['code']")" = "duplicate_is_retired" ] \
+    || fail "re-asserting retired content was not refused: $out"
+  hint=$(json_field "$out" "d['payload']['error']['hint']")
+  case "$hint" in
+    *"$third"*) ;;
+    *) fail "the refusal did not name the live head of the chain: $hint" ;;
+  esac
+  case "$hint" in
+    *"$second"*) fail "the refusal pointed at a replacement that is itself retired: $hint" ;;
+    *) ;;
+  esac
+
+  # And so must a supersede of the oldest row.
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_supersede\",\"arguments\":{\"memory_id\":\"$first\",\"content\":\"Standups are at noon.\",\"project\":\"alpha\"}}}" \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['payload']['error']['code']")" = "supersede_target_retired" ] \
+    || fail "superseding a retired target was not refused: $out"
+  hint=$(json_field "$out" "d['payload']['error']['hint']")
+  case "$hint" in
+    *"$third"*) ;;
+    *) fail "the supersede refusal did not name the live head of the chain: $hint" ;;
+  esac
+  case "$hint" in
+    *"$second"*) fail "the supersede refusal pointed at a retired row: $hint" ;;
+    *) ;;
+  esac
+  pass "fm-memory-mcp: refusals point at the live head of a chain, never at a retired link"
+}
+
 test_preflight_refuses_missing_data_dir
 test_preflight_refuses_missing_bank
 test_preflight_refuses_unprovisioned_bank
@@ -1256,3 +1386,5 @@ test_a_memory_with_a_future_shelf_life_is_still_writable
 test_superseding_an_already_superseded_memory_is_refused
 test_a_valid_until_already_in_the_past_is_refused
 test_a_malformed_valid_until_is_refused
+test_a_non_canonical_shelf_life_is_recallable_not_dead_on_arrival
+test_retired_refusals_name_the_live_head_of_the_chain

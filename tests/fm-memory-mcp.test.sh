@@ -982,6 +982,127 @@ PY
   pass "fm-memory-mcp: extracted content is refused under a second project, not relocated"
 }
 
+test_reasserting_a_superseded_memory_is_refused_not_reported_durable() {
+  local dir first replacement out row
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the retired-reassert test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the retired-reassert test"
+    return
+  fi
+  # The store's dedupe updates a matched row in place and leaves superseded_by
+  # and valid_until untouched, so re-asserting a retired memory's text would
+  # report a pinned durable write for a row every recall filters out.
+  dir="$TMP_ROOT/reassert-superseded"
+  mkdir -p "$dir"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+  first=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"Ship on Fridays.","project":"alpha"}}}' \
+    | tail -n 1)
+  first=$(json_field "$(tool_payload "$first")" "d['payload']['id']")
+  [ -n "$first" ] || fail "no id came back from the first write"
+
+  replacement=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_supersede\",\"arguments\":{\"memory_id\":\"$first\",\"content\":\"Ship on Tuesdays.\",\"project\":\"alpha\"}}}" \
+    | tail -n 1)
+  replacement=$(tool_payload "$replacement")
+  [ "$(json_field "$replacement" "d['isError']")" = "False" ] || fail "supersede failed: $replacement"
+  replacement=$(json_field "$replacement" "d['payload']['id']")
+
+  # The decision reverts, so the agent re-asserts the original text.
+  out=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"Ship on Fridays.","project":"alpha"}}}' \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "True" ] \
+    || fail "re-asserting a superseded memory was reported as a durable write: $out"
+  [ "$(json_field "$out" "d['payload']['error']['code']")" = "duplicate_is_retired" ] \
+    || fail "the refusal was not typed duplicate_is_retired: $out"
+  assert_contains "$out" "superseded" "the refusal did not name the state the memory is actually in"
+  assert_contains "$out" "$first" "the refusal did not name the retired memory"
+
+  row=$(python3 - "$dir/banks/lane-products/mnemosyne.db" "$first" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+r = conn.execute("SELECT superseded_by, valid_until IS NOT NULL FROM working_memory WHERE id = ?",
+                 (sys.argv[2],)).fetchone()
+print("|".join(str(x) for x in r))
+PY
+)
+  # Refused means untouched: the retirement stands and nothing was revived.
+  [ "$row" = "$replacement|1" ] || fail "the refused write still touched the retired memory: $row"
+  pass "fm-memory-mcp: re-asserting a superseded memory is refused, never reported durable"
+}
+
+test_reasserting_an_expired_memory_is_refused_not_reported_durable() {
+  local dir first out row
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the expired-reassert test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the expired-reassert test"
+    return
+  fi
+  # memory_expire retires a row the same way, with no replacement, so it reaches
+  # the same dedupe path.
+  dir="$TMP_ROOT/reassert-expired"
+  mkdir -p "$dir"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+  first=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"The staging cluster is on the old image.","project":"alpha"}}}' \
+    | tail -n 1)
+  first=$(json_field "$(tool_payload "$first")" "d['payload']['id']")
+  [ -n "$first" ] || fail "no id came back from the first write"
+
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_expire\",\"arguments\":{\"memory_id\":\"$first\"}}}" \
+    | tail -n 1)
+  [ "$(json_field "$(tool_payload "$out")" "d['isError']")" = "False" ] || fail "expire failed: $out"
+
+  out=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"The staging cluster is on the old image.","project":"alpha"}}}' \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "True" ] \
+    || fail "re-asserting an expired memory was reported as a durable write: $out"
+  [ "$(json_field "$out" "d['payload']['error']['code']")" = "duplicate_is_retired" ] \
+    || fail "the refusal was not typed duplicate_is_retired: $out"
+  assert_contains "$out" "expired" "the refusal did not name the state the memory is actually in"
+
+  row=$(python3 - "$dir/banks/lane-products/mnemosyne.db" "$first" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+r = conn.execute("SELECT valid_until IS NOT NULL FROM working_memory WHERE id = ?", (sys.argv[2],)).fetchone()
+print(r[0])
+PY
+)
+  [ "$row" = "1" ] || fail "the refused write revived the expired memory: $row"
+  pass "fm-memory-mcp: re-asserting an expired memory is refused, never reported durable"
+}
+
+test_a_memory_with_a_future_shelf_life_is_still_writable() {
+  local dir out
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the shelf-life test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the shelf-life test"
+    return
+  fi
+  # valid_until in the future is a shelf life, not a retirement; only a past one
+  # takes a memory out of recall.
+  local future
+  dir="$TMP_ROOT/shelf-life"
+  mkdir -p "$dir"
+  future=$(python3 -c "from datetime import datetime, timedelta; print((datetime.now()+timedelta(days=30)).isoformat())")
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+  serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_remember\",\"arguments\":{\"content\":\"The trial ends next month.\",\"project\":\"alpha\",\"valid_until\":\"$future\"}}}" \
+    >/dev/null
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_remember\",\"arguments\":{\"content\":\"The trial ends next month.\",\"project\":\"alpha\",\"valid_until\":\"$future\"}}}" \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "False" ] \
+    || fail "a memory that has not expired yet was refused as retired: $out"
+  pass "fm-memory-mcp: a future shelf life is not a retirement"
+}
+
 test_preflight_refuses_missing_data_dir
 test_preflight_refuses_missing_bank
 test_preflight_refuses_unprovisioned_bank
@@ -1017,3 +1138,6 @@ test_the_same_content_is_never_relocated_out_of_its_project
 test_supersede_refuses_content_the_store_matched_onto_the_target
 test_recall_honors_the_session_it_is_told_to_act_as
 test_extracted_content_is_never_relocated_out_of_its_project
+test_reasserting_a_superseded_memory_is_refused_not_reported_durable
+test_reasserting_an_expired_memory_is_refused_not_reported_durable
+test_a_memory_with_a_future_shelf_life_is_still_writable

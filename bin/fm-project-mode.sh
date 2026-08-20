@@ -16,6 +16,10 @@
 #   - <name> [<mode>] - <desc> (added <date>)          -> <mode> off
 #   - <name> [<mode> +yolo] - <desc> (added <date>)    -> <mode> on
 #
+# The bracket group may also carry an optional memory-lane token,
+# "lane:<name>", which this script ignores and bin/fm-memory-mcp reads to route
+# a project's memories to its lane. Any other unrecognized token is ignored too.
+#
 # Registered modes:
 #   no-mistakes            full pipeline -> PR -> configured merge authority (default)
 #   direct-PR              push + PR via gh-axi, no pipeline

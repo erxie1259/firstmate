@@ -695,8 +695,8 @@ def recall_lane(
     if not query or not query.strip():
         raise BridgeError("invalid_argument", "query is required and cannot be blank")
     merged: Dict[str, Dict[str, Any]] = {}
+    store = open_store(data_dir, lane, LANE_CHANNEL, session_id)
     for channel in channels:
-        store = open_store(data_dir, lane, channel or LANE_CHANNEL, session_id)
         try:
             hits = store.beam.recall(
                 query,

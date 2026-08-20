@@ -371,7 +371,11 @@ class BridgeSession:
             text=True,
             bufsize=1,
         )
-        self._call_raw("initialize", {})
+        try:
+            self._call_raw("initialize", {})
+        except BaseException:
+            self.close()
+            raise
 
     def _call_raw(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         assert self.proc.stdin and self.proc.stdout
@@ -404,17 +408,33 @@ class BridgeSession:
         return (not result.get("isError", False), payload)
 
     def close(self) -> None:
+        """Tear the bridge down. Never raises: a dead bridge costs its lane.
+
+        Closing the pipe onto a process that has already gone raises a second
+        time on the buffered request its flush could not deliver, and letting
+        that escape would lose the counts for every pointer that did land.
+        """
         try:
             self._call_raw("shutdown", {})
         except (PointerError, ValueError):
             pass
         finally:
-            if self.proc.stdin:
-                self.proc.stdin.close()
+            for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
             try:
                 self.proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+                try:
+                    self.proc.wait(timeout=30)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+            except OSError:
+                pass
 
 
 def write_arguments(entry: Dict[str, Any]) -> Dict[str, Any]:

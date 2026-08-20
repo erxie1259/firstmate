@@ -423,6 +423,74 @@ test_a_lost_ledger_costs_a_duplicate_pointer_not_a_wrong_answer() {
   pass "fm-memory-pointers: a lost ledger falls back to the store's own dedupe, changing nothing"
 }
 
+test_a_bridge_that_dies_midlane_still_reports_every_lane() {
+  local home dir stub out
+  home=$(make_home midlane-home)
+  dir="$TMP_ROOT/midlane-dir"
+  fm_pointers_assert_scratch "$dir"
+  mkdir -p "$dir"
+
+  # A stub bridge that answers `initialize`, serves exactly one tool call, and
+  # then dies mid-lane. A real bridge can go the same way - killed, out of
+  # disk, crashed after startup - and the run has to survive it: the pointers
+  # that already landed stay counted, the stranded ones are named, and the
+  # remaining lanes are still walked.
+  stub="$TMP_ROOT/midlane-bridge.py"
+  cat > "$stub" <<'PY'
+import json, sys
+served = False
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["method"] == "initialize":
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {}}) + "\n")
+        sys.stdout.flush()
+        continue
+    if served:
+        sys.exit(0)
+    served = True
+    payload = json.dumps({"id": "row-%s" % request["id"], "created": True})
+    sys.stdout.write(json.dumps({
+        "jsonrpc": "2.0", "id": request["id"],
+        "result": {"content": [{"type": "text", "text": payload}]}}) + "\n")
+    sys.stdout.flush()
+PY
+
+  out=$(python3 - "$ROOT/bin/fm-memory-pointers" "$stub" "$home" "$dir" <<'PY'
+import importlib.machinery, importlib.util, json, sys
+from pathlib import Path
+
+module_path, stub, home, data_dir = sys.argv[1:5]
+loader = importlib.machinery.SourceFileLoader("fm_memory_pointers", module_path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+mod.BRIDGE = Path(stub)
+
+pointers, problems = mod.derive(Path(home))
+result = mod.write_pointers(Path(home), Path(data_dir), pointers)
+print(json.dumps({"total": len(pointers), "problems": problems, **result}))
+PY
+) || fail "a bridge dying mid-lane crashed the run: $out"
+
+  # One pointer per lane landed before its bridge died, and all three lanes
+  # were walked: a crash on the first lane would report none of this.
+  [ "$(json_field "$out" "d['counts']['written']")" = "3" ] \
+    || fail "the pointers that landed before the bridge died were not counted: $out"
+  [ "$(json_field "$out" "d['counts']['refused']")" = "3" ] \
+    || fail "the stranded pointers were not counted as refused: $out"
+  [ "$(json_field "$out" "d['counts']['written'] + d['counts']['refused'] == d['total']")" = "True" ] \
+    || fail "the run lost track of some pointers entirely: $out"
+  [ "$(json_field "$out" "sorted({r['lane'] for r in d['refusals']})")" \
+    = "['fleet-infra', 'shared']" ] || fail "the lanes that lost pointers were not named: $out"
+  [ "$(json_field "$out" "all(r['keys'] for r in d['refusals'])")" = "True" ] \
+    || fail "a refusal did not name the pointers that did not land: $out"
+  # The ledger for a lane that failed mid-way still records what DID land, so
+  # the next run supersedes those rows rather than duplicating them.
+  [ -f "$dir/banks/lane-shared/fm-memory-pointers.json" ] \
+    || fail "a lane that failed mid-way lost the ledger for the pointer that landed"
+  pass "fm-memory-pointers: a bridge dying mid-lane costs its lane, never the run's counts"
+}
+
 test_write_refuses_an_unprovisioned_lane_rather_than_creating_one() {
   local home dir out status
   skip_without_library "the unprovisioned-lane test" && return
@@ -452,5 +520,6 @@ test_an_edited_section_supersedes_its_pointer_instead_of_adding_a_second
 test_a_shifted_section_supersedes_its_pointer_instead_of_adding_a_second
 test_two_sections_sharing_a_heading_keep_one_live_pointer_each
 test_a_lost_ledger_costs_a_duplicate_pointer_not_a_wrong_answer
+test_a_bridge_that_dies_midlane_still_reports_every_lane
 test_write_refuses_an_unprovisioned_lane_rather_than_creating_one
 echo "# all fm-memory-pointers tests passed"

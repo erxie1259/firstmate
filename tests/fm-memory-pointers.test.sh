@@ -207,15 +207,29 @@ MD
   pass "fm-memory-pointers: an unrouted project is reported and skipped, never guessed into a lane"
 }
 
-test_plan_reports_an_absent_canonical_file_rather_than_inventing_one() {
-  local home out status
+test_plan_treats_an_absent_source_exactly_like_an_empty_one() {
+  local home absent emptied
   home=$(make_home absent-home)
+
+  # Absent and readable-but-empty are the same situation for a derivation:
+  # the source produces nothing, and which of the two it is says nothing about
+  # whether anything is at risk. Planning opens no store, so neither can be
+  # dangerous here and neither is a problem.
   rm "$home/data/learnings.md"
-  status=0
-  out=$("$POINTERS" plan --home "$home") || status=$?
-  [ "$status" -eq 1 ] || fail "an absent canonical file did not make the plan fail: exit $status"
-  assert_contains "$out" "data/learnings.md is absent" "the absent file was not named: $out"
-  pass "fm-memory-pointers: an absent canonical file is reported, not silently indexed as empty"
+  absent=$("$POINTERS" plan --home "$home") \
+    || fail "an absent canonical file made the plan fail: $absent"
+  [ "$(json_field "$absent" "d['problems']")" = "[]" ] \
+    || fail "an absent source was reported as a problem by plan: $absent"
+  [ "$(json_field "$absent" "sum(1 for p in d['pointers'] if 'learnings' in p['metadata']['canonical_file'])")" = "0" ] \
+    || fail "an absent source was invented into pointers: $absent"
+
+  : > "$home/data/learnings.md"
+  emptied=$("$POINTERS" plan --home "$home") \
+    || fail "an empty canonical file made the plan fail: $emptied"
+  [ "$(json_field "$absent" "(d['total'], d['lanes'], d['problems'])")" \
+    = "$(json_field "$emptied" "(d['total'], d['lanes'], d['problems'])")" ] \
+    || fail "an absent source planned differently from an empty one: $absent vs $emptied"
+  pass "fm-memory-pointers: an absent source plans exactly as an empty one does, and neither is a problem"
 }
 
 # --- writing through the bridge ----------------------------------------------
@@ -592,22 +606,59 @@ PY
 }
 
 test_a_lazily_absent_learnings_file_is_not_a_problem() {
-  local home dir out
+  local home dir out state
   skip_without_library "the lazy-learnings test" && return
-  home=$(make_home lazy-home)
-  dir=$(make_lanes lazy-dir shared fleet-infra products)
   # AGENTS.md creates data/learnings.md lazily, so a home that has recorded no
   # learning yet is an ordinary state, not a derivation that came up short.
-  : > "$home/data/learnings.md"
+  # Never created and truncated to zero are the same thing here, and a run with
+  # nothing indexed for that source has nothing to lose either way.
+  for state in absent empty; do
+    home=$(make_home "lazy-$state-home")
+    dir=$(make_lanes "lazy-$state-dir" shared fleet-infra products)
+    case "$state" in
+      absent) rm "$home/data/learnings.md" ;;
+      empty) : > "$home/data/learnings.md" ;;
+    esac
 
-  out=$(fm_pointers "$home" "$dir" write) || fail "a home with no learnings yet failed: $out"
-  [ "$(json_field "$out" "d['problems']")" = "[]" ] \
-    || fail "an empty learnings file with nothing indexed was reported as a problem: $out"
-  [ "$(json_field "$out" "d['counts']['expired'] + d['counts']['refused']")" = "0" ] \
-    || fail "a home with no learnings retired or refused something: $out"
-  [ "$(live_pointer_rows "$dir" fleet-infra)" = "1" ] \
-    || fail "the fleet-infra project pointer did not land"
-  pass "fm-memory-pointers: a home that has recorded no learning yet runs normally"
+    out=$(fm_pointers "$home" "$dir" write) \
+      || fail "a home whose learnings file is $state failed: $out"
+    [ "$(json_field "$out" "d['problems']")" = "[]" ] \
+      || fail "a $state learnings file with nothing indexed was reported as a problem: $out"
+    [ "$(json_field "$out" "d['counts']['expired'] + d['counts']['refused']")" = "0" ] \
+      || fail "a home whose learnings file is $state retired or refused something: $out"
+    [ "$(json_field "$out" "'skipped_reconciliation' in d")" = "False" ] \
+      || fail "a $state learnings file guarded keys it has nothing at risk in: $out"
+    [ "$(live_pointer_rows "$dir" fleet-infra)" = "1" ] \
+      || fail "the fleet-infra project pointer did not land with a $state learnings file"
+  done
+  pass "fm-memory-pointers: a home that has recorded no learning yet runs normally, absent or empty"
+}
+
+test_an_absent_source_whose_pointers_are_indexed_refuses_like_an_empty_one() {
+  local home dir out status
+  skip_without_library "the absent-with-pointers test" && return
+  home=$(make_home absent-indexed-home)
+  dir=$(make_lanes absent-indexed-dir shared fleet-infra products)
+  fm_pointers "$home" "$dir" write >/dev/null || fail "the first pointer run failed"
+
+  # Once the ledger this run owns holds its keys, a source that is simply gone
+  # reads exactly like every one of its sections having been deleted, and
+  # retiring on that reading cannot be undone. It is refused, not obeyed, on
+  # the same terms as a file truncated to nothing.
+  rm "$home/data/learnings.md"
+
+  status=0
+  out=$(fm_pointers "$home" "$dir" write) || status=$?
+  [ "$status" -eq 1 ] || fail "an absent source with pointers indexed exited $status, not 1"
+  [ "$(json_field "$out" "d['counts']['expired']")" = "0" ] \
+    || fail "an absent source retired its pointers: $out"
+  [ "$(live_pointer_rows "$dir" fleet-infra)" = "3" ] \
+    || fail "the learnings pointers were retired on the strength of a missing file"
+  [ "$(json_field "$out" "any('learnings.md' in p for p in d['problems'])")" = "True" ] \
+    || fail "the absent source was not reported as a problem: $out"
+  [ "$(json_field "$out" "sorted({s.split('#')[0] for l in d['skipped_reconciliation'] for s in l['keys']})")" \
+    = "['data/learnings.md']" ] || fail "keys from a healthy source were left alone too: $out"
+  pass "fm-memory-pointers: an absent source whose pointers are indexed refuses exactly as an empty one does"
 }
 
 test_an_emptied_learnings_file_with_pointers_indexed_refuses() {
@@ -681,6 +732,57 @@ MD
   [ "$(live_pointer_rows "$dir" shared)" = "2" ] \
     || fail "the shared lane was emptied by a file that merely lost its headings"
   pass "fm-memory-pointers: a canonical file that derives no sections is refused, never obeyed"
+}
+
+test_a_foreign_ledgers_keys_do_not_put_this_homes_source_at_risk() {
+  local other home dir out status
+  skip_without_library "the foreign-at-risk test" && return
+  dir=$(make_lanes foreign-at-risk-dir shared fleet-infra products)
+
+  # A home that derives one project pointer and nothing else, so the only
+  # ledger it leaves behind is lane-products, bound to it.
+  other="$TMP_ROOT/foreign-at-risk-other"
+  fm_pointers_assert_scratch "$other"
+  mkdir -p "$other/data"
+  cat > "$other/data/projects.md" <<'MD'
+# Projects
+
+- flags [no-mistakes +yolo lane:products] - Flutter flags app (added 2026-07-29)
+MD
+  out=$(fm_pointers "$other" "$dir" write) || fail "the foreign home's run failed: $out"
+
+  # This home shares the data dir but derives no projects at all. Its OWN
+  # ledgers hold no data/projects.md keys, so nothing of its own is at risk -
+  # and the other home's keys are never reconciled from here, so they cannot
+  # put a source of this one's at risk either.
+  home=$(make_home foreign-at-risk-home)
+  rm "$home/data/projects.md"
+
+  status=0
+  out=$(fm_pointers "$home" "$dir" write) || status=$?
+  [ "$(json_field "$out" "any('projects.md' in p for p in d['problems'])")" = "False" ] \
+    || fail "another home's ledger keys made this home's absent source a problem: $out"
+  [ "$(json_field "$out" "d['counts']['written']")" = "4" ] \
+    || fail "the run did not write this home's own pointers: $out"
+  [ "$(json_field "$out" "sorted(l['lane'] for l in d.get('skipped_reconciliation', []))")" \
+    = "['products']" ] \
+    || fail "the run left alone more than the lane it does not own: $out"
+
+  # And its own lanes still reconcile: a section it deleted is still retired,
+  # rather than being guarded by a source the other home's ledger poisoned.
+  python3 - "$home/data/captain.md" <<'PY'
+import sys
+p = sys.argv[1]
+text = open(p).read()
+open(p, "w").write(text.split("## Chat is for outcomes only")[0])
+PY
+  status=0
+  out=$(fm_pointers "$home" "$dir" write) || status=$?
+  [ "$(json_field "$out" "d['counts']['expired']")" = "1" ] \
+    || fail "this home could not retire its own stale pointer: $out"
+  [ "$(live_rows_claiming "$dir" shared "Never send routine acknowledgements")" = "0" ] \
+    || fail "the deleted section still has a live pointer claiming it"
+  pass "fm-memory-pointers: a ledger this run cannot reconcile does not put its own source at risk"
 }
 
 test_a_ledger_from_another_home_neither_retires_nor_supersedes() {
@@ -1237,7 +1339,7 @@ test_write_refuses_an_unprovisioned_lane_rather_than_creating_one() {
 test_plan_routes_every_source_to_its_lane
 test_plan_classifies_decisions_apart_from_preferences_and_learnings
 test_plan_refuses_to_guess_a_lane_for_an_unrouted_project
-test_plan_reports_an_absent_canonical_file_rather_than_inventing_one
+test_plan_treats_an_absent_source_exactly_like_an_empty_one
 test_write_is_idempotent_across_runs
 test_write_lands_pointers_in_their_own_lane_and_project
 test_an_edited_section_supersedes_its_pointer_instead_of_adding_a_second
@@ -1249,9 +1351,11 @@ test_re_laning_a_project_retires_the_pointer_in_the_lane_it_left
 test_removing_a_lanes_last_project_retires_its_pointer
 test_an_unreadable_source_spares_only_its_own_keys
 test_a_lazily_absent_learnings_file_is_not_a_problem
+test_an_absent_source_whose_pointers_are_indexed_refuses_like_an_empty_one
 test_an_emptied_learnings_file_with_pointers_indexed_refuses
 test_an_emptied_canonical_file_retires_nothing_and_refuses
 test_a_canonical_file_with_no_sections_retires_nothing_and_refuses
+test_a_foreign_ledgers_keys_do_not_put_this_homes_source_at_risk
 test_a_ledger_from_another_home_neither_retires_nor_supersedes
 test_a_run_from_another_home_records_nothing_in_the_ledger_it_does_not_own
 test_a_bridge_that_will_not_start_at_all_costs_its_lanes_not_the_run

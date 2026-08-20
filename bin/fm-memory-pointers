@@ -87,10 +87,17 @@ RECONCILIATION
   source's keys reconcile as usual. A refusal costs one re-run; a wrongly
   retired pointer can never be written again, so the two are not weighed the
   same.
-  A source that derived nothing is only a problem when a ledger still holds its
-  keys, because that is the only case with anything to lose. data/learnings.md
-  is created lazily, so a home that has recorded no learning yet derives none,
-  reports none, and runs normally.
+  Absent and readable-but-empty are the same situation from here: the source
+  derives nothing, and which of the two it is says nothing about whether
+  anything is at risk. So both are treated by the same rule, and no source is
+  special-cased by name.
+  A source that derived nothing is only a problem when a ledger THIS RUN WOULD
+  RECONCILE still holds its keys, because that is the only case with anything
+  to lose; then the run refuses and expires nothing. A ledger bound to another
+  tree is never reconciled from here, so its keys never make this run's source
+  look at risk. When no such ledger holds its keys the run derives none,
+  reports none, and succeeds. data/learnings.md is created lazily, so that is
+  the ordinary state of every fresh home.
   Only a WHOLLY empty source is caught this way. A canonical file truncated
   part of the way through still derives the sections that survived, and those
   read exactly like deletions of the rest, so a partial loss is still
@@ -174,7 +181,7 @@ EXCERPT_CHARS = 360
 # restructured out of `## ` headings all look identical to every section having
 # been deleted, and retiring on that reading is unrecoverable: the bridge will
 # not write text a retired row already holds.
-EMPTY_SOURCE = "{path} is readable but derives no pointers"
+EMPTY_SOURCE = "{path} derives no pointers while the ledger still holds its keys"
 
 DECISION_MARKERS = ("captain-decided", "captain-validated", "restated", "conditional")
 
@@ -289,10 +296,10 @@ def pointer(
     }
 
 
-def captain_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str], bool]:
+def captain_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
     lines = read_lines(home / "data" / "captain.md")
     if lines is None:
-        return ([], ["data/captain.md is absent"], False)
+        return ([], [])
     out = []
     for line_no, heading, body in sections(lines):
         decided = any(marker in heading.lower() for marker in DECISION_MARKERS)
@@ -310,13 +317,13 @@ def captain_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str], bool]
                 veracity="stated",
             )
         )
-    return (out, [], True)
+    return (out, [])
 
 
-def learning_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str], bool]:
+def learning_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
     lines = read_lines(home / "data" / "learnings.md")
     if lines is None:
-        return ([], ["data/learnings.md is absent"], False)
+        return ([], [])
     out = []
     for line_no, heading, body in sections(lines):
         out.append(
@@ -333,7 +340,7 @@ def learning_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str], bool
                 veracity="tool",
             )
         )
-    return (out, [], True)
+    return (out, [])
 
 
 def project_lane(home: Path, project: str) -> Optional[str]:
@@ -349,10 +356,10 @@ def project_lane(home: Path, project: str) -> Optional[str]:
     return lane if result.returncode == 0 and lane else None
 
 
-def project_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str], bool]:
+def project_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
     lines = read_lines(home / "data" / "projects.md")
     if lines is None:
-        return ([], ["data/projects.md is absent"], False)
+        return ([], [])
     out: List[Dict[str, Any]] = []
     unrouted: List[str] = []
     for line_no, line in enumerate(lines, start=1):
@@ -384,7 +391,7 @@ def project_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str], bool]
                 veracity="stated",
             )
         )
-    return (out, [f"{name} carries no lane in data/projects.md" for name in unrouted], True)
+    return (out, [f"{name} carries no lane in data/projects.md" for name in unrouted])
 
 
 def disambiguate_keys(pointers: List[Dict[str, Any]]) -> None:
@@ -410,8 +417,9 @@ class Derivation(NamedTuple):
 
     `troubled` names the sources whose derivation came up short, so a lane can
     refuse to retire THOSE keys while still reconciling everything the other
-    sources say. `empty` names sources that read fine and produced nothing,
-    which is only dangerous once a ledger holds keys for them.
+    sources say. `empty` names sources that produced nothing at all, absent and
+    readable-but-empty alike, which is only dangerous once a ledger this run
+    would reconcile holds keys for them.
     """
 
     pointers: List[Dict[str, Any]]
@@ -438,12 +446,12 @@ def derive(home: Path) -> Derivation:
     troubled: List[str] = []
     empty: List[str] = []
     for path, producer in SOURCES:
-        found, trouble, readable = producer(home)
+        found, trouble = producer(home)
         pointers.extend(found)
         problems.extend(trouble)
         if trouble:
             troubled.append(path)
-        elif readable and not found:
+        elif not found:
             empty.append(path)
     disambiguate_keys(pointers)
     return Derivation(pointers, problems, troubled, empty)
@@ -727,13 +735,19 @@ def write_pointers(
         by_lane.setdefault(lane, [])
 
     ledgers = {lane: read_ledger(data_dir, lane) for lane in sorted(by_lane)}
-    # A source that read fine and derived nothing is only dangerous once a
-    # ledger holds its keys, because that is the case where reconciliation
-    # would retire them. An empty data/learnings.md on a home that has never
-    # recorded a learning has nothing to lose and is not a problem at all.
+    # Compared as a resolved path, so a trailing slash or a symlinked tmp root
+    # is not read as a different tree.
+    home_key = str(home.resolve())
+    # A source that derived nothing is only dangerous once a ledger THIS RUN
+    # WOULD RECONCILE holds its keys, because that is the only case where those
+    # keys would be retired. A ledger bound to another tree is never reconciled
+    # from here, so its keys have nothing to lose and must not make another
+    # home's absent or empty source look at risk. A home that has recorded no
+    # learning yet is not a problem at all.
     at_risk = sorted({
         key_source(key)
-        for records, _ in ledgers.values()
+        for records, recorded_home in ledgers.values()
+        if reconciliation_state(recorded_home, home_key)[0]
         for key in records
     })
     dangerous = [path for path in sorted(set(empty)) if path in at_risk]
@@ -743,9 +757,6 @@ def write_pointers(
               "expired": 0, "refused": 0, "expiry_refused": 0}
     refusals: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
-    # Compared as a resolved path, so a trailing slash or a symlinked tmp root
-    # is not read as a different tree.
-    home_key = str(home.resolve())
     for lane in sorted(by_lane):
         ledger, recorded_home = ledgers[lane]
         # A ledger bound to another tree is left exactly as its owner wrote it.

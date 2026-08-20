@@ -272,6 +272,84 @@ EOF
   pass "fm-project-mode: the conditional policy is accepted, mapped for mechanical callers, and readable raw"
 }
 
+# The registry annotation is a token SET, not a fixed sequence: a project's
+# memory lane rides in the same brackets as its delivery posture, and neither
+# may disturb the other. bin/fm-memory-mcp routes writes on the lane this
+# reports, so a wrong or guessed answer here is a cross-lane memory leak.
+test_project_mode_carries_the_memory_lane() {
+  local home out err status
+  home="$TMP_ROOT/project-lane/home"
+  mkdir -p "$home/data"
+  cat > "$home/data/projects.md" <<'EOF'
+- laneonly [lane:fleet-infra] - fixture (added 2026-01-01)
+- lanelast [direct-PR +yolo lane:products] - fixture (added 2026-01-01)
+- lanefirst [lane:personal local-only +yolo] - fixture (added 2026-01-01)
+- lanemid [no-mistakes lane:client-services +yolo] - fixture (added 2026-01-01)
+- policy [no-mistakes-prod-only lane:brand-business] - fixture (added 2026-01-01)
+- nolane [direct-PR +yolo] - fixture (added 2026-01-01)
+- bare - fixture (added 2026-01-01)
+- prose - migrating the [lane:personal] tooling (added 2026-01-01)
+- trailing [no-mistakes] - a later note [lane:personal] about it (added 2026-01-01)
+EOF
+
+  # The lane round-trips wherever it sits in the annotation.
+  out=$(FM_HOME="$home" "$PROJECT_MODE" --lane laneonly 2>/dev/null) \
+    || fail "a lane-only annotation did not report its lane"
+  [ "$out" = "fleet-infra" ] || fail "lane-only annotation reported '$out'"
+  [ "$(FM_HOME="$home" "$PROJECT_MODE" --lane lanelast 2>/dev/null)" = "products" ] \
+    || fail "a trailing lane token did not round-trip"
+  [ "$(FM_HOME="$home" "$PROJECT_MODE" --lane lanefirst 2>/dev/null)" = "personal" ] \
+    || fail "a leading lane token did not round-trip"
+  [ "$(FM_HOME="$home" "$PROJECT_MODE" --lane lanemid 2>/dev/null)" = "client-services" ] \
+    || fail "a lane token between other tokens did not round-trip"
+  [ "$(FM_HOME="$home" "$PROJECT_MODE" --lane policy 2>/dev/null)" = "brand-business" ] \
+    || fail "a conditional policy dropped its lane"
+
+  # And it never disturbs the posture, at any position - including the case
+  # that used to read the lane token itself as the mode and warn about it.
+  out=$(FM_HOME="$home" "$PROJECT_MODE" laneonly 2>/dev/null)
+  [ "$out" = "no-mistakes off" ] || fail "a lane-only annotation changed the posture (got '$out')"
+  err=$(FM_HOME="$home" "$PROJECT_MODE" laneonly 2>&1 >/dev/null)
+  [ -z "$err" ] || fail "a lane-only annotation warned as an unknown mode: $err"
+  [ "$(FM_HOME="$home" "$PROJECT_MODE" lanelast 2>/dev/null)" = "direct-PR on" ] \
+    || fail "a trailing lane token changed the posture"
+  [ "$(FM_HOME="$home" "$PROJECT_MODE" lanefirst 2>/dev/null)" = "local-only on" ] \
+    || fail "a leading lane token changed the posture"
+  [ "$(FM_HOME="$home" "$PROJECT_MODE" lanemid 2>/dev/null)" = "no-mistakes on" ] \
+    || fail "a lane token between other tokens changed the posture"
+  [ "$(FM_HOME="$home" "$PROJECT_MODE" --raw policy 2>/dev/null)" = "no-mistakes-prod-only off" ] \
+    || fail "a lane token altered the raw registered annotation"
+
+  # There is deliberately no default lane: writing memory to a guessed lane is
+  # the leak the lane model exists to prevent, so an absent lane refuses.
+  status=0
+  out=$(FM_HOME="$home" "$PROJECT_MODE" --lane nolane 2>/dev/null) || status=$?
+  [ "$status" -eq 1 ] || fail "a registered project with no lane token exited $status, not 1"
+  [ -z "$out" ] || fail "a project with no lane token still printed a lane: '$out'"
+  err=$(FM_HOME="$home" "$PROJECT_MODE" --lane nolane 2>&1 >/dev/null)
+  assert_contains "$err" "carries no lane" "a lane-less project was not told what is missing"
+  # An unregistered project and a registered one with no lane need different
+  # fixes, so they must not report the same thing.
+  err=$(FM_HOME="$home" "$PROJECT_MODE" --lane notregistered 2>&1 >/dev/null)
+  assert_contains "$err" "is not in" "an unregistered project was not told it is unregistered"
+
+  # Only the bracket annotation carries tokens. A lane named in a description,
+  # before or after a real annotation, is prose and must not route a write.
+  FM_HOME="$home" "$PROJECT_MODE" --lane prose >/dev/null 2>&1 \
+    && fail "a lane named in a description was read as a routing token"
+  FM_HOME="$home" "$PROJECT_MODE" --lane trailing >/dev/null 2>&1 \
+    && fail "a bracket after the annotation was read as a lane token"
+  FM_HOME="$home" "$PROJECT_MODE" --lane bare >/dev/null 2>&1 \
+    && fail "an unannotated project reported a lane"
+
+  # No registry at all is a refusal too, never a default lane.
+  status=0
+  out=$(FM_HOME="$TMP_ROOT/project-lane/absent" "$PROJECT_MODE" --lane laneonly 2>/dev/null) || status=$?
+  [ "$status" -eq 1 ] || fail "a missing registry exited $status, not 1"
+  [ -z "$out" ] || fail "a missing registry still printed a lane: '$out'"
+  pass "fm-project-mode: the memory lane round-trips from any position and never disturbs the posture"
+}
+
 test_ship_spawn_requires_a_valid_delivery_contract
 test_scout_and_secondmate_refuse_delivery_flags
 test_spawn_refuses_a_brief_mode_mismatch
@@ -279,4 +357,5 @@ test_spawn_notices_a_rigor_downgrade_against_the_registry
 test_scout_records_no_delivery_posture
 test_promote_requires_and_records_the_delivery_contract
 test_project_mode_maps_the_conditional_policy
+test_project_mode_carries_the_memory_lane
 echo "# all fm-task-delivery tests passed"

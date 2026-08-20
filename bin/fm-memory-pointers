@@ -302,6 +302,24 @@ def project_pointers(home: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
     return (out, [f"{name} carries no lane in data/projects.md" for name in unrouted])
 
 
+def disambiguate_keys(pointers: List[Dict[str, Any]]) -> None:
+    """Give every pointer a ledger key of its own.
+
+    Two `## ` sections can carry the same heading, and the ledger is keyed by
+    it, so without this the second section reads the first's recorded row as
+    its own and supersedes it - retiring one of two live facts on every run.
+    The first occurrence keeps the plain key so existing ledgers still match;
+    each repeat is numbered by its order in the canonical file.
+    """
+    seen: Dict[str, int] = {}
+    for entry in pointers:
+        key = entry["key"]
+        occurrence = seen.get(key, 0) + 1
+        seen[key] = occurrence
+        if occurrence > 1:
+            entry["key"] = f"{key}#{occurrence}"
+
+
 def derive(home: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
     pointers: List[Dict[str, Any]] = []
     problems: List[str] = []
@@ -309,6 +327,7 @@ def derive(home: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
         found, trouble = producer(home)
         pointers.extend(found)
         problems.extend(trouble)
+    disambiguate_keys(pointers)
     return (pointers, problems)
 
 

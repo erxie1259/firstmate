@@ -356,6 +356,53 @@ PY
   pass "fm-memory-pointers: a section moved by an insertion supersedes its pointer, never duplicates it"
 }
 
+test_two_sections_sharing_a_heading_keep_one_live_pointer_each() {
+  local home dir first second rows_first rows_second live superseded
+  skip_without_library "the repeated-heading test" && return
+  home=$(make_home repeat-home)
+  dir=$(make_lanes repeat-dir shared fleet-infra products)
+  # Two `## ` sections may carry the same heading. They are two different
+  # facts, so each has to own its pointer: sharing a ledger entry makes the
+  # second retire the first on every run, and the store grows while one fact
+  # is never live.
+  cat >> "$home/data/captain.md" <<'MD'
+
+## Standing decisions
+
+- **Reviews**: never merge on a red pipeline. Set 2026-08-19.
+MD
+
+  first=$(fm_pointers "$home" "$dir" write) || fail "the first pointer run failed: $first"
+  [ "$(json_field "$first" "d['counts']['written']")" = "7" ] \
+    || fail "the repeated heading was not written as its own pointer: $first"
+  [ "$(json_field "$first" "d['counts']['updated']")" = "0" ] \
+    || fail "the repeated heading superseded the section it merely shares a title with: $first"
+  live=$(live_pointer_rows "$dir" shared)
+  [ "$live" = "3" ] || fail "the shared lane holds $live live pointers, not three"
+  rows_first=$(lane_rows "$dir" shared)
+
+  second=$(fm_pointers "$home" "$dir" write) || fail "the second pointer run failed: $second"
+  [ "$(json_field "$second" "d['counts']['updated']")" = "0" ] \
+    || fail "re-running flipped the repeated headings against each other: $second"
+  [ "$(json_field "$second" "d['counts']['written']")" = "0" ] \
+    || fail "re-running wrote pointers that were already there: $second"
+  rows_second=$(lane_rows "$dir" shared)
+  [ "$rows_first" = "$rows_second" ] \
+    || fail "a repeated heading grew the store on re-run: $rows_first -> $rows_second"
+  [ "$(live_pointer_rows "$dir" shared)" = "3" ] \
+    || fail "a re-run retired one of two sections sharing a heading"
+  superseded=$(python3 - "$dir/banks/lane-shared/mnemosyne.db" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+print(conn.execute(
+    "SELECT count(*) FROM working_memory WHERE source='firstmate-pointers'"
+    " AND superseded_by IS NOT NULL").fetchone()[0])
+PY
+)
+  [ "$superseded" = "0" ] || fail "sections sharing a heading retired $superseded pointers between them"
+  pass "fm-memory-pointers: two sections sharing a heading each keep their own live pointer"
+}
+
 test_a_lost_ledger_costs_a_duplicate_pointer_not_a_wrong_answer() {
   local home dir out live
   skip_without_library "the lost-ledger test" && return
@@ -403,6 +450,7 @@ test_write_is_idempotent_across_runs
 test_write_lands_pointers_in_their_own_lane_and_project
 test_an_edited_section_supersedes_its_pointer_instead_of_adding_a_second
 test_a_shifted_section_supersedes_its_pointer_instead_of_adding_a_second
+test_two_sections_sharing_a_heading_keep_one_live_pointer_each
 test_a_lost_ledger_costs_a_duplicate_pointer_not_a_wrong_answer
 test_write_refuses_an_unprovisioned_lane_rather_than_creating_one
 echo "# all fm-memory-pointers tests passed"

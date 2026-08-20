@@ -1,0 +1,1695 @@
+#!/usr/bin/env python3
+"""fm-memory-mcp - firstmate's stdio MCP bridge onto the Mnemosyne memory store.
+
+A thin wrapper over the installed `mnemosyne-memory` library (public API only,
+no fork). One short-lived process per agent session, spoken over stdio
+JSON-RPC. No daemon, no HTTP, no dependency beyond the standard library plus
+`mnemosyne` itself.
+
+Usage:
+  fm-memory-mcp serve [--lane L] [--project P] [--data-dir D] [--session S]
+      Speak MCP over stdio for one lane. stdout is the protocol channel and
+      carries nothing else; diagnostics go to stderr.
+  fm-memory-mcp preflight [--lane L] [--project P] [--data-dir D]
+      Run the full store proof and print it. Exit 1 on any refusal.
+  fm-memory-mcp provision --lane L [--data-dir D]
+      Create a lane bank, seed it with its own lane memory, and record the row
+      floor the preflight measures against.
+  fm-memory-mcp record-floor --lane L [--data-dir D]
+      Re-record that floor at the lane's current size, after a migration.
+  fm-memory-mcp lanes [--data-dir D]
+      Report every lane's bank path and readiness.
+  fm-memory-mcp --help
+
+LANES AND ADDRESSING
+  lane    -> a Mnemosyne bank, `lane-<name>`, its own SQLite file. Physical
+             isolation, so a cross-lane leak is impossible by construction.
+             The lanes are fixed: products, client-services, brand-business,
+             fleet-infra, personal, shared.
+  project -> `channel_id`, a hard AND filter inside one lane bank.
+  `_lane` -> the reserved channel for facts that apply to every project in the
+             lane.
+  scope   -> durable writes are always 'global'. Mnemosyne's cross-session
+             invalidate only matches `session_id = ? OR scope = 'global'`, so a
+             session-scoped row can never be superseded by anyone else.
+  session -> provenance only, never a scoping axis.
+
+LANE RESOLUTION
+  1. --lane / FM_MEMORY_LANE.
+  2. --project / FM_MEMORY_PROJECT, mapped through the registry: an optional
+     `lane:<name>` token inside a project's bracket annotation in
+     data/projects.md. bin/fm-project-mode.sh owns that line format; this
+     script only reads the token.
+  3. Refuse. An unknown lane name and an unresolvable lane are both hard
+     errors. Guessing a write lane is the leak this model exists to prevent.
+
+PREFLIGHT (the reason this wrapper exists)
+  Mnemosyne auto-creates an empty store at any writable path, and its recall
+  then returns [] forever - success-shaped, indistinguishable from "no match".
+  So `serve` proves it is talking to the real, populated bank BEFORE it serves
+  anything, using plain stdlib sqlite3 in mode=ro:
+    - the resolved data dir and bank database file already exist;
+    - a provisioning record sits beside the bank and names this exact lane,
+      bank, and database path;
+    - PRAGMA integrity_check is ok and PRAGMA journal_mode is wal;
+    - every table the bridge reads or writes is present;
+    - working_memory holds at least the row floor recorded at provisioning
+      time, and never fewer than one row.
+  Any failure refuses to start, naming the concrete missing requirement. Each
+  tool call then re-verifies the cheap half (file, record, row floor) before it
+  touches the store. Every tool answers with an explicit status: a genuine
+  no-match is {"status":"ok","count":0,"store_verified":true}, a broken store is
+  {"status":"error","error":{"code":...}}. Those two never share a shape.
+
+  Every other lane read for awareness proves itself the same way and reports
+  its own state, so a wiped sibling is never an empty awareness list. A broken
+  sibling is reported, never fatal: the serving lane's own recall is the
+  primary contract and stays satisfiable.
+
+  Importing mnemosyne runs init_db() at module import time, which opens a store
+  read-write. Preflight therefore never imports it - stdlib sqlite3 only - and
+  every import path sets MNEMOSYNE_DATA_DIR first.
+
+WRITE POLICY
+  Every write is pinned: `consolidated_at` is stamped immediately after the
+  library returns, and the pin is read back before the write is reported
+  successful. Mnemosyne deletes any working_memory row older than 24h whose
+  `consolidated_at` is NULL on the next write in the same session, and its
+  exact-content dedupe path clears `consolidated_at` again, so an unverified
+  pin is a memory that silently deletes itself. `sleep()` is not exposed and is
+  not relied on: Hermes runs with auto_sleep off.
+
+  The bridge writes `lane-*` banks only. Hermes's `default` bank is never
+  opened read-write by any path here; reading it is deliberately not exposed
+  in this phase, because the library opens a store read-write on construction.
+  Extracted binary payloads land beside the lane bank too, never in the shared
+  blob tree the library would otherwise default to.
+
+  The library dedupes on exact content within a session and overwrites the
+  matched row's channel from the writing store. So content that already exists
+  under another project is refused (`duplicate_in_other_project`) rather than
+  relocated out of the project that wrote it, and a supersession the store
+  matched onto its own target is refused (`supersede_noop`) both before the
+  write, on content, and after it, on the id that came back. A row that was
+  already superseded or expired is refused too (`duplicate_is_retired`): the
+  dedupe update leaves it retired, so reporting that write durable would be a
+  success shape for a memory no recall can return. Reviving one stays a
+  deliberate act, and this phase exposes no tool for it. A `valid_until` that
+  is malformed or already past is refused for the same reason: a write nobody
+  can recall must never be reported as a pinned durable success. It is judged,
+  and stored, as the canonical local timestamp the store's own text compare
+  will see, so the bridge's verdict and the store's filter cannot disagree.
+  Refusals that point at a replacement follow the chain to the row still
+  claimed to be true, never to one that was itself retired.
+
+TOOLS
+  memory_remember           durable write: scope, lane, channel_id, memory_type,
+                            veracity, importance, metadata, pinning
+  memory_recall             tier 1 (project) + tier 2 (lane-wide), merged
+  memory_supersede          write the replacement first, then invalidate the old;
+                            an already-retired target is refused, so a chain is
+                            never overwritten and two live rows never claim one fact
+  memory_expire             invalidate with no replacement
+  memory_get                read one memory by id, across sessions
+  memory_lanes              cross-lane awareness: titles only, never bodies,
+                            each lane carrying the state it proved
+  memory_cross_lane_recall  full bodies from one named other lane; reason required
+  memory_stats              store statistics plus the live preflight result
+  Deliberately absent: forget (hard delete leaves orphaned gists and
+  embeddings) and sleep (consolidation would fight the pin).
+
+EXIT STATUS
+  0 success; 1 a typed refusal (preflight, lane, or store failure); 2 usage.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+import urllib.parse
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+PROTOCOL_VERSION = "2024-11-05"
+SERVER_NAME = "fm-memory-mcp"
+SERVER_VERSION = "1"
+
+LANES: Tuple[str, ...] = (
+    "products",
+    "client-services",
+    "brand-business",
+    "fleet-infra",
+    "personal",
+    "shared",
+)
+BANK_PREFIX = "lane-"
+LANE_CHANNEL = "_lane"
+PROVISION_FILENAME = "fm-memory-provision.json"
+PROVISION_VERSION = 1
+DEFAULT_SESSION = "fm:bridge"
+DEFAULT_SOURCE = "firstmate-bridge"
+DEFAULT_DATA_DIR = Path.home() / ".hermes" / "mnemosyne" / "data"
+
+# Tables the bridge reads or writes. A store missing any of them is not the
+# store we think it is. Deliberately a named set rather than a table count: a
+# library upgrade may add tables, and a count would then fail for no reason.
+REQUIRED_TABLES: Tuple[str, ...] = (
+    "working_memory",
+    "episodic_memory",
+    "gists",
+    "facts",
+    "memory_embeddings",
+    "fts_working",
+    "consolidation_log",
+    "scratchpad",
+)
+
+VERACITIES: Tuple[str, ...] = ("stated", "inferred", "tool", "imported", "unknown")
+SCOPES: Tuple[str, ...] = ("global", "session")
+
+# SQLite caps attached databases at 10; keep one slot for the main connection.
+MAX_ATTACHED_LANES = 9
+AWARENESS_TITLE_CHARS = 120
+AWARENESS_MIN_IMPORTANCE = 0.7
+AWARENESS_LIMIT = 15
+
+BANK_NAME_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
+REGISTRY_LANE_RE = re.compile(r"(?<![A-Za-z0-9_-])lane:([a-z0-9-]+)")
+
+
+class BridgeError(Exception):
+    """One typed refusal. Never degrades into an empty success."""
+
+    def __init__(self, code: str, message: str, hint: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.hint = hint
+
+    def payload(self) -> Dict[str, Any]:
+        error: Dict[str, Any] = {"code": self.code, "message": self.message}
+        if self.hint:
+            error["hint"] = self.hint
+        return {"status": "error", "error": error, "store_verified": False}
+
+
+def now_iso() -> str:
+    return datetime.now().isoformat()
+
+
+# --- lane and path resolution ------------------------------------------------
+
+
+def bank_for_lane(lane: str) -> str:
+    bank = BANK_PREFIX + lane
+    if not BANK_NAME_RE.match(bank):
+        raise BridgeError("unknown_lane", f"lane {lane!r} does not form a valid bank name")
+    return bank
+
+
+def resolve_data_dir(explicit: Optional[str]) -> Path:
+    raw = explicit or os.environ.get("MNEMOSYNE_DATA_DIR")
+    if not raw:
+        return DEFAULT_DATA_DIR
+    # Normalized so a stray double slash or a "." segment cannot make an
+    # otherwise identical path look like a different store.
+    return Path(os.path.normpath(str(Path(raw).expanduser())))
+
+
+def bank_db_path(data_dir: Path, lane: str) -> Path:
+    return data_dir / "banks" / bank_for_lane(lane) / "mnemosyne.db"
+
+
+def provision_record_path(data_dir: Path, lane: str) -> Path:
+    return bank_db_path(data_dir, lane).parent / PROVISION_FILENAME
+
+
+def registry_path() -> Path:
+    home = os.environ.get("FM_HOME")
+    if home:
+        return Path(home) / "data" / "projects.md"
+    return Path(__file__).resolve().parent.parent / "data" / "projects.md"
+
+
+def registry_annotation(fields: List[str]) -> Optional[str]:
+    """The bracket annotation of a registry line, exactly as its owner reads it.
+
+    bin/fm-project-mode.sh treats field 3 as the annotation only when it opens
+    with `[`, and takes it through the first field that closes with `]`. Any
+    other bracket on the line belongs to the human-readable description.
+    """
+    if len(fields) < 3 or not fields[2].startswith("["):
+        return None
+    parts: List[str] = []
+    for field in fields[2:]:
+        parts.append(field)
+        if field.endswith("]"):
+            break
+    return " ".join(parts).removeprefix("[").removesuffix("]")
+
+
+def lane_from_registry(project: str) -> Tuple[bool, Optional[str]]:
+    """Read a project's optional `lane:<name>` token from the registry.
+
+    Returns (registered, lane). The two negatives are told apart deliberately:
+    an unregistered project and a registered one carrying no lane token need
+    different fixes.
+    """
+    try:
+        text = registry_path().read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return (False, None)
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 2 or fields[0] != "-" or fields[1] != project:
+            continue
+        # Only the bracket annotation carries tokens; a description must never
+        # be able to name a lane by accident. bin/fm-project-mode.sh owns this
+        # line format and reads the annotation as the bracket group that starts
+        # at field 3, so anything later on the line is description, not tokens.
+        annotation = registry_annotation(fields)
+        if annotation is not None:
+            match = REGISTRY_LANE_RE.search(annotation)
+            if match:
+                return (True, match.group(1))
+        return (True, None)
+    return (False, None)
+
+
+def resolve_lane(lane: Optional[str], project: Optional[str]) -> str:
+    """Explicit lane, else the project mapping, else refuse. Never guess."""
+    explicit = lane or os.environ.get("FM_MEMORY_LANE") or ""
+    if explicit:
+        if explicit not in LANES:
+            raise BridgeError(
+                "unknown_lane",
+                f"lane {explicit!r} is not one of: {', '.join(LANES)}",
+                "Pass one of the registered lanes, or register the new lane first.",
+            )
+        return explicit
+
+    named_project = project or os.environ.get("FM_MEMORY_PROJECT") or ""
+    if named_project:
+        registered, mapped = lane_from_registry(named_project)
+        if not registered:
+            raise BridgeError(
+                "lane_unresolved",
+                f"project {named_project!r} is not in {registry_path()}",
+                "Register the project, or pass --lane; an unregistered project gets no lane by default.",
+            )
+        if mapped is None:
+            raise BridgeError(
+                "lane_unresolved",
+                f"project {named_project!r} carries no lane:<name> token in {registry_path()}",
+                "Add a lane:<name> token to that project's bracket annotation, or pass --lane.",
+            )
+        if mapped not in LANES:
+            raise BridgeError(
+                "unknown_lane",
+                f"project {named_project!r} maps to unknown lane {mapped!r}",
+                f"Registered lanes: {', '.join(LANES)}.",
+            )
+        return mapped
+
+    raise BridgeError(
+        "lane_unresolved",
+        "no lane given and no project to map",
+        "Pass --lane <lane> or --project <name>; this server never guesses a write lane.",
+    )
+
+
+# --- preflight (stdlib sqlite3 only; never imports mnemosyne) -----------------
+
+
+def same_path(left: Any, right: Any) -> bool:
+    """Compare two path strings by what they actually resolve to."""
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    try:
+        return os.path.realpath(left) == os.path.realpath(right)
+    except OSError:
+        return False
+
+
+def read_provision_record(data_dir: Path, lane: str) -> Dict[str, Any]:
+    path = provision_record_path(data_dir, lane)
+    if not path.is_file():
+        raise BridgeError(
+            "provision_missing",
+            f"no provisioning record at {path}",
+            f"Run: fm-memory-mcp provision --lane {lane}",
+        )
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BridgeError("provision_unreadable", f"cannot read {path}: {exc}") from exc
+    if not isinstance(record, dict):
+        raise BridgeError("provision_unreadable", f"{path} is not a JSON object")
+    expected_db = str(bank_db_path(data_dir, lane))
+    if record.get("lane") != lane or record.get("bank") != bank_for_lane(lane):
+        raise BridgeError(
+            "provision_mismatch",
+            f"{path} records lane={record.get('lane')!r} bank={record.get('bank')!r}, expected {lane!r}",
+        )
+    if not same_path(record.get("db_path"), expected_db):
+        raise BridgeError(
+            "provision_mismatch",
+            f"{path} records db_path={record.get('db_path')!r}, expected {expected_db!r}",
+            "The bank moved or the data dir is not the one this lane was provisioned in.",
+        )
+    return record
+
+
+def sqlite_read_uri(db_path: Path, mode: str) -> str:
+    """Build a `file:` URI for db_path that cannot be truncated by its own path.
+
+    SQLite ends the path of a URI at the first `?` or `#`, so interpolating a
+    raw path silently drops the mode parameter - and losing `mode=ro` means the
+    connection defaults to `rwc` and creates the stray store the preflight
+    exists to disprove. Percent-encoding the path keeps both halves intact.
+    """
+    return "file:" + urllib.parse.quote(str(db_path)) + "?" + urllib.parse.urlencode({"mode": mode})
+
+
+def open_for_inspection(db_path: Path) -> Tuple[sqlite3.Connection, str]:
+    """Open an existing store for reading, and report which mode it took.
+
+    mode=ro is preferred because it cannot write. It is not always possible:
+    reading a WAL database needs the -shm file, and a read-only connection
+    cannot create one, so a bank with no live writer refuses mode=ro outright.
+    mode=rw is then the fallback - it still cannot CREATE a database, so the
+    typo'd-path hazard stays closed by the existence and provisioning checks -
+    and the mode used is reported rather than quietly substituted. Nothing here
+    issues anything but SELECT and read-only PRAGMAs.
+    """
+    last: Optional[Exception] = None
+    for mode in ("ro", "rw"):
+        conn = None
+        try:
+            conn = sqlite3.connect(sqlite_read_uri(db_path, mode), uri=True, timeout=10)
+            # Touch the file itself: connect() is lazy, and the WAL -shm problem
+            # this fallback exists for only shows up on the first real read.
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            return conn, mode
+        except sqlite3.Error as exc:
+            last = exc
+            if conn is not None:
+                conn.close()
+    raise BridgeError("store_unreadable", f"cannot open {db_path} for reading: {last}")
+
+
+def working_memory_count(db_path: Path, conn: Optional[sqlite3.Connection] = None) -> int:
+    """Count working memories, reusing an already-open inspection connection.
+
+    Passing the connection the structural checks used keeps the row floor
+    measured against the same snapshot and the same open mode they reported.
+    """
+    owned = conn is None
+    if conn is None:
+        conn, _mode = open_for_inspection(db_path)
+    try:
+        return int(conn.execute("SELECT count(*) FROM working_memory").fetchone()[0])
+    except sqlite3.Error as exc:
+        raise BridgeError("store_unreadable", f"cannot count {db_path}: {exc}") from exc
+    finally:
+        if owned:
+            conn.close()
+
+
+def preflight(data_dir: Path, lane: str, full: bool = True) -> Dict[str, Any]:
+    """Prove this is the real, populated lane store, or raise a typed refusal."""
+    if not data_dir.is_dir():
+        raise BridgeError(
+            "data_dir_missing",
+            f"memory data dir {data_dir} does not exist",
+            "Check MNEMOSYNE_DATA_DIR or --data-dir; a typo would auto-create an empty store.",
+        )
+    # bank_for_lane always prefixes, so this is never the default bank Hermes owns.
+    db_path = bank_db_path(data_dir, lane)
+    if not db_path.is_file():
+        raise BridgeError(
+            "bank_missing",
+            f"lane {lane!r} has no bank database at {db_path}",
+            f"Run: fm-memory-mcp provision --lane {lane}",
+        )
+    record = read_provision_record(data_dir, lane)
+    floor = record.get("row_floor")
+    if not isinstance(floor, int) or floor < 0:
+        raise BridgeError("provision_unreadable", f"row_floor in {provision_record_path(data_dir, lane)} is not a count")
+    floor = max(floor, 1)
+
+    checks: Dict[str, Any] = {}
+    if full:
+        conn, open_mode = open_for_inspection(db_path)
+        try:
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok":
+                raise BridgeError("integrity_failed", f"{db_path} failed integrity_check: {integrity}")
+            journal = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            if journal != "wal":
+                raise BridgeError(
+                    "journal_mode_unexpected",
+                    f"{db_path} is in journal_mode={journal}, expected wal",
+                    "A non-WAL store is not the concurrent store this bridge was built against.",
+                )
+            present = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")
+            }
+            missing = [t for t in REQUIRED_TABLES if t not in present]
+            if missing:
+                raise BridgeError(
+                    "schema_incomplete",
+                    f"{db_path} is missing tables: {', '.join(missing)}",
+                    "This is not a Mnemosyne store.",
+                )
+            checks["integrity_check"] = "ok"
+            checks["journal_mode"] = journal
+            checks["tables_present"] = len(present)
+            checks["open_mode"] = open_mode
+            rows = working_memory_count(db_path, conn)
+        except sqlite3.Error as exc:
+            raise BridgeError("store_unreadable", f"cannot inspect {db_path}: {exc}") from exc
+        finally:
+            conn.close()
+    else:
+        rows = working_memory_count(db_path)
+    if rows < floor:
+        raise BridgeError(
+            "store_empty",
+            f"{db_path} holds {rows} working memories, below the recorded floor of {floor}",
+            "The bank was wiped, replaced, or auto-created empty; refusing rather than answering [].",
+        )
+    checks["working_memory_rows"] = rows
+    checks["row_floor"] = floor
+    return {
+        "status": "ok",
+        "store_verified": True,
+        "lane": lane,
+        "bank": bank_for_lane(lane),
+        "db_path": str(db_path),
+        "data_dir": str(data_dir),
+        "provisioned_at": record.get("provisioned_at"),
+        "checks": checks,
+    }
+
+
+# --- store access (imports mnemosyne; only after preflight) -------------------
+
+
+_IMPORT_SANDBOX: Optional["tempfile.TemporaryDirectory"] = None
+
+
+def import_mnemosyne(data_dir: Path):
+    """Import the library without letting its import-time write touch a real bank.
+
+    mnemosyne.core.memory calls init_db() at module import time, against whatever
+    MNEMOSYNE_DATA_DIR then names - creating that store if it does not exist. So
+    the first import is aimed at a throwaway directory, and only afterwards does
+    the environment name the real data dir. Without this, merely starting the
+    bridge against the operator's data dir would open Hermes's default bank
+    read-write, which nothing here is allowed to do.
+    """
+    global _IMPORT_SANDBOX
+    if "mnemosyne.core.memory" not in sys.modules:
+        _IMPORT_SANDBOX = tempfile.TemporaryDirectory(prefix="fm-memory-import-")
+        os.environ["MNEMOSYNE_DATA_DIR"] = _IMPORT_SANDBOX.name
+        try:
+            import mnemosyne.core.memory  # noqa: F401, PLC0415
+        except ImportError as exc:
+            raise BridgeError(
+                "library_unavailable",
+                f"cannot import mnemosyne under {sys.executable}: {exc}",
+                "Run this server with the interpreter that has mnemosyne-memory installed.",
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - the library writes at import time
+            raise BridgeError(
+                "library_import_failed",
+                f"mnemosyne failed to import under {sys.executable}: {exc}",
+                "The library's import-time init_db() could not run in a scratch directory.",
+            ) from exc
+        finally:
+            # Always leave the environment naming the real data dir: the sandbox
+            # is deleted, so an escaping failure must not leave it pointed there.
+            os.environ["MNEMOSYNE_DATA_DIR"] = str(data_dir)
+    os.environ["MNEMOSYNE_DATA_DIR"] = str(data_dir)
+    from mnemosyne.core.memory import Mnemosyne  # noqa: PLC0415
+
+    return Mnemosyne
+
+
+def open_store(data_dir: Path, lane: str, channel_id: str, session_id: str):
+    mnemosyne_cls = import_mnemosyne(data_dir)
+    bank = bank_for_lane(lane)
+    # The library extracts a data: URI or an oversized payload to content-addressed
+    # blob storage, which defaults to ~/.hermes/mnemosyne/blobs - the shared tree
+    # this bridge never writes. Pin it beside the lane bank so a lane's bytes stay
+    # as physically isolated as its rows.
+    os.environ["MNEMOSYNE_BLOB_DIR"] = str(bank_db_path(data_dir, lane).parent / "blobs")
+    try:
+        return mnemosyne_cls(session_id=session_id, bank=bank, channel_id=channel_id)
+    except Exception as exc:  # noqa: BLE001 - surface any library failure as typed
+        raise BridgeError("store_open_failed", f"cannot open bank {bank}: {exc}") from exc
+
+
+def pin_write(store, memory_id: str, memory_type: Optional[str]) -> str:
+    """Stamp consolidated_at (and memory_type) and read the pin back.
+
+    An unpinned row is deleted by the 24h trim on the next write in the same
+    session, and the library's dedupe path resets the pin, so the read-back is
+    the only thing that makes a reported write durable.
+    """
+    stamped = now_iso()
+    conn = store.conn
+    try:
+        if memory_type:
+            conn.execute(
+                "UPDATE working_memory SET consolidated_at = ?, memory_type = ? WHERE id = ?",
+                (stamped, memory_type, memory_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE working_memory SET consolidated_at = ? WHERE id = ?",
+                (stamped, memory_id),
+            )
+        conn.commit()
+        row = conn.execute(
+            "SELECT consolidated_at FROM working_memory WHERE id = ?", (memory_id,)
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise BridgeError("pin_failed", f"cannot pin memory {memory_id}: {exc}") from exc
+    if row is None or not row[0]:
+        raise BridgeError(
+            "pin_failed",
+            f"memory {memory_id} was written but not pinned against the 24h trim",
+            "The write is not durable; treat it as failed.",
+        )
+    return str(row[0])
+
+
+UNCHECKED = object()
+
+
+def write_memory(
+    data_dir: Path,
+    lane: str,
+    channel_id: str,
+    session_id: str,
+    content: str,
+    *,
+    source: str,
+    importance: float,
+    scope: str,
+    veracity: str,
+    memory_type: Optional[str],
+    metadata: Optional[Dict[str, Any]],
+    valid_until: Optional[str],
+    store: Any = None,
+    existing: Any = UNCHECKED,
+) -> Dict[str, Any]:
+    if not content or not content.strip():
+        raise BridgeError("invalid_argument", "content is required and cannot be blank")
+    if scope not in SCOPES:
+        raise BridgeError("invalid_argument", f"scope must be one of: {', '.join(SCOPES)}")
+    if veracity not in VERACITIES:
+        raise BridgeError("invalid_argument", f"veracity must be one of: {', '.join(VERACITIES)}")
+    try:
+        importance = float(importance)
+    except (TypeError, ValueError):
+        raise BridgeError("invalid_argument", "importance must be a number between 0 and 1") from None
+    if not 0.0 <= importance <= 1.0:
+        raise BridgeError("invalid_argument", "importance must be between 0 and 1")
+    valid_until = check_valid_until(valid_until)
+
+    if store is None:
+        store = open_store(data_dir, lane, channel_id, session_id)
+    if existing is UNCHECKED:
+        existing = duplicate_row(store, content)
+    existing_id = existing["id"] if existing else None
+    retired = retired_state(existing) if existing else None
+    # The library's dedupe UPDATE overwrites channel_id from the store's own,
+    # so re-asserting a project's memory under a second project would move the
+    # row out of the project that wrote it, where its recall can never find it
+    # again. That relocation is silent and unrecoverable, so refuse instead.
+    if existing and existing["channel_id"] != channel_id:
+        if retired:
+            raise BridgeError(
+                "duplicate_in_other_project",
+                f"lane {lane} holds this exact content under project {existing['channel_id']!r} as memory "
+                f"{existing['id']}, which was already {retired}; writing it under {channel_id!r} would drag "
+                f"that retired row into this project and it would still be returned by no recall",
+                retired_hint(store, existing),
+            )
+        raise BridgeError(
+            "duplicate_in_other_project",
+            f"lane {lane} already holds this exact content under project "
+            f"{existing['channel_id']!r} (memory {existing['id']}); writing it under "
+            f"{channel_id!r} would move it out of that project",
+            "Recall it there, supersede it there, or write content specific to this project.",
+        )
+    # A retired memory was retired on purpose. The library's dedupe would update
+    # it in place and leave superseded_by and valid_until exactly as they are, so
+    # this write would report a pinned, durable success for a row no recall can
+    # ever return. Reviving one stays a deliberate act, never a side effect of
+    # writing its text again.
+    if retired:
+        raise BridgeError(
+            "duplicate_is_retired",
+            f"memory {existing['id']} in lane {lane} already holds this exact content and was {retired}; "
+            f"the store would update that row in place and it would stay {retired}, so nothing written here "
+            f"could be recalled",
+            retired_hint(store, existing),
+        )
+    try:
+        memory_id = store.beam.remember(
+            content,
+            source=source,
+            importance=importance,
+            metadata=metadata,
+            valid_until=valid_until,
+            scope=scope,
+            veracity=veracity,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise BridgeError("write_failed", f"remember failed in lane {lane}: {exc}") from exc
+    if not memory_id:
+        raise BridgeError("write_failed", f"remember returned no id in lane {lane}")
+    consolidated_at = pin_write(store, memory_id, memory_type)
+    # Report the row, not the request. The library's dedupe update keeps the
+    # higher importance, keeps the old veracity when this call says 'unknown',
+    # and COALESCEs valid_until - so a caller who asked for a permanent memory
+    # at importance 0.2 can land on a row that is 0.9, 'stated', and expires
+    # tomorrow. Echoing the arguments back would call that pinned and durable
+    # and leave the shelf life to be discovered by a refusal the next day.
+    stored = read_memory(store, memory_id)
+    if stored is None:
+        raise BridgeError(
+            "write_failed",
+            f"memory {memory_id} was written in lane {lane} but cannot be read back",
+            "Treat the write as failed; its stored state cannot be confirmed.",
+        )
+    return {
+        "status": "ok",
+        "store_verified": True,
+        "id": memory_id,
+        "created": memory_id != existing_id,
+        "lane": lane,
+        "bank": bank_for_lane(lane),
+        "channel_id": stored.get("channel_id"),
+        "scope": stored.get("scope"),
+        "veracity": stored.get("veracity"),
+        "memory_type": stored.get("memory_type"),
+        "importance": stored.get("importance"),
+        "valid_until": stored.get("valid_until"),
+        "consolidated_at": consolidated_at,
+        "pinned": True,
+    }
+
+
+def dedupe_key(content: str) -> str:
+    """The exact text the library will match its dedupe on.
+
+    beam.remember() sanitizes content before it looks for a duplicate: a data:
+    URI, anything over 1 MB, and high-entropy content over 100 KB are all
+    rewritten to a content-addressed stub. A check keyed on what the caller
+    sent would therefore miss the very row the write is about to mutate, which
+    is how a memory silently leaves the project that wrote it. The sanitizer is
+    deterministic and idempotent, and the bytes it extracts land in the
+    lane-pinned blob dir this write would put them in anyway.
+    """
+    try:
+        from mnemosyne.core.content_sanitizer import sanitize_content  # noqa: PLC0415
+    except ImportError as exc:
+        raise BridgeError(
+            "library_unavailable",
+            f"cannot import mnemosyne's content sanitizer under {sys.executable}: {exc}",
+            "Without the store's own dedupe key a write could silently mutate another project's memory.",
+        ) from exc
+    try:
+        sanitized, _blob_meta = sanitize_content(content)
+    except Exception as exc:  # noqa: BLE001 - surface any library failure as typed
+        raise BridgeError("write_failed", f"cannot compute the store's dedupe key: {exc}") from exc
+    return sanitized
+
+
+def retired_state(row: Dict[str, Any]) -> Optional[str]:
+    """How a matched row is retired, if it is: 'superseded', 'expired', or None.
+
+    The same two predicates recall filters on, read the same way: the library
+    compares valid_until against an ISO timestamp, so this does too.
+    """
+    if row.get("superseded_by"):
+        return "superseded"
+    valid_until = row.get("valid_until")
+    if valid_until and str(valid_until) <= now_iso():
+        return "expired"
+    return None
+
+
+def live_head(store, memory_id: Optional[str]) -> Optional[str]:
+    """Follow superseded_by from here to the row still claimed to be true.
+
+    A chain grows every time a fact is revised, so the row that directly
+    replaced a retired memory is often retired itself. Naming it would send a
+    caller to another dead row. invalidate() writes superseded_by
+    unconditionally, so a row can also carry a self-link or a cycle; the visited
+    set makes the walk terminate on those instead of spinning. Returns None when
+    the chain ends without a live row, which is what an expired memory with no
+    replacement looks like.
+    """
+    seen: set = set()
+    current = memory_id
+    while current and current not in seen:
+        seen.add(current)
+        row = read_memory(store, current)
+        if row is None:
+            return None
+        if not retired_state(row):
+            return current
+        current = row.get("superseded_by")
+    return None
+
+
+def retired_hint(store, row: Dict[str, Any]) -> str:
+    """What a caller can actually do about content that is already retired.
+
+    Never "supersede the retired row": that overwrites the link it carries to
+    whatever replaced it and leaves two live rows claiming the same fact, which
+    supersede() refuses. Reviving a retired memory is a deliberate operation
+    this bridge does not expose yet, and saying so is more use than a suggestion
+    that cannot work.
+    """
+    head = live_head(store, row.get("superseded_by"))
+    opening = (
+        f"This content is retired as memory {row['id']}, and deliberate revival is not a tool this "
+        f"bridge exposes yet. "
+    )
+    if head:
+        return opening + f"Supersede {head}, the live replacement, or write distinct content."
+    return opening + "Write distinct content."
+
+
+def check_valid_until(valid_until: Optional[str]) -> Optional[str]:
+    """Validate a shelf life and return the exact string the store should hold.
+
+    The library never parses this field: it writes whatever it is given and
+    every recall filters it with the text compare `valid_until > <now as an ISO
+    string>`. So a value is judged here by that same predicate, on the same
+    canonical form the store will hold - naive local isoformat, which is what
+    the store compares against. Without that, lexical and chronological order
+    can disagree: '2026-08-20 23:00:00' is hours away by the clock but sorts
+    below the 'T' separator and is dead on arrival, and an offset timestamp
+    sorts by its wall-clock digits rather than the instant it names. Either way
+    the write would be reported pinned and durable while no recall could ever
+    return it, which is the shape this whole contract forbids.
+    """
+    if valid_until is None:
+        return None
+    if not isinstance(valid_until, str) or not valid_until.strip():
+        raise BridgeError("invalid_argument", "valid_until must be an ISO 8601 timestamp string")
+    try:
+        parsed = datetime.fromisoformat(valid_until.strip())
+    except ValueError:
+        raise BridgeError(
+            "invalid_argument",
+            f"valid_until {valid_until!r} is not an ISO 8601 timestamp",
+            "Use a timestamp like 2027-03-01T00:00:00; the store never parses this field, it compares it as text.",
+        ) from None
+    if parsed.tzinfo:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    canonical = parsed.isoformat()
+    if canonical <= now_iso():
+        raise BridgeError(
+            "valid_until_in_the_past",
+            f"valid_until {valid_until!r} is {canonical} here, which has already passed, so the memory would "
+            f"be expired the moment it was written and no recall could ever return it",
+            "Give a future timestamp, omit it for a memory with no shelf life, or use memory_expire to retire one.",
+        )
+    return canonical
+
+
+def duplicate_row(store, content: str) -> Optional[Dict[str, Any]]:
+    """The row the store's dedupe would update in place instead of writing anew.
+
+    The library dedupes on (session_id, sanitized content) and returns the
+    matched row's id, so a caller that needs to know whether a write creates or
+    mutates has to ask the same question, on the same key, first - after the
+    fact the mutation has already landed. The channel comes back too, because
+    the dedupe update overwrites it, and the retirement columns, because the
+    dedupe update leaves those exactly as they are.
+    """
+    try:
+        row = store.conn.execute(
+            "SELECT id, channel_id, superseded_by, valid_until FROM working_memory "
+            "WHERE session_id = ? AND content = ? LIMIT 1",
+            (store.session_id, dedupe_key(content)),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise BridgeError("read_failed", f"cannot check working_memory for a duplicate: {exc}") from exc
+    if not row:
+        return None
+    return {"id": row[0], "channel_id": row[1], "superseded_by": row[2], "valid_until": row[3]}
+
+
+def read_memory(store, memory_id: str) -> Optional[Dict[str, Any]]:
+    """Read one memory by id across sessions.
+
+    The library's own get() is session-scoped, so it cannot see a global row
+    written by another agent - which is every row this bridge writes.
+    """
+    for table in ("working_memory", "episodic_memory"):
+        try:
+            row = store.conn.execute(
+                f"SELECT id, content, source, timestamp, session_id, importance, "  # noqa: S608
+                f"metadata_json, veracity, scope, channel_id, valid_until, superseded_by, memory_type "
+                f"FROM {table} WHERE id = ? AND (scope = 'global' OR session_id = ?)",
+                (memory_id, store.session_id),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise BridgeError("read_failed", f"cannot read {table}: {exc}") from exc
+        if row:
+            metadata: Any = row[6]
+            if isinstance(metadata, str) and metadata:
+                try:
+                    metadata = json.loads(metadata)
+                except ValueError:
+                    pass
+            return {
+                "id": row[0],
+                "content": row[1],
+                "source": row[2],
+                "timestamp": row[3],
+                "session_id": row[4],
+                "importance": row[5],
+                "metadata": metadata,
+                "veracity": row[7],
+                "scope": row[8],
+                "channel_id": row[9],
+                "valid_until": row[10],
+                "superseded_by": row[11],
+                "memory_type": row[12],
+                "memory_store": "working" if table == "working_memory" else "episodic",
+            }
+    return None
+
+
+def recall_lane(
+    data_dir: Path,
+    lane: str,
+    session_id: str,
+    query: str,
+    *,
+    channels: Iterable[Optional[str]],
+    top_k: int,
+    memory_type: Optional[str],
+    veracity: Optional[str],
+) -> List[Dict[str, Any]]:
+    if not query or not query.strip():
+        raise BridgeError("invalid_argument", "query is required and cannot be blank")
+    merged: Dict[str, Dict[str, Any]] = {}
+    store = open_store(data_dir, lane, LANE_CHANNEL, session_id)
+    for channel in channels:
+        try:
+            hits = store.beam.recall(
+                query,
+                top_k=top_k,
+                channel_id=channel,
+                memory_type=memory_type,
+                veracity=veracity,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise BridgeError("recall_failed", f"recall failed in lane {lane}: {exc}") from exc
+        for hit in hits or []:
+            hit = dict(hit)
+            hit["lane"] = lane
+            existing = merged.get(hit["id"])
+            if existing is None or hit.get("score", 0) > existing.get("score", 0):
+                merged[hit["id"]] = hit
+    ordered = sorted(merged.values(), key=lambda h: h.get("score", 0), reverse=True)
+    return ordered[:top_k]
+
+
+def lane_stats(store, data_dir: Path, lane: str) -> Dict[str, Any]:
+    """The library's statistics, with the bank identity corrected to this lane.
+
+    get_stats() builds a BankManager rooted at the parent of the database it is
+    reading. For a lane bank that parent is the bank's own directory, so the
+    manager both creates a `banks/` directory inside it and enumerates nothing,
+    reporting the `default` bank this bridge never opens. The count fields are
+    read straight off this store and are sound; only the bank name is wrong, and
+    only that stray directory is left behind.
+    """
+    stray = bank_db_path(data_dir, lane).parent / "banks"
+    stray_existed = stray.exists()
+    try:
+        stats = dict(store.get_stats())
+    except Exception as exc:  # noqa: BLE001
+        raise BridgeError("stats_failed", f"cannot read stats for lane {lane}: {exc}") from exc
+    finally:
+        if not stray_existed:
+            try:
+                stray.rmdir()  # empty-only by construction; a populated dir is left alone
+            except OSError:
+                pass
+    stats["bank"] = bank_for_lane(lane)
+    stats["banks"] = [bank_for_lane(lane)]
+    return stats
+
+
+def attach_readable(conn: sqlite3.Connection, db_path: Path, alias: str) -> str:
+    """ATTACH one bank for reading, preferring mode=ro (see open_for_inspection)."""
+    last: Optional[Exception] = None
+    for mode in ("ro", "rw"):
+        try:
+            conn.execute(f"ATTACH DATABASE ? AS {alias}", (sqlite_read_uri(db_path, mode),))  # noqa: S608
+            conn.execute(f"SELECT 1 FROM {alias}.working_memory LIMIT 1").fetchone()  # noqa: S608
+            return mode
+        except sqlite3.Error as exc:
+            last = exc
+            try:
+                conn.execute(f"DETACH DATABASE {alias}")  # noqa: S608
+            except sqlite3.Error:
+                pass
+    raise BridgeError("awareness_failed", f"cannot attach {db_path} for reading: {last}")
+
+
+def lane_awareness(data_dir: Path, exclude: Optional[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Cross-lane awareness: titles only, never bodies, read-only.
+
+    Returns (titles, lane_states). Every sibling lane has to prove itself the
+    same way the serving lane does, and each one reports the state it proved:
+    a wiped or unreadable bank contributes no titles, so without a per-lane
+    state an empty awareness list would mean both "nothing important over
+    there" and "that bank is gone". They must never share a shape. One broken
+    sibling also never takes the serving lane down - its own recall is
+    satisfiable and is the primary contract.
+    """
+    states: Dict[str, Dict[str, Any]] = {}
+    readable: List[Tuple[str, Path]] = []
+    for lane in LANES:
+        if lane == exclude:
+            continue
+        db_path = bank_db_path(data_dir, lane)
+        if not db_path.is_file():
+            states[lane] = {"lane": lane, "state": "unprovisioned", "title_count": 0}
+            continue
+        try:
+            preflight(data_dir, lane, full=False)
+        except BridgeError as exc:
+            states[lane] = {"lane": lane, "state": exc.code, "detail": exc.message, "title_count": 0}
+            continue
+        readable.append((lane, db_path))
+    if len(readable) > MAX_ATTACHED_LANES:
+        raise BridgeError(
+            "too_many_lanes",
+            f"{len(readable)} lane banks exceed SQLite's attach limit of {MAX_ATTACHED_LANES}",
+        )
+    titles: List[Dict[str, Any]] = []
+    if readable:
+        conn = sqlite3.connect("file:fm-memory-awareness?mode=memory", uri=True)
+        try:
+            for index, (lane, path) in enumerate(readable):
+                alias = f"lane_{index}"
+                try:
+                    attach_readable(conn, path, alias)
+                    rows = conn.execute(
+                        f"SELECT id, substr(content, 1, ?), importance, channel_id "  # noqa: S608
+                        f"FROM {alias}.working_memory "
+                        f"WHERE superseded_by IS NULL "
+                        f"  AND (valid_until IS NULL OR valid_until > ?) "
+                        f"  AND importance >= ? "
+                        f"ORDER BY importance DESC LIMIT ?",
+                        (AWARENESS_TITLE_CHARS, now_iso(), AWARENESS_MIN_IMPORTANCE, AWARENESS_LIMIT),
+                    ).fetchall()
+                except (sqlite3.Error, BridgeError) as exc:
+                    states[lane] = {
+                        "lane": lane,
+                        "state": "awareness_failed",
+                        "detail": f"cannot read lane {lane}: {exc}",
+                        "title_count": 0,
+                    }
+                    continue
+                states[lane] = {"lane": lane, "state": "ready", "title_count": len(rows)}
+                for row in rows:
+                    titles.append(
+                        {"lane": lane, "id": row[0], "title": row[1], "importance": row[2], "channel_id": row[3]}
+                    )
+        finally:
+            conn.close()
+    titles.sort(key=lambda t: t.get("importance") or 0, reverse=True)
+    ordered = [states[lane] for lane in LANES if lane in states]
+    return titles[:AWARENESS_LIMIT], ordered
+
+
+# --- tools -------------------------------------------------------------------
+
+
+class Bridge:
+    """One resolved lane, one verified store, eight tools."""
+
+    def __init__(self, data_dir: Path, lane: str, project: Optional[str], session_id: str) -> None:
+        self.data_dir = data_dir
+        self.lane = lane
+        self.project = project or None
+        self.session_id = session_id
+
+    def verify(self) -> Dict[str, Any]:
+        """Cheap per-call re-verification; startup already ran the full one."""
+        return preflight(self.data_dir, self.lane, full=False)
+
+    def channel_for(self, project: Optional[str]) -> str:
+        return project or self.project or LANE_CHANNEL
+
+    # -- tool bodies ----------------------------------------------------------
+
+    def remember(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        lane = self._arg_lane(args)
+        return write_memory(
+            self.data_dir,
+            lane,
+            self.channel_for(args.get("project")),
+            args.get("session_id") or self.session_id,
+            args.get("content", ""),
+            source=args.get("source") or DEFAULT_SOURCE,
+            importance=args.get("importance", 0.5),
+            scope=args.get("scope") or "global",
+            veracity=args.get("veracity") or "unknown",
+            memory_type=args.get("memory_type"),
+            metadata=args.get("metadata"),
+            valid_until=args.get("valid_until"),
+        )
+
+    def recall(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        top_k = self._arg_top_k(args)
+        project = args.get("project") or self.project
+        session_id = args.get("session_id") or self.session_id
+        channels: List[Optional[str]] = [LANE_CHANNEL]
+        if project:
+            channels.insert(0, project)
+        results = recall_lane(
+            self.data_dir,
+            self.lane,
+            session_id,
+            args.get("query", ""),
+            channels=channels,
+            top_k=top_k,
+            memory_type=args.get("memory_type"),
+            veracity=args.get("veracity"),
+        )
+        payload: Dict[str, Any] = {
+            "status": "ok",
+            "store_verified": True,
+            "lane": self.lane,
+            "project": project,
+            "session_id": session_id,
+            "count": len(results),
+            "results": results,
+        }
+        if args.get("include_awareness", True):
+            titles, lane_states = lane_awareness(self.data_dir, exclude=self.lane)
+            payload["awareness"] = titles
+            payload["awareness_lanes"] = lane_states
+        return payload
+
+    def supersede(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        memory_id = args.get("memory_id") or ""
+        if not memory_id:
+            raise BridgeError("invalid_argument", "memory_id is required")
+        lane = self._arg_lane(args)
+        session_id = args.get("session_id") or self.session_id
+        metadata = dict(args.get("metadata") or {})
+        metadata["supersedes"] = memory_id
+        channel_id = self.channel_for(args.get("project"))
+        store = open_store(self.data_dir, lane, channel_id, session_id)
+        # Read the target before touching anything, the way expire() does:
+        # invalidate() writes valid_until and superseded_by unconditionally, so
+        # superseding an already-retired memory would overwrite the link to
+        # whatever replaced it - leaving that replacement live alongside the new
+        # one, two rows claiming the same fact, and no record the first link
+        # existed.
+        target = read_memory(store, memory_id)
+        if target is None:
+            raise BridgeError("not_found", f"memory {memory_id} was not found in lane {lane}")
+        target_retired = retired_state(target)
+        if target_retired == "superseded":
+            replacement = target.get("superseded_by")
+            head = live_head(store, replacement)
+            raise BridgeError(
+                "supersede_target_retired",
+                f"memory {memory_id} in lane {lane} was already superseded by memory {replacement}; "
+                f"superseding it again would discard that link and leave two live rows claiming the same fact",
+                (
+                    f"Supersede {head} instead - that is the row still claimed to be true."
+                    if head
+                    else f"Memory {replacement} is retired too, so nothing live claims this fact; "
+                    f"write the revision as a new memory."
+                ),
+            )
+        if target_retired:
+            raise BridgeError(
+                "supersede_target_retired",
+                f"memory {memory_id} in lane {lane} expired at {target.get('valid_until')} and nothing "
+                f"replaced it, so there is no live claim here to revise; superseding it would record a "
+                f"replacement for a memory this lane already stopped claiming",
+                "Write the fact as a new memory; nothing live is being revised, and this bridge does not "
+                "bring an expired memory back as a side effect.",
+            )
+        # Ask before writing: the store dedupes on (session_id, content), so
+        # replacement content identical to the target would update that very row
+        # in place - moving its channel and overwriting its fields - and then
+        # supersede it by itself. Refuse first, while it is still untouched.
+        existing = duplicate_row(store, args.get("content", ""))
+        if existing and existing["id"] == memory_id:
+            raise BridgeError(
+                "supersede_noop",
+                f"the replacement content is identical to memory {memory_id}, so nothing would replace it; "
+                f"{memory_id} is untouched and still readable",
+                "Supersede needs content that differs; use memory_expire to retire a memory unchanged.",
+            )
+        # New row first: a crash between the steps leaves a duplicate, which is
+        # recoverable, rather than a gap, which is silent memory loss.
+        written = write_memory(
+            self.data_dir,
+            lane,
+            channel_id,
+            session_id,
+            args.get("content", ""),
+            source=args.get("source") or DEFAULT_SOURCE,
+            importance=args.get("importance", 0.5),
+            scope=args.get("scope") or "global",
+            veracity=args.get("veracity") or "stated",
+            memory_type=args.get("memory_type"),
+            metadata=metadata,
+            valid_until=args.get("valid_until"),
+            store=store,
+            existing=existing,
+        )
+        # Authoritative, whatever the library dedupes on: it sanitizes content
+        # before matching, so a payload the pre-write check read as new can still
+        # land on the target row. Superseding a memory by itself hides it from
+        # every read, so refuse here rather than link it to itself.
+        if written["id"] == memory_id:
+            raise BridgeError(
+                "supersede_noop",
+                f"the store matched the replacement onto memory {memory_id} itself, so nothing would replace it; "
+                f"{memory_id} was updated in place and is still readable",
+                "Supersede needs content the store treats as different; use memory_expire to retire one unchanged.",
+            )
+        try:
+            invalidated = bool(store.invalidate(memory_id, replacement_id=written["id"]))
+        except Exception as exc:  # noqa: BLE001
+            raise BridgeError("supersede_failed", f"cannot invalidate {memory_id}: {exc}") from exc
+        if not invalidated:
+            raise BridgeError(
+                "supersede_failed",
+                f"replacement {written['id']} was written but {memory_id} was not superseded",
+                "The old memory is missing, or is session-scoped and owned by another session.",
+            )
+        written["superseded"] = memory_id
+        return written
+
+    def expire(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        memory_id = args.get("memory_id") or ""
+        if not memory_id:
+            raise BridgeError("invalid_argument", "memory_id is required")
+        store = open_store(
+            self.data_dir, self.lane, self.channel_for(None), args.get("session_id") or self.session_id
+        )
+        # invalidate() writes superseded_by unconditionally, so expiring an
+        # already-superseded memory with no replacement would erase its pointer
+        # to the row that replaced it. Re-supply the link so the chain survives.
+        existing = read_memory(store, memory_id)
+        if existing is None:
+            raise BridgeError("not_found", f"memory {memory_id} was not found in lane {self.lane}")
+        superseded_by = existing.get("superseded_by")
+        try:
+            expired = bool(store.invalidate(memory_id, replacement_id=superseded_by))
+        except Exception as exc:  # noqa: BLE001
+            raise BridgeError("expire_failed", f"cannot expire {memory_id}: {exc}") from exc
+        if not expired:
+            raise BridgeError("not_found", f"memory {memory_id} was not found in lane {self.lane}")
+        return {
+            "status": "ok",
+            "store_verified": True,
+            "id": memory_id,
+            "lane": self.lane,
+            "expired": True,
+            "superseded_by": superseded_by,
+        }
+
+    def get(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        memory_id = args.get("memory_id") or ""
+        if not memory_id:
+            raise BridgeError("invalid_argument", "memory_id is required")
+        store = open_store(
+            self.data_dir, self.lane, self.channel_for(None), args.get("session_id") or self.session_id
+        )
+        memory = read_memory(store, memory_id)
+        if memory is None:
+            raise BridgeError("not_found", f"memory {memory_id} was not found in lane {self.lane}")
+        return {"status": "ok", "store_verified": True, "lane": self.lane, "memory": memory}
+
+    def lanes(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        exclude = self.lane if args.get("exclude_self", True) else None
+        titles, lane_states = lane_awareness(self.data_dir, exclude=exclude)
+        return {
+            "status": "ok",
+            "store_verified": True,
+            "lane": self.lane,
+            "known_lanes": list(LANES),
+            "count": len(titles),
+            "titles": titles,
+            "lanes": lane_states,
+            "note": (
+                "Titles only. Use memory_cross_lane_recall with a reason to read a body. "
+                "'lanes' carries each lane's proven state: a lane that is not 'ready' contributed "
+                "no titles because it could not be verified, not because it holds nothing."
+            ),
+        }
+
+    def cross_lane_recall(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        lane = args.get("lane") or ""
+        if not lane:
+            raise BridgeError("invalid_argument", "lane is required")
+        if lane not in LANES:
+            raise BridgeError("unknown_lane", f"lane {lane!r} is not one of: {', '.join(LANES)}")
+        reason = (args.get("reason") or "").strip()
+        if not reason:
+            raise BridgeError(
+                "reason_required",
+                "cross-lane reads require a stated reason",
+                "Say why this lane's memory is needed; 'might be relevant' is not a reason.",
+            )
+        if lane == self.lane:
+            raise BridgeError("invalid_argument", "cross-lane recall must name a lane other than the current one")
+        preflight(self.data_dir, lane, full=False)
+        results = recall_lane(
+            self.data_dir,
+            lane,
+            self.session_id,
+            args.get("query", ""),
+            channels=[args.get("project")] if args.get("project") else [None],
+            top_k=self._arg_top_k(args),
+            memory_type=args.get("memory_type"),
+            veracity=args.get("veracity"),
+        )
+        return {
+            "status": "ok",
+            "store_verified": True,
+            "lane": lane,
+            "from_lane": self.lane,
+            "reason": reason,
+            "count": len(results),
+            "results": results,
+        }
+
+    def stats(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        verified = preflight(self.data_dir, self.lane, full=True)
+        store = open_store(self.data_dir, self.lane, self.channel_for(None), self.session_id)
+        stats = lane_stats(store, self.data_dir, self.lane)
+        return {"status": "ok", "store_verified": True, "lane": self.lane, "preflight": verified, "stats": stats}
+
+    # -- helpers --------------------------------------------------------------
+
+    def _arg_lane(self, args: Dict[str, Any]) -> str:
+        lane = args.get("lane")
+        if not lane:
+            return self.lane
+        if lane not in LANES:
+            raise BridgeError("unknown_lane", f"lane {lane!r} is not one of: {', '.join(LANES)}")
+        if lane != self.lane:
+            raise BridgeError(
+                "cross_lane_write_refused",
+                f"this server serves lane {self.lane!r}; it will not write lane {lane!r}",
+                "A memory belongs to exactly one lane. If it applies to two, it belongs in 'shared'.",
+            )
+        return lane
+
+    @staticmethod
+    def _arg_top_k(args: Dict[str, Any]) -> int:
+        try:
+            top_k = int(args.get("top_k", 10))
+        except (TypeError, ValueError):
+            raise BridgeError("invalid_argument", "top_k must be an integer") from None
+        if not 1 <= top_k <= 100:
+            raise BridgeError("invalid_argument", "top_k must be between 1 and 100")
+        return top_k
+
+
+# --- tool schemas ------------------------------------------------------------
+
+_LANE_ENUM = {"type": "string", "enum": list(LANES)}
+_SCOPE_ENUM = {"type": "string", "enum": list(SCOPES), "default": "global"}
+_VERACITY_ENUM = {"type": "string", "enum": list(VERACITIES)}
+_SESSION_ID_PROPERTY = {
+    "type": "string",
+    "description": (
+        "Act as this session instead of the server's own. It is the provenance a write records and the "
+        "session a session-scoped read, expire, or supersede matches, so pass the same one to every call "
+        "that must reach the row."
+    ),
+}
+
+_WRITE_PROPERTIES: Dict[str, Any] = {
+    "content": {"type": "string", "description": "The memory text. Clean prose; the bridge sets structure itself."},
+    "project": {"type": "string", "description": f"channel_id inside the lane; omit for the lane-wide '{LANE_CHANNEL}'."},
+    "lane": dict(_LANE_ENUM, description="Must match the lane this server serves; cross-lane writes are refused."),
+    "scope": dict(_SCOPE_ENUM, description="Durable memories stay 'global' so any session can supersede them."),
+    "veracity": dict(_VERACITY_ENUM, description="stated for captain decisions, tool for measured facts."),
+    "memory_type": {"type": "string", "description": "decision, preference, instruction, learning, observation, context."},
+    "importance": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5},
+    "source": {"type": "string", "default": DEFAULT_SOURCE},
+    "metadata": {"type": "object", "description": "Provenance. Round-trips faithfully but is not filterable in recall."},
+    "valid_until": {"type": "string", "description": "ISO timestamp for a fact with a known shelf life."},
+    "session_id": dict(_SESSION_ID_PROPERTY),
+}
+
+TOOL_SPECS: List[Dict[str, Any]] = [
+    {
+        "name": "memory_remember",
+        "description": (
+            "Write one durable memory into this lane. Global scope and a trim pin are applied and "
+            "verified, so the memory survives and stays superseded-able from any other session."
+        ),
+        "inputSchema": {"type": "object", "properties": dict(_WRITE_PROPERTIES), "required": ["content"]},
+        "handler": "remember",
+    },
+    {
+        "name": "memory_recall",
+        "description": (
+            "Search this lane: the named project's own memories plus the lane-wide ones, merged and "
+            "ranked, with cross-lane titles for awareness. A genuine no-match returns count 0, never an error shape."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "project": {"type": "string"},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10},
+                "memory_type": {"type": "string"},
+                "veracity": dict(_VERACITY_ENUM),
+                "include_awareness": {"type": "boolean", "default": True},
+                "session_id": dict(_SESSION_ID_PROPERTY),
+            },
+            "required": ["query"],
+        },
+        "handler": "recall",
+    },
+    {
+        "name": "memory_supersede",
+        "description": (
+            "Replace a memory whose content is no longer true: write the replacement first, then mark "
+            "the old one superseded by it. Recall drops the old memory; it stays queryable as history."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": dict(_WRITE_PROPERTIES, memory_id={"type": "string", "description": "The memory being replaced."}),
+            "required": ["memory_id", "content"],
+        },
+        "handler": "supersede",
+    },
+    {
+        "name": "memory_expire",
+        "description": (
+            "Mark a memory as no longer claimed to be true, with no replacement. For observed externals "
+            "with a shelf life, not for decisions - supersede those instead. Nothing is ever deleted."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"memory_id": {"type": "string"}, "session_id": _SESSION_ID_PROPERTY},
+            "required": ["memory_id"],
+        },
+        "handler": "expire",
+    },
+    {
+        "name": "memory_get",
+        "description": "Read one memory by id, including global memories written by other sessions.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"memory_id": {"type": "string"}, "session_id": _SESSION_ID_PROPERTY},
+            "required": ["memory_id"],
+        },
+        "handler": "get",
+    },
+    {
+        "name": "memory_lanes",
+        "description": (
+            "List the other lanes' important memories as titles only. Enough to know a memory exists and "
+            "ask for it, without its body entering this lane's context."
+        ),
+        "inputSchema": {"type": "object", "properties": {"exclude_self": {"type": "boolean", "default": True}}},
+        "handler": "lanes",
+    },
+    {
+        "name": "memory_cross_lane_recall",
+        "description": (
+            "Read full memories from one other named lane. Requires a stated reason, which is returned "
+            "with the result as an audit trail. Cross-lane writes are never allowed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "lane": dict(_LANE_ENUM),
+                "reason": {"type": "string", "description": "Why this lane's memory is needed."},
+                "project": {"type": "string"},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10},
+                "memory_type": {"type": "string"},
+                "veracity": dict(_VERACITY_ENUM),
+            },
+            "required": ["query", "lane", "reason"],
+        },
+        "handler": "cross_lane_recall",
+    },
+    {
+        "name": "memory_stats",
+        "description": "Store statistics for this lane plus the full preflight result, so health is visible, not assumed.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": "stats",
+    },
+]
+
+
+def tool_definitions() -> List[Dict[str, Any]]:
+    return [{k: v for k, v in spec.items() if k != "handler"} for spec in TOOL_SPECS]
+
+
+def tool_handlers(bridge: Bridge) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
+    return {spec["name"]: getattr(bridge, spec["handler"]) for spec in TOOL_SPECS}
+
+
+# --- stdio JSON-RPC ----------------------------------------------------------
+
+
+def rpc_result(request_id: Any, result: Dict[str, Any]) -> Dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+def rpc_error(request_id: Any, code: int, message: str) -> Dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+
+def tool_content(payload: Dict[str, Any], is_error: bool) -> Dict[str, Any]:
+    return {
+        "content": [{"type": "text", "text": json.dumps(payload, indent=2, default=str)}],
+        "isError": is_error,
+    }
+
+
+def serve(bridge: Bridge, stdin, stdout) -> int:
+    handlers = tool_handlers(bridge)
+    for line in stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            message = json.loads(line)
+        except ValueError:
+            _write(stdout, rpc_error(None, -32700, "parse error"))
+            continue
+        if not isinstance(message, dict):
+            _write(stdout, rpc_error(None, -32600, "invalid request"))
+            continue
+        method = message.get("method")
+        request_id = message.get("id")
+        if request_id is None and method is not None:
+            continue  # a notification; nothing to answer
+        if method == "initialize":
+            _write(
+                stdout,
+                rpc_result(
+                    request_id,
+                    {
+                        "protocolVersion": PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                    },
+                ),
+            )
+        elif method == "ping":
+            _write(stdout, rpc_result(request_id, {}))
+        elif method == "tools/list":
+            _write(stdout, rpc_result(request_id, {"tools": tool_definitions()}))
+        elif method == "tools/call":
+            params = message.get("params") or {}
+            name = params.get("name")
+            args = params.get("arguments") or {}
+            handler = handlers.get(name)
+            if handler is None:
+                _write(stdout, rpc_result(request_id, tool_content(
+                    BridgeError("unknown_tool", f"no tool named {name!r}").payload(), True)))
+                continue
+            try:
+                bridge.verify()
+                payload = handler(args)
+                _write(stdout, rpc_result(request_id, tool_content(payload, False)))
+            except BridgeError as exc:
+                _write(stdout, rpc_result(request_id, tool_content(exc.payload(), True)))
+            except Exception as exc:  # noqa: BLE001 - never answer with an empty success
+                payload = BridgeError("internal_error", f"{type(exc).__name__}: {exc}").payload()
+                _write(stdout, rpc_result(request_id, tool_content(payload, True)))
+        elif method in ("shutdown", "exit"):
+            _write(stdout, rpc_result(request_id, {}))
+            return 0
+        else:
+            _write(stdout, rpc_error(request_id, -32601, f"method not found: {method}"))
+    return 0
+
+
+def _write(stdout, message: Dict[str, Any]) -> None:
+    stdout.write(json.dumps(message, default=str) + "\n")
+    stdout.flush()
+
+
+# --- maintenance subcommands -------------------------------------------------
+
+
+def cmd_provision(data_dir: Path, lane: str) -> Dict[str, Any]:
+    db_path = bank_db_path(data_dir, lane)
+    record_path = provision_record_path(data_dir, lane)
+    open_store(data_dir, lane, LANE_CHANNEL, DEFAULT_SESSION)  # creates the bank
+    if not db_path.is_file():
+        raise BridgeError("provision_failed", f"bank database was not created at {db_path}")
+    seed = (
+        f"[lane:{lane}] Memory lane {lane!r} provisioned for the firstmate bridge on "
+        f"{datetime.now().date().isoformat()}. Bank {bank_for_lane(lane)}; project scoping by channel_id; "
+        f"'{LANE_CHANNEL}' holds facts that apply to every project in this lane."
+    )
+    written = write_memory(
+        data_dir,
+        lane,
+        LANE_CHANNEL,
+        DEFAULT_SESSION,
+        seed,
+        source=DEFAULT_SOURCE,
+        importance=0.7,
+        scope="global",
+        veracity="stated",
+        memory_type="instruction",
+        metadata={"lane": lane, "provisioning_seed": True},
+        valid_until=None,
+    )
+    rows = working_memory_count(db_path)
+    record = {
+        "version": PROVISION_VERSION,
+        "lane": lane,
+        "bank": bank_for_lane(lane),
+        "db_path": str(db_path),
+        "provisioned_at": now_iso(),
+        "row_floor": max(rows, 1),
+    }
+    record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    return {"status": "ok", "provisioned": record, "seed_memory": written["id"]}
+
+
+def cmd_record_floor(data_dir: Path, lane: str) -> Dict[str, Any]:
+    db_path = bank_db_path(data_dir, lane)
+    if not db_path.is_file():
+        raise BridgeError("bank_missing", f"lane {lane!r} has no bank database at {db_path}")
+    record = read_provision_record(data_dir, lane)
+    record["row_floor"] = max(working_memory_count(db_path), 1)
+    record["floor_recorded_at"] = now_iso()
+    provision_record_path(data_dir, lane).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    return {"status": "ok", "provisioned": record}
+
+
+def cmd_lanes(data_dir: Path) -> Dict[str, Any]:
+    entries = []
+    for lane in LANES:
+        db_path = bank_db_path(data_dir, lane)
+        entry: Dict[str, Any] = {"lane": lane, "bank": bank_for_lane(lane), "db_path": str(db_path)}
+        if db_path.is_file():
+            try:
+                preflight(data_dir, lane, full=False)
+                entry["state"] = "ready"
+            except BridgeError as exc:
+                entry["state"] = exc.code
+        else:
+            entry["state"] = "unprovisioned"
+        entries.append(entry)
+    return {"status": "ok", "data_dir": str(data_dir), "lanes": entries}
+
+
+# --- CLI ---------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="fm-memory-mcp",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=True,
+    )
+    parser.add_argument("command", choices=["serve", "preflight", "provision", "record-floor", "lanes"])
+    parser.add_argument("--lane", help="One of: " + ", ".join(LANES))
+    parser.add_argument("--project", help="Project name; mapped to a lane through the registry")
+    parser.add_argument("--data-dir", help="Mnemosyne data dir (default: MNEMOSYNE_DATA_DIR, then ~/.hermes/mnemosyne/data)")
+    parser.add_argument("--session", default=os.environ.get("FM_MEMORY_SESSION", DEFAULT_SESSION),
+                        help="Provenance session id, never a scoping axis")
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    data_dir = resolve_data_dir(args.data_dir)
+    try:
+        if args.command == "lanes":
+            print(json.dumps(cmd_lanes(data_dir), indent=2))
+            return 0
+
+        lane = resolve_lane(args.lane, args.project)
+
+        if args.command == "preflight":
+            result = preflight(data_dir, lane, full=True)
+            print(json.dumps(result, indent=2))
+            return 0
+        if args.command == "provision":
+            print(json.dumps(cmd_provision(data_dir, lane), indent=2))
+            return 0
+        if args.command == "record-floor":
+            print(json.dumps(cmd_record_floor(data_dir, lane), indent=2))
+            return 0
+
+        # serve: prove the store before speaking a single protocol message.
+        verified = preflight(data_dir, lane, full=True)
+        print(
+            f"{SERVER_NAME}: serving lane {lane} from {verified['db_path']} "
+            f"({verified['checks']['working_memory_rows']} memories)",
+            file=sys.stderr,
+        )
+        bridge = Bridge(data_dir, lane, args.project, args.session)
+        return serve(bridge, sys.stdin, sys.stdout)
+    except BridgeError as exc:
+        print(json.dumps(exc.payload(), indent=2), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

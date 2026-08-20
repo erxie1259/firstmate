@@ -104,6 +104,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -320,6 +321,17 @@ def read_provision_record(data_dir: Path, lane: str) -> Dict[str, Any]:
     return record
 
 
+def sqlite_read_uri(db_path: Path, mode: str) -> str:
+    """Build a `file:` URI for db_path that cannot be truncated by its own path.
+
+    SQLite ends the path of a URI at the first `?` or `#`, so interpolating a
+    raw path silently drops the mode parameter - and losing `mode=ro` means the
+    connection defaults to `rwc` and creates the stray store the preflight
+    exists to disprove. Percent-encoding the path keeps both halves intact.
+    """
+    return "file:" + urllib.parse.quote(str(db_path)) + "?" + urllib.parse.urlencode({"mode": mode})
+
+
 def open_for_inspection(db_path: Path) -> Tuple[sqlite3.Connection, str]:
     """Open an existing store for reading, and report which mode it took.
 
@@ -335,7 +347,7 @@ def open_for_inspection(db_path: Path) -> Tuple[sqlite3.Connection, str]:
     for mode in ("ro", "rw"):
         conn = None
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode={mode}", uri=True, timeout=10)
+            conn = sqlite3.connect(sqlite_read_uri(db_path, mode), uri=True, timeout=10)
             # Touch the file itself: connect() is lazy, and the WAL -shm problem
             # this fallback exists for only shows up on the first real read.
             conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
@@ -347,14 +359,22 @@ def open_for_inspection(db_path: Path) -> Tuple[sqlite3.Connection, str]:
     raise BridgeError("store_unreadable", f"cannot open {db_path} for reading: {last}")
 
 
-def working_memory_count(db_path: Path) -> int:
-    conn, _mode = open_for_inspection(db_path)
+def working_memory_count(db_path: Path, conn: Optional[sqlite3.Connection] = None) -> int:
+    """Count working memories, reusing an already-open inspection connection.
+
+    Passing the connection the structural checks used keeps the row floor
+    measured against the same snapshot and the same open mode they reported.
+    """
+    owned = conn is None
+    if conn is None:
+        conn, _mode = open_for_inspection(db_path)
     try:
         return int(conn.execute("SELECT count(*) FROM working_memory").fetchone()[0])
     except sqlite3.Error as exc:
         raise BridgeError("store_unreadable", f"cannot count {db_path}: {exc}") from exc
     finally:
-        conn.close()
+        if owned:
+            conn.close()
 
 
 def preflight(data_dir: Path, lane: str, full: bool = True) -> Dict[str, Any]:
@@ -408,12 +428,13 @@ def preflight(data_dir: Path, lane: str, full: bool = True) -> Dict[str, Any]:
             checks["journal_mode"] = journal
             checks["tables_present"] = len(present)
             checks["open_mode"] = open_mode
+            rows = working_memory_count(db_path, conn)
         except sqlite3.Error as exc:
             raise BridgeError("store_unreadable", f"cannot inspect {db_path}: {exc}") from exc
         finally:
             conn.close()
-
-    rows = working_memory_count(db_path)
+    else:
+        rows = working_memory_count(db_path)
     if rows < floor:
         raise BridgeError(
             "store_empty",
@@ -457,12 +478,21 @@ def import_mnemosyne(data_dir: Path):
         try:
             import mnemosyne.core.memory  # noqa: F401, PLC0415
         except ImportError as exc:
-            os.environ["MNEMOSYNE_DATA_DIR"] = str(data_dir)
             raise BridgeError(
                 "library_unavailable",
                 f"cannot import mnemosyne under {sys.executable}: {exc}",
                 "Run this server with the interpreter that has mnemosyne-memory installed.",
             ) from exc
+        except Exception as exc:  # noqa: BLE001 - the library writes at import time
+            raise BridgeError(
+                "library_import_failed",
+                f"mnemosyne failed to import under {sys.executable}: {exc}",
+                "The library's import-time init_db() could not run in a scratch directory.",
+            ) from exc
+        finally:
+            # Always leave the environment naming the real data dir: the sandbox
+            # is deleted, so an escaping failure must not leave it pointed there.
+            os.environ["MNEMOSYNE_DATA_DIR"] = str(data_dir)
     os.environ["MNEMOSYNE_DATA_DIR"] = str(data_dir)
     from mnemosyne.core.memory import Mnemosyne  # noqa: PLC0415
 
@@ -655,7 +685,7 @@ def attach_readable(conn: sqlite3.Connection, db_path: Path, alias: str) -> str:
     last: Optional[Exception] = None
     for mode in ("ro", "rw"):
         try:
-            conn.execute(f"ATTACH DATABASE 'file:{db_path}?mode={mode}' AS {alias}")  # noqa: S608
+            conn.execute(f"ATTACH DATABASE ? AS {alias}", (sqlite_read_uri(db_path, mode),))  # noqa: S608
             conn.execute(f"SELECT 1 FROM {alias}.working_memory LIMIT 1").fetchone()  # noqa: S608
             return mode
         except sqlite3.Error as exc:
@@ -780,6 +810,7 @@ class Bridge:
         if not memory_id:
             raise BridgeError("invalid_argument", "memory_id is required")
         lane = self._arg_lane(args)
+        session_id = args.get("session_id") or self.session_id
         metadata = dict(args.get("metadata") or {})
         metadata["supersedes"] = memory_id
         # New row first: a crash between the steps leaves a duplicate, which is
@@ -788,7 +819,7 @@ class Bridge:
             self.data_dir,
             lane,
             self.channel_for(args.get("project")),
-            self.session_id,
+            session_id,
             args.get("content", ""),
             source=args.get("source") or DEFAULT_SOURCE,
             importance=args.get("importance", 0.5),
@@ -798,7 +829,7 @@ class Bridge:
             metadata=metadata,
             valid_until=args.get("valid_until"),
         )
-        store = open_store(self.data_dir, lane, self.channel_for(args.get("project")), self.session_id)
+        store = open_store(self.data_dir, lane, self.channel_for(args.get("project")), session_id)
         try:
             invalidated = bool(store.invalidate(memory_id, replacement_id=written["id"]))
         except Exception as exc:  # noqa: BLE001
@@ -937,6 +968,7 @@ _WRITE_PROPERTIES: Dict[str, Any] = {
     "source": {"type": "string", "default": DEFAULT_SOURCE},
     "metadata": {"type": "object", "description": "Provenance. Round-trips faithfully but is not filterable in recall."},
     "valid_until": {"type": "string", "description": "ISO timestamp for a fact with a known shelf life."},
+    "session_id": {"type": "string", "description": "Provenance override; omit to record this server's session."},
 }
 
 TOOL_SPECS: List[Dict[str, Any]] = [

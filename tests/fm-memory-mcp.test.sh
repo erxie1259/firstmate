@@ -216,6 +216,37 @@ test_preflight_reads_a_wal_store_with_no_live_writer() {
   pass "fm-memory-mcp: preflight reads a WAL store with no live writer and reports the open mode"
 }
 
+test_preflight_reads_a_data_dir_whose_path_holds_uri_metacharacters() {
+  local dir out
+  # A '#' or '?' in the path ends a SQLite URI's path component, so an
+  # unescaped path both truncates and silently drops mode=ro - which makes the
+  # connection default to rwc and create a stray database at the truncation
+  # point. The store here is fine; only its path is awkward.
+  dir="$TMP_ROOT/uri#meta?dir"
+  make_ready_lane "$dir" products 3
+  out=$(fm_memory_mcp "$dir" preflight --lane products) || fail "preflight failed on a data dir with URI metacharacters: $out"
+  assert_contains "$out" '"store_verified": true' "a ready lane under an awkward path was not verified"
+  [ "$(json_field "$out" "d['checks']['working_memory_rows']")" = "3" ] || fail "preflight miscounted through an awkward path"
+  assert_absent "$TMP_ROOT/uri" "preflight created a stray database at the truncated path"
+  pass "fm-memory-mcp: preflight reads through a path holding URI metacharacters without creating a stray store"
+}
+
+test_awareness_attaches_a_bank_whose_path_holds_a_quote() {
+  local dir line payload
+  # attach_readable names the bank inside a SQL statement; an apostrophe in the
+  # path must not be able to end the string literal it is named in.
+  dir="$TMP_ROOT/quote'dir"
+  make_ready_lane "$dir" products 2
+  make_ready_lane "$dir" shared 2
+  line=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_lanes","arguments":{}}}' \
+    | tail -n 1)
+  payload=$(tool_payload "$line")
+  [ "$(json_field "$payload" "d['isError']")" = "False" ] || fail "memory_lanes failed through a quoted path: $payload"
+  [ "$(json_field "$payload" "d['payload']['count']")" = "2" ] || fail "awareness did not read the sibling lane through a quoted path: $payload"
+  pass "fm-memory-mcp: cross-lane awareness attaches a bank whose path holds an apostrophe"
+}
+
 # --- lane resolution ---------------------------------------------------------
 
 test_refuses_unknown_lane() {
@@ -562,6 +593,8 @@ test_preflight_refuses_wiped_store_below_recorded_floor
 test_preflight_refuses_foreign_database
 test_preflight_passes_a_ready_lane
 test_preflight_reads_a_wal_store_with_no_live_writer
+test_preflight_reads_a_data_dir_whose_path_holds_uri_metacharacters
+test_awareness_attaches_a_bank_whose_path_holds_a_quote
 test_refuses_unknown_lane
 test_refuses_unresolved_lane
 test_resolves_lane_from_the_project_registry

@@ -561,6 +561,9 @@ def pin_write(store, memory_id: str, memory_type: Optional[str]) -> str:
     return str(row[0])
 
 
+UNCHECKED = object()
+
+
 def write_memory(
     data_dir: Path,
     lane: str,
@@ -575,6 +578,8 @@ def write_memory(
     memory_type: Optional[str],
     metadata: Optional[Dict[str, Any]],
     valid_until: Optional[str],
+    store: Any = None,
+    existing_id: Any = UNCHECKED,
 ) -> Dict[str, Any]:
     if not content or not content.strip():
         raise BridgeError("invalid_argument", "content is required and cannot be blank")
@@ -589,8 +594,10 @@ def write_memory(
     if not 0.0 <= importance <= 1.0:
         raise BridgeError("invalid_argument", "importance must be between 0 and 1")
 
-    store = open_store(data_dir, lane, channel_id, session_id)
-    existing_id = duplicate_id(store, content)
+    if store is None:
+        store = open_store(data_dir, lane, channel_id, session_id)
+    if existing_id is UNCHECKED:
+        existing_id = duplicate_id(store, content)
     try:
         memory_id = store.beam.remember(
             content,
@@ -856,7 +863,8 @@ class Bridge:
         # replacement content identical to the target would update that very row
         # in place - moving its channel and overwriting its fields - and then
         # supersede it by itself. Refuse first, while it is still untouched.
-        if duplicate_id(store, args.get("content", "")) == memory_id:
+        existing_id = duplicate_id(store, args.get("content", ""))
+        if existing_id == memory_id:
             raise BridgeError(
                 "supersede_noop",
                 f"the replacement content is identical to memory {memory_id}, so nothing would replace it; "
@@ -878,6 +886,8 @@ class Bridge:
             memory_type=args.get("memory_type"),
             metadata=metadata,
             valid_until=args.get("valid_until"),
+            store=store,
+            existing_id=existing_id,
         )
         try:
             invalidated = bool(store.invalidate(memory_id, replacement_id=written["id"]))

@@ -59,6 +59,13 @@ make_fake_root() {
   ln -s "$ROOT/bin/fm-tmux-lib.sh" "$fake/bin/fm-tmux-lib.sh"
   ln -s "$ROOT/bin/fm-composer-lib.sh" "$fake/bin/fm-composer-lib.sh"
   ln -s "$ROOT/bin/fm-nm-run-lib.sh" "$fake/bin/fm-nm-run-lib.sh"
+  # fm-cursor-lib.sh and fm-session-lock-lib.sh: siblings the tmux adapter
+  # itself sources. They must be present before fm_backend_source runs: a
+  # failed `.` is fatal in stock macOS Bash 3.2 even under the caller's
+  # conditional, so an absent one silently ends the whole teardown subprocess
+  # mid-run and leaves every later assertion here vacuously satisfied.
+  ln -s "$ROOT/bin/fm-cursor-lib.sh" "$fake/bin/fm-cursor-lib.sh"
+  ln -s "$ROOT/bin/fm-session-lock-lib.sh" "$fake/bin/fm-session-lock-lib.sh"
   # fm-lock-lib.sh: teardown sources it for the shared lock-staleness proof.
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   # Lifecycle serialization, status presentation retirement, and shared adapter
@@ -90,6 +97,13 @@ SH
 exit 0
 SH
   chmod +x "$fake/bin/fm-fleet-sync.sh"
+  # fm-remote-job-reap-orphans.sh: stub (teardown sweeps abandoned remote job
+  # workers with `|| true`; no remote state exists in this fixture).
+  cat > "$fake/bin/fm-remote-job-reap-orphans.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fake/bin/fm-remote-job-reap-orphans.sh"
   # fm-tasks-axi-lib.sh: stub (teardown sources it). Report no backend so
   # backlog_refresh_reminder takes the plain-message path; no tasks-axi here.
   cat > "$fake/bin/fm-tasks-axi-lib.sh" <<'SH'
@@ -140,6 +154,8 @@ test_teardown_skips_gracefully_without_tasktmp() {
   ln -s "$ROOT/bin/fm-tmux-lib.sh" "$fake/bin/fm-tmux-lib.sh"
   ln -s "$ROOT/bin/fm-composer-lib.sh" "$fake/bin/fm-composer-lib.sh"
   ln -s "$ROOT/bin/fm-nm-run-lib.sh" "$fake/bin/fm-nm-run-lib.sh"
+  ln -s "$ROOT/bin/fm-cursor-lib.sh" "$fake/bin/fm-cursor-lib.sh"
+  ln -s "$ROOT/bin/fm-session-lock-lib.sh" "$fake/bin/fm-session-lock-lib.sh"
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   ln -s "$ROOT/bin/fm-control-lib.sh" "$fake/bin/fm-control-lib.sh"
   ln -s "$ROOT/bin/fm-classify-lib.sh" "$fake/bin/fm-classify-lib.sh"
@@ -166,6 +182,11 @@ SH
 exit 0
 SH
   chmod +x "$fake/bin/fm-fleet-sync.sh"
+  cat > "$fake/bin/fm-remote-job-reap-orphans.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fake/bin/fm-remote-job-reap-orphans.sh"
   cat > "$fake/bin/fm-tasks-axi-lib.sh" <<'SH'
 fm_tasks_axi_backend_available() { return 1; }
 SH

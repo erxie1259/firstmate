@@ -157,7 +157,10 @@ done < "$BRIEF" > "$TMP/charter.remote"
 PROJECTS_CSV=
 : > "$TMP/project.records"
 PROJECT_INDEX=0
-for project in "${PROJECT_NAMES[@]}"; do
+# Expanded empty-safe: `--no-projects` leaves this array empty, and stock
+# macOS Bash 3.2 treats a bare "${arr[@]}" on an empty array as unbound under
+# `set -u` (fixed upstream in 4.4), which killed the whole seed here.
+for project in "${PROJECT_NAMES[@]+"${PROJECT_NAMES[@]}"}"; do
   ORIGIN=${PROJECT_ORIGINS[$PROJECT_INDEX]}
   PROJECT_INDEX=$((PROJECT_INDEX + 1))
   MODE_LINE=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" "$SCRIPT_DIR/fm-project-mode.sh" "$project")

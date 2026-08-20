@@ -2686,7 +2686,15 @@ preserve_relaunch_meta() {
   if [ "$SPAWN_CONTROL_PARENT" = 1 ] && [ -n "${FM_CONTROL_RELAUNCH_TX:-}" ]; then
     echo "control_relaunch_tx=$FM_CONTROL_RELAUNCH_TX"
   fi
-} > "$SPAWN_META_PATH"
+} > "$SPAWN_META_PATH" || {
+  # Explicit, because errexit alone does not carry this: stock macOS Bash 3.2
+  # does not treat a failed redirection on a compound command as a fatal
+  # errexit condition, so an unpublishable metadata path let the spawn print a
+  # success line and exit 0 with no record at all, leaking the backend's
+  # terminal and worktree past the abort cleanup this exit restores.
+  echo "error: cannot publish task metadata at $SPAWN_META_PATH" >&2
+  exit 1
+}
 if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_META_PUBLISH_STARTED=1
   mv -f "$SPAWN_META_TMP" "$STATE/$ID.meta"

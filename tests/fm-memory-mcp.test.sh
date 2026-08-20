@@ -1443,6 +1443,55 @@ test_superseding_an_expired_target_is_refused_with_a_true_reason() {
   pass "fm-memory-mcp: superseding an expired target is refused for the reason that is actually true"
 }
 
+test_the_memory_type_a_caller_writes_can_be_read_back() {
+  local dir first replacement out
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the memory-type readback test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the memory-type readback test"
+    return
+  fi
+  # The bridge stamps memory_type itself as part of pinning, so it is the one
+  # write parameter no library call reports back. A caller needs a tool that can
+  # tell it what type the row actually carries.
+  dir="$TMP_ROOT/memory-type"
+  mkdir -p "$dir"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+
+  first=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"Releases are cut from main.","project":"alpha","memory_type":"decision"}}}' \
+    | tail -n 1)
+  first=$(tool_payload "$first")
+  [ "$(json_field "$first" "d['isError']")" = "False" ] || fail "the write failed: $first"
+  [ "$(json_field "$first" "d['payload']['memory_type']")" = "decision" ] \
+    || fail "memory_remember did not report the memory_type it wrote: $first"
+  first=$(json_field "$first" "d['payload']['id']")
+
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_get\",\"arguments\":{\"memory_id\":\"$first\"}}}" \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['payload']['memory']['memory_type']")" = "decision" ] \
+    || fail "memory_get could not read back the type that was written: $out"
+
+  replacement=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_supersede\",\"arguments\":{\"memory_id\":\"$first\",\"content\":\"Releases are cut from the release branch.\",\"project\":\"alpha\",\"memory_type\":\"instruction\"}}}" \
+    | tail -n 1)
+  replacement=$(tool_payload "$replacement")
+  [ "$(json_field "$replacement" "d['isError']")" = "False" ] || fail "supersede failed: $replacement"
+  [ "$(json_field "$replacement" "d['payload']['memory_type']")" = "instruction" ] \
+    || fail "memory_supersede did not report the replacement's memory_type: $replacement"
+
+  # And what was reported is what the row holds.
+  out=$(python3 - "$dir/banks/lane-products/mnemosyne.db" "$(json_field "$replacement" "d['payload']['id']")" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+print(conn.execute("SELECT memory_type FROM working_memory WHERE id = ?", (sys.argv[2],)).fetchone()[0])
+PY
+)
+  [ "$out" = "instruction" ] || fail "the reported memory_type is not the stored one: $out"
+  pass "fm-memory-mcp: the memory_type a caller writes is reported back and readable"
+}
+
 test_preflight_refuses_missing_data_dir
 test_preflight_refuses_missing_bank
 test_preflight_refuses_unprovisioned_bank
@@ -1488,3 +1537,4 @@ test_a_non_canonical_shelf_life_is_recallable_not_dead_on_arrival
 test_retired_refusals_name_the_live_head_of_the_chain
 test_a_dedupe_update_reports_the_row_it_actually_left_behind
 test_superseding_an_expired_target_is_refused_with_a_true_reason
+test_the_memory_type_a_caller_writes_can_be_read_back

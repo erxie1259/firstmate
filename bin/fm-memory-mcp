@@ -867,7 +867,7 @@ def read_memory(store, memory_id: str) -> Optional[Dict[str, Any]]:
         try:
             row = store.conn.execute(
                 f"SELECT id, content, source, timestamp, session_id, importance, "  # noqa: S608
-                f"metadata_json, veracity, scope, channel_id, valid_until, superseded_by "
+                f"metadata_json, veracity, scope, channel_id, valid_until, superseded_by, memory_type "
                 f"FROM {table} WHERE id = ? AND (scope = 'global' OR session_id = ?)",
                 (memory_id, store.session_id),
             ).fetchone()
@@ -893,6 +893,7 @@ def read_memory(store, memory_id: str) -> Optional[Dict[str, Any]]:
                 "channel_id": row[9],
                 "valid_until": row[10],
                 "superseded_by": row[11],
+                "memory_type": row[12],
                 "memory_store": "working" if table == "working_memory" else "episodic",
             }
     return None

@@ -1103,6 +1103,118 @@ test_a_memory_with_a_future_shelf_life_is_still_writable() {
   pass "fm-memory-mcp: a future shelf life is not a retirement"
 }
 
+test_superseding_an_already_superseded_memory_is_refused() {
+  local dir first second out row live
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the chain-guard test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the chain-guard test"
+    return
+  fi
+  # invalidate() rewrites valid_until and superseded_by unconditionally, so a
+  # second supersede of the same target would point it at the newer row and
+  # leave the first replacement live beside it - two rows claiming one fact,
+  # and the original audit link gone.
+  dir="$TMP_ROOT/supersede-chain"
+  mkdir -p "$dir"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+  first=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"Deploys go out on Monday.","project":"alpha"}}}' \
+    | tail -n 1)
+  first=$(json_field "$(tool_payload "$first")" "d['payload']['id']")
+
+  second=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_supersede\",\"arguments\":{\"memory_id\":\"$first\",\"content\":\"Deploys go out on Tuesday.\",\"project\":\"alpha\"}}}" \
+    | tail -n 1)
+  second=$(tool_payload "$second")
+  [ "$(json_field "$second" "d['isError']")" = "False" ] || fail "the first supersede failed: $second"
+  second=$(json_field "$second" "d['payload']['id']")
+
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_supersede\",\"arguments\":{\"memory_id\":\"$first\",\"content\":\"Deploys go out on Wednesday.\",\"project\":\"alpha\"}}}" \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "True" ] \
+    || fail "superseding an already-superseded memory was accepted: $out"
+  [ "$(json_field "$out" "d['payload']['error']['code']")" = "supersede_target_retired" ] \
+    || fail "the refusal was not typed supersede_target_retired: $out"
+  assert_contains "$out" "$second" "the refusal did not name the live replacement to act on instead"
+
+  row=$(python3 - "$dir/banks/lane-products/mnemosyne.db" "$first" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+print(conn.execute("SELECT superseded_by FROM working_memory WHERE id = ?", (sys.argv[2],)).fetchone()[0])
+PY
+)
+  [ "$row" = "$second" ] || fail "the refused supersede rewrote the existing chain: $row"
+
+  # Exactly one live row still claims the fact, and it is the first replacement.
+  live=$(python3 - "$dir/banks/lane-products/mnemosyne.db" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+rows = conn.execute(
+    "SELECT id FROM working_memory WHERE content LIKE 'Deploys go out%'"
+    " AND superseded_by IS NULL AND valid_until IS NULL").fetchall()
+print(" ".join(r[0] for r in rows))
+PY
+)
+  [ "$live" = "$second" ] || fail "the fact is claimed by something other than the single live replacement: $live"
+  pass "fm-memory-mcp: superseding an already-superseded memory is refused, and its chain stands"
+}
+
+test_a_valid_until_already_in_the_past_is_refused() {
+  local dir out rows
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the past-shelf-life test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the past-shelf-life test"
+    return
+  fi
+  # A row whose valid_until has passed is filtered out of every recall, so
+  # reporting that write pinned and durable is the success-shaped unreachable
+  # write the whole contract forbids.
+  dir="$TMP_ROOT/past-shelf-life"
+  mkdir -p "$dir"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+  out=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"A fact that was already stale when written.","project":"alpha","valid_until":"2020-01-01T00:00:00"}}}' \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "True" ] \
+    || fail "a memory that expired before it was written was reported durable: $out"
+  [ "$(json_field "$out" "d['payload']['error']['code']")" = "valid_until_in_the_past" ] \
+    || fail "the refusal was not typed valid_until_in_the_past: $out"
+
+  rows=$(python3 - "$dir/banks/lane-products/mnemosyne.db" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+print(conn.execute("SELECT count(*) FROM working_memory WHERE content LIKE 'A fact that was already stale%'").fetchone()[0])
+PY
+)
+  [ "$rows" = "0" ] || fail "the refused write still landed a row: $rows"
+  pass "fm-memory-mcp: a valid_until already in the past is refused, not written and reported durable"
+}
+
+test_a_malformed_valid_until_is_refused() {
+  local dir out
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the malformed-shelf-life test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the malformed-shelf-life test"
+    return
+  fi
+  # The store never parses this field, it compares it as text, so 'next week'
+  # would silently become permanent or immediately dead by its first character.
+  dir="$TMP_ROOT/malformed-shelf-life"
+  mkdir -p "$dir"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+  out=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"A fact with a hand-written shelf life.","project":"alpha","valid_until":"next week"}}}' \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "True" ] || fail "a malformed valid_until was accepted verbatim: $out"
+  [ "$(json_field "$out" "d['payload']['error']['code']")" = "invalid_argument" ] \
+    || fail "the refusal was not typed invalid_argument: $out"
+  pass "fm-memory-mcp: a malformed valid_until is refused rather than compared as text"
+}
+
 test_preflight_refuses_missing_data_dir
 test_preflight_refuses_missing_bank
 test_preflight_refuses_unprovisioned_bank
@@ -1141,3 +1253,6 @@ test_extracted_content_is_never_relocated_out_of_its_project
 test_reasserting_a_superseded_memory_is_refused_not_reported_durable
 test_reasserting_an_expired_memory_is_refused_not_reported_durable
 test_a_memory_with_a_future_shelf_life_is_still_writable
+test_superseding_an_already_superseded_memory_is_refused
+test_a_valid_until_already_in_the_past_is_refused
+test_a_malformed_valid_until_is_refused

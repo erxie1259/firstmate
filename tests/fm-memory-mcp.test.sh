@@ -103,7 +103,8 @@ serve_rpc() {
   {
     printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
     for line in "$@"; do printf '%s\n' "$line"; done
-  } | FM_HOME="$TMP_ROOT/no-such-home" "$MCP" serve --lane "$lane" --data-dir "$data_dir" 2>/dev/null
+  } | env HOME="${FM_MEMORY_TEST_HOME:-$HOME}" FM_HOME="$TMP_ROOT/no-such-home" \
+      "$MCP" serve --lane "$lane" --data-dir "$data_dir" 2>/dev/null
 }
 
 # The JSON payload a tool call answered with, and whether it was flagged an error.
@@ -720,6 +721,221 @@ test_the_default_bank_is_never_touched() {
   pass "fm-memory-mcp: a full write cycle never opens the default bank"
 }
 
+test_lanes_tells_a_wiped_sibling_apart_from_an_empty_one() {
+  local dir line payload states
+  # The awareness list is the whole result of memory_lanes, so a sibling bank
+  # that was wiped contributes nothing - exactly what a genuinely quiet lane
+  # contributes. Requirement 2 forbids those sharing a shape, so each lane has
+  # to carry the state it proved.
+  dir="$TMP_ROOT/wiped-sibling"
+  make_ready_lane "$dir" products 2
+  make_ready_lane "$dir" shared 2
+  # personal was provisioned and then wiped: its record survives, its rows do not.
+  make_store "$dir" personal 0
+  write_record "$dir" personal 4
+
+  line=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_lanes","arguments":{}}}' \
+    | tail -n 1)
+  payload=$(tool_payload "$line")
+  [ "$(json_field "$payload" "d['isError']")" = "False" ] || fail "one broken sibling took memory_lanes down: $payload"
+  states=$(json_field "$payload" "','.join(sorted(f\"{l['lane']}={l['state']}\" for l in d['payload']['lanes']))")
+  case "$states" in
+    *"personal=store_empty"*) ;;
+    *) fail "the wiped sibling was not reported as a refused store: $states" ;;
+  esac
+  case "$states" in
+    *"shared=ready"*) ;;
+    *) fail "the healthy sibling was not reported ready: $states" ;;
+  esac
+  case "$states" in
+    *"brand-business=unprovisioned"*) ;;
+    *) fail "a lane with no bank at all was not reported unprovisioned: $states" ;;
+  esac
+  # The serving lane's own awareness still works, and the wiped lane contributed
+  # no titles - which is only readable as a failure because of its state.
+  [ "$(json_field "$payload" "sum(1 for t in d['payload']['titles'] if t['lane'] == 'personal')")" = "0" ] \
+    || fail "a store that failed its floor still contributed titles"
+  [ "$(json_field "$payload" "d['count']>0 if False else sum(1 for t in d['payload']['titles'] if t['lane']=='shared')")" != "0" ] \
+    || fail "the healthy sibling contributed no titles"
+  pass "fm-memory-mcp: a wiped sibling lane is reported broken, not silently empty"
+}
+
+test_stats_names_the_lane_bank_and_leaves_no_stray_directory() {
+  local dir before after payload line
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the stats test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the stats test"
+    return
+  fi
+  dir="$TMP_ROOT/stats"
+  mkdir -p "$dir"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+  before=$(find "$dir/banks/lane-products" -type d | sort)
+
+  line=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_stats","arguments":{}}}' \
+    | tail -n 1)
+  payload=$(tool_payload "$line")
+  [ "$(json_field "$payload" "d['isError']")" = "False" ] || fail "memory_stats failed: $payload"
+  # The library's own bank list is rooted at the parent of the database it reads,
+  # which for a lane bank is that bank's own directory - so it names the default
+  # bank this bridge never opens. The bridge owns this field.
+  [ "$(json_field "$payload" "d['payload']['stats']['banks']")" = "['lane-products']" ] \
+    || fail "stats did not name the lane bank it is serving: $payload"
+  [ "$(json_field "$payload" "d['payload']['preflight']['store_verified']")" = "True" ] \
+    || fail "stats did not carry a verified preflight: $payload"
+
+  after=$(find "$dir/banks/lane-products" -type d | sort)
+  [ "$before" = "$after" ] || fail "memory_stats left a stray directory under the bank dir: $after"
+  pass "fm-memory-mcp: memory_stats names the served bank and leaves no stray directory"
+}
+
+test_the_same_content_is_never_relocated_out_of_its_project() {
+  local dir first second row
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the cross-project dedupe test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the cross-project dedupe test"
+    return
+  fi
+  # The store dedupes on (session_id, content) and overwrites the matched row's
+  # channel, so re-asserting alpha's memory under beta would move it out of
+  # alpha, where alpha's recall can never reach it again.
+  dir="$TMP_ROOT/cross-project-dedupe"
+  mkdir -p "$dir"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+  first=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"Ship on Fridays.","project":"alpha"}}}' \
+    | tail -n 1)
+  first=$(tool_payload "$first")
+  [ "$(json_field "$first" "d['isError']")" = "False" ] || fail "the first write failed: $first"
+  first=$(json_field "$first" "d['payload']['id']")
+
+  second=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"Ship on Fridays.","project":"beta"}}}' \
+    | tail -n 1)
+  second=$(tool_payload "$second")
+  [ "$(json_field "$second" "d['isError']")" = "True" ] || fail "the same content was accepted under a second project: $second"
+  [ "$(json_field "$second" "d['payload']['error']['code']")" = "duplicate_in_other_project" ] \
+    || fail "the refusal was not typed duplicate_in_other_project: $second"
+  assert_contains "$second" "alpha" "the refusal did not name the project that already holds the content"
+
+  row=$(python3 - "$dir/banks/lane-products/mnemosyne.db" "$first" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+r = conn.execute("SELECT channel_id, consolidated_at IS NOT NULL FROM working_memory WHERE id = ?",
+                 (sys.argv[2],)).fetchone()
+print("|".join(str(x) for x in r))
+PY
+)
+  [ "$row" = "alpha|1" ] || fail "the refused write still relocated or unpinned the memory: $row"
+
+  # And alpha can still recall what alpha wrote.
+  second=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"query":"Fridays","project":"alpha","include_awareness":false}}}' \
+    | tail -n 1)
+  second=$(tool_payload "$second")
+  [ "$(json_field "$second" "sum(1 for r in d['payload']['results'] if r['id'] == '$first')")" = "1" ] \
+    || fail "the memory left the project that wrote it: $second"
+  pass "fm-memory-mcp: re-asserting content under a second project is refused, not relocated"
+}
+
+test_supersede_refuses_content_the_store_matched_onto_the_target() {
+  local dir first out row blobs
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the sanitized-supersede test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the sanitized-supersede test"
+    return
+  fi
+  # The library rewrites a data: URI to a content-addressed stub before it
+  # dedupes, so two writes of the same URI collide on content the caller never
+  # sees. A guard that compares what the caller sent cannot catch that; only the
+  # id that came back can.
+  dir="$TMP_ROOT/sanitized-supersede"
+  mkdir -p "$dir"
+  # A scratch home, so a regressed blob pin writes bytes here rather than into
+  # the operator's shared tree. The library's embedding cache is hardcoded to
+  # ~/.hermes/cache, so that one subtree is lent back to keep the test from
+  # re-downloading a model; nothing else under this home is shared.
+  export FM_MEMORY_TEST_HOME="$TMP_ROOT/scratch-home"
+  mkdir -p "$FM_MEMORY_TEST_HOME/.hermes"
+  [ -d "$HOME/.hermes/cache" ] && ln -sfn "$HOME/.hermes/cache" "$FM_MEMORY_TEST_HOME/.hermes/cache"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+
+  first=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==","project":"flags"}}}' \
+    | tail -n 1)
+  first=$(tool_payload "$first")
+  [ "$(json_field "$first" "d['isError']")" = "False" ] || fail "the data-URI write failed: $first"
+  first=$(json_field "$first" "d['payload']['id']")
+
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_supersede\",\"arguments\":{\"memory_id\":\"$first\",\"content\":\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==\",\"project\":\"flags\"}}}" \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "True" ] || fail "a self-matching supersession was reported successful: $out"
+  [ "$(json_field "$out" "d['payload']['error']['code']")" = "supersede_noop" ] \
+    || fail "the refusal was not typed supersede_noop: $out"
+
+  row=$(python3 - "$dir/banks/lane-products/mnemosyne.db" "$first" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+r = conn.execute("SELECT superseded_by IS NULL, valid_until IS NULL FROM working_memory WHERE id = ?",
+                 (sys.argv[2],)).fetchone()
+print("|".join(str(x) for x in r))
+PY
+)
+  [ "$row" = "1|1" ] || fail "the memory was superseded by itself and is now invisible to recall: $row"
+
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_get\",\"arguments\":{\"memory_id\":\"$first\"}}}" \
+    | tail -n 1)
+  [ "$(json_field "$(tool_payload "$out")" "d['isError']")" = "False" ] || fail "the memory was unreadable after the refusal: $out"
+
+  # The extracted bytes belong beside the lane bank, never in the shared tree
+  # the library defaults to.
+  blobs=$(find "$dir/banks/lane-products/blobs" -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "$blobs" != "0" ] || fail "the extracted payload did not land beside the lane bank"
+  assert_absent "$FM_MEMORY_TEST_HOME/.hermes/mnemosyne" \
+    "blob bytes were written to the library's default home tree instead of the lane"
+  unset FM_MEMORY_TEST_HOME
+  pass "fm-memory-mcp: a supersession the store matched onto its target is refused, and blobs stay in the lane"
+}
+
+test_recall_honors_the_session_it_is_told_to_act_as() {
+  local dir out
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the recall-session test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the recall-session test"
+    return
+  fi
+  # session_id is documented as the one to pass to every call that must reach a
+  # row. Recall has to accept it and act as it, and say which session it used.
+  dir="$TMP_ROOT/recall-session"
+  mkdir -p "$dir"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+  serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"Zarquon is the session-scoped marker.","project":"sess","scope":"session","session_id":"other-agent"}}}' \
+    >/dev/null
+
+  out=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"query":"Zarquon","project":"sess","session_id":"other-agent","include_awareness":false}}}' \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "False" ] || fail "recall as another session failed: $out"
+  [ "$(json_field "$out" "d['payload']['session_id']")" = "other-agent" ] \
+    || fail "recall did not act as the session it was given: $out"
+  [ "$(json_field "$out" "sum(1 for r in d['payload']['results'] if 'Zarquon' in r['content'])")" = "1" ] \
+    || fail "a session-scoped write was not recallable under its own session: $out"
+
+  out=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"query":"Zarquon","project":"sess","include_awareness":false}}}' \
+    | tail -n 1)
+  [ "$(json_field "$(tool_payload "$out")" "d['payload']['session_id']")" = "fm:bridge" ] \
+    || fail "recall without a session_id did not report the server's own session: $out"
+  pass "fm-memory-mcp: recall acts as the session it is told to act as, and reports it"
+}
+
 test_preflight_refuses_missing_data_dir
 test_preflight_refuses_missing_bank
 test_preflight_refuses_unprovisioned_bank
@@ -749,3 +965,8 @@ test_expiring_a_superseded_memory_keeps_its_replacement_link
 test_a_session_scoped_write_is_readable_and_expirable_under_the_same_session
 test_a_lane_is_never_visible_to_another_lanes_recall
 test_the_default_bank_is_never_touched
+test_lanes_tells_a_wiped_sibling_apart_from_an_empty_one
+test_stats_names_the_lane_bank_and_leaves_no_stray_directory
+test_the_same_content_is_never_relocated_out_of_its_project
+test_supersede_refuses_content_the_store_matched_onto_the_target
+test_recall_honors_the_session_it_is_told_to_act_as

@@ -61,6 +61,11 @@ PREFLIGHT (the reason this wrapper exists)
   no-match is {"status":"ok","count":0,"store_verified":true}, a broken store is
   {"status":"error","error":{"code":...}}. Those two never share a shape.
 
+  Every other lane read for awareness proves itself the same way and reports
+  its own state, so a wiped sibling is never an empty awareness list. A broken
+  sibling is reported, never fatal: the serving lane's own recall is the
+  primary contract and stays satisfiable.
+
   Importing mnemosyne runs init_db() at module import time, which opens a store
   read-write. Preflight therefore never imports it - stdlib sqlite3 only - and
   every import path sets MNEMOSYNE_DATA_DIR first.
@@ -77,6 +82,15 @@ WRITE POLICY
   The bridge writes `lane-*` banks only. Hermes's `default` bank is never
   opened read-write by any path here; reading it is deliberately not exposed
   in this phase, because the library opens a store read-write on construction.
+  Extracted binary payloads land beside the lane bank too, never in the shared
+  blob tree the library would otherwise default to.
+
+  The library dedupes on exact content within a session and overwrites the
+  matched row's channel from the writing store. So content that already exists
+  under another project is refused (`duplicate_in_other_project`) rather than
+  relocated out of the project that wrote it, and a supersession the store
+  matched onto its own target is refused (`supersede_noop`) both before the
+  write, on content, and after it, on the id that came back.
 
 TOOLS
   memory_remember           durable write: scope, lane, channel_id, memory_type,
@@ -85,7 +99,8 @@ TOOLS
   memory_supersede          write the replacement first, then invalidate the old
   memory_expire             invalidate with no replacement
   memory_get                read one memory by id, across sessions
-  memory_lanes              cross-lane awareness: titles only, never bodies
+  memory_lanes              cross-lane awareness: titles only, never bodies,
+                            each lane carrying the state it proved
   memory_cross_lane_recall  full bodies from one named other lane; reason required
   memory_stats              store statistics plus the live preflight result
   Deliberately absent: forget (hard delete leaves orphaned gists and
@@ -520,6 +535,11 @@ def import_mnemosyne(data_dir: Path):
 def open_store(data_dir: Path, lane: str, channel_id: str, session_id: str):
     mnemosyne_cls = import_mnemosyne(data_dir)
     bank = bank_for_lane(lane)
+    # The library extracts a data: URI or an oversized payload to content-addressed
+    # blob storage, which defaults to ~/.hermes/mnemosyne/blobs - the shared tree
+    # this bridge never writes. Pin it beside the lane bank so a lane's bytes stay
+    # as physically isolated as its rows.
+    os.environ["MNEMOSYNE_BLOB_DIR"] = str(bank_db_path(data_dir, lane).parent / "blobs")
     try:
         return mnemosyne_cls(session_id=session_id, bank=bank, channel_id=channel_id)
     except Exception as exc:  # noqa: BLE001 - surface any library failure as typed
@@ -579,7 +599,7 @@ def write_memory(
     metadata: Optional[Dict[str, Any]],
     valid_until: Optional[str],
     store: Any = None,
-    existing_id: Any = UNCHECKED,
+    existing: Any = UNCHECKED,
 ) -> Dict[str, Any]:
     if not content or not content.strip():
         raise BridgeError("invalid_argument", "content is required and cannot be blank")
@@ -596,8 +616,21 @@ def write_memory(
 
     if store is None:
         store = open_store(data_dir, lane, channel_id, session_id)
-    if existing_id is UNCHECKED:
-        existing_id = duplicate_id(store, content)
+    if existing is UNCHECKED:
+        existing = duplicate_row(store, content)
+    existing_id = existing["id"] if existing else None
+    # The library's dedupe UPDATE overwrites channel_id from the store's own,
+    # so re-asserting a project's memory under a second project would move the
+    # row out of the project that wrote it, where its recall can never find it
+    # again. That relocation is silent and unrecoverable, so refuse instead.
+    if existing and existing["channel_id"] != channel_id:
+        raise BridgeError(
+            "duplicate_in_other_project",
+            f"lane {lane} already holds this exact content under project "
+            f"{existing['channel_id']!r} (memory {existing['id']}); writing it under "
+            f"{channel_id!r} would move it out of that project",
+            "Recall it there, supersede it there, or write content specific to this project.",
+        )
     try:
         memory_id = store.beam.remember(
             content,
@@ -630,21 +663,22 @@ def write_memory(
     }
 
 
-def duplicate_id(store, content: str) -> Optional[str]:
-    """The id the store's dedupe would update in place instead of writing anew.
+def duplicate_row(store, content: str) -> Optional[Dict[str, Any]]:
+    """The row the store's dedupe would update in place instead of writing anew.
 
     The library dedupes on (session_id, content) and returns the matched row's
     id, so a caller that needs to know whether a write creates or mutates has to
     ask the same question first - after the fact the mutation has already landed.
+    Its channel comes back too, because the dedupe update overwrites it.
     """
     try:
         row = store.conn.execute(
-            "SELECT id FROM working_memory WHERE session_id = ? AND content = ? LIMIT 1",
+            "SELECT id, channel_id FROM working_memory WHERE session_id = ? AND content = ? LIMIT 1",
             (store.session_id, content),
         ).fetchone()
     except sqlite3.Error as exc:
         raise BridgeError("read_failed", f"cannot check working_memory for a duplicate: {exc}") from exc
-    return row[0] if row else None
+    return {"id": row[0], "channel_id": row[1]} if row else None
 
 
 def read_memory(store, memory_id: str) -> Optional[Dict[str, Any]]:
@@ -724,6 +758,33 @@ def recall_lane(
     return ordered[:top_k]
 
 
+def lane_stats(store, data_dir: Path, lane: str) -> Dict[str, Any]:
+    """The library's statistics, with the bank identity corrected to this lane.
+
+    get_stats() builds a BankManager rooted at the parent of the database it is
+    reading. For a lane bank that parent is the bank's own directory, so the
+    manager both creates a `banks/` directory inside it and enumerates nothing,
+    reporting the `default` bank this bridge never opens. The count fields are
+    read straight off this store and are sound; only the bank name is wrong, and
+    only that stray directory is left behind.
+    """
+    stray = bank_db_path(data_dir, lane).parent / "banks"
+    stray_existed = stray.exists()
+    try:
+        stats = dict(store.get_stats())
+    except Exception as exc:  # noqa: BLE001
+        raise BridgeError("stats_failed", f"cannot read stats for lane {lane}: {exc}") from exc
+    finally:
+        if not stray_existed:
+            try:
+                stray.rmdir()  # empty-only by construction; a populated dir is left alone
+            except OSError:
+                pass
+    stats["bank"] = bank_for_lane(lane)
+    stats["banks"] = [bank_for_lane(lane)]
+    return stats
+
+
 def attach_readable(conn: sqlite3.Connection, db_path: Path, alias: str) -> str:
     """ATTACH one bank for reading, preferring mode=ro (see open_for_inspection)."""
     last: Optional[Exception] = None
@@ -741,46 +802,72 @@ def attach_readable(conn: sqlite3.Connection, db_path: Path, alias: str) -> str:
     raise BridgeError("awareness_failed", f"cannot attach {db_path} for reading: {last}")
 
 
-def lane_awareness(data_dir: Path, exclude: Optional[str]) -> List[Dict[str, Any]]:
-    """Cross-lane awareness: titles only, never bodies, read-only."""
-    banks = [
-        (lane, bank_db_path(data_dir, lane))
-        for lane in LANES
-        if lane != exclude and bank_db_path(data_dir, lane).is_file()
-    ]
-    if len(banks) > MAX_ATTACHED_LANES:
+def lane_awareness(data_dir: Path, exclude: Optional[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Cross-lane awareness: titles only, never bodies, read-only.
+
+    Returns (titles, lane_states). Every sibling lane has to prove itself the
+    same way the serving lane does, and each one reports the state it proved:
+    a wiped or unreadable bank contributes no titles, so without a per-lane
+    state an empty awareness list would mean both "nothing important over
+    there" and "that bank is gone". They must never share a shape. One broken
+    sibling also never takes the serving lane down - its own recall is
+    satisfiable and is the primary contract.
+    """
+    states: Dict[str, Dict[str, Any]] = {}
+    readable: List[Tuple[str, Path]] = []
+    for lane in LANES:
+        if lane == exclude:
+            continue
+        db_path = bank_db_path(data_dir, lane)
+        if not db_path.is_file():
+            states[lane] = {"lane": lane, "state": "unprovisioned", "title_count": 0}
+            continue
+        try:
+            preflight(data_dir, lane, full=False)
+        except BridgeError as exc:
+            states[lane] = {"lane": lane, "state": exc.code, "detail": exc.message, "title_count": 0}
+            continue
+        readable.append((lane, db_path))
+    if len(readable) > MAX_ATTACHED_LANES:
         raise BridgeError(
             "too_many_lanes",
-            f"{len(banks)} lane banks exceed SQLite's attach limit of {MAX_ATTACHED_LANES}",
+            f"{len(readable)} lane banks exceed SQLite's attach limit of {MAX_ATTACHED_LANES}",
         )
-    if not banks:
-        return []
-    conn = sqlite3.connect("file:fm-memory-awareness?mode=memory", uri=True)
     titles: List[Dict[str, Any]] = []
-    try:
-        for index, (lane, path) in enumerate(banks):
-            alias = f"lane_{index}"
-            try:
-                attach_readable(conn, path, alias)
-                rows = conn.execute(
-                    f"SELECT id, substr(content, 1, ?), importance, channel_id "  # noqa: S608
-                    f"FROM {alias}.working_memory "
-                    f"WHERE superseded_by IS NULL "
-                    f"  AND (valid_until IS NULL OR valid_until > ?) "
-                    f"  AND importance >= ? "
-                    f"ORDER BY importance DESC LIMIT ?",
-                    (AWARENESS_TITLE_CHARS, now_iso(), AWARENESS_MIN_IMPORTANCE, AWARENESS_LIMIT),
-                ).fetchall()
-            except sqlite3.Error as exc:
-                raise BridgeError("awareness_failed", f"cannot read lane {lane}: {exc}") from exc
-            for row in rows:
-                titles.append(
-                    {"lane": lane, "id": row[0], "title": row[1], "importance": row[2], "channel_id": row[3]}
-                )
-    finally:
-        conn.close()
+    if readable:
+        conn = sqlite3.connect("file:fm-memory-awareness?mode=memory", uri=True)
+        try:
+            for index, (lane, path) in enumerate(readable):
+                alias = f"lane_{index}"
+                try:
+                    attach_readable(conn, path, alias)
+                    rows = conn.execute(
+                        f"SELECT id, substr(content, 1, ?), importance, channel_id "  # noqa: S608
+                        f"FROM {alias}.working_memory "
+                        f"WHERE superseded_by IS NULL "
+                        f"  AND (valid_until IS NULL OR valid_until > ?) "
+                        f"  AND importance >= ? "
+                        f"ORDER BY importance DESC LIMIT ?",
+                        (AWARENESS_TITLE_CHARS, now_iso(), AWARENESS_MIN_IMPORTANCE, AWARENESS_LIMIT),
+                    ).fetchall()
+                except (sqlite3.Error, BridgeError) as exc:
+                    states[lane] = {
+                        "lane": lane,
+                        "state": "awareness_failed",
+                        "detail": f"cannot read lane {lane}: {exc}",
+                        "title_count": 0,
+                    }
+                    continue
+                states[lane] = {"lane": lane, "state": "ready", "title_count": len(rows)}
+                for row in rows:
+                    titles.append(
+                        {"lane": lane, "id": row[0], "title": row[1], "importance": row[2], "channel_id": row[3]}
+                    )
+        finally:
+            conn.close()
     titles.sort(key=lambda t: t.get("importance") or 0, reverse=True)
-    return titles[:AWARENESS_LIMIT]
+    ordered = [states[lane] for lane in LANES if lane in states]
+    return titles[:AWARENESS_LIMIT], ordered
 
 
 # --- tools -------------------------------------------------------------------
@@ -824,13 +911,14 @@ class Bridge:
     def recall(self, args: Dict[str, Any]) -> Dict[str, Any]:
         top_k = self._arg_top_k(args)
         project = args.get("project") or self.project
+        session_id = args.get("session_id") or self.session_id
         channels: List[Optional[str]] = [LANE_CHANNEL]
         if project:
             channels.insert(0, project)
         results = recall_lane(
             self.data_dir,
             self.lane,
-            self.session_id,
+            session_id,
             args.get("query", ""),
             channels=channels,
             top_k=top_k,
@@ -842,11 +930,14 @@ class Bridge:
             "store_verified": True,
             "lane": self.lane,
             "project": project,
+            "session_id": session_id,
             "count": len(results),
             "results": results,
         }
         if args.get("include_awareness", True):
-            payload["awareness"] = lane_awareness(self.data_dir, exclude=self.lane)
+            titles, lane_states = lane_awareness(self.data_dir, exclude=self.lane)
+            payload["awareness"] = titles
+            payload["awareness_lanes"] = lane_states
         return payload
 
     def supersede(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -863,8 +954,8 @@ class Bridge:
         # replacement content identical to the target would update that very row
         # in place - moving its channel and overwriting its fields - and then
         # supersede it by itself. Refuse first, while it is still untouched.
-        existing_id = duplicate_id(store, args.get("content", ""))
-        if existing_id == memory_id:
+        existing = duplicate_row(store, args.get("content", ""))
+        if existing and existing["id"] == memory_id:
             raise BridgeError(
                 "supersede_noop",
                 f"the replacement content is identical to memory {memory_id}, so nothing would replace it; "
@@ -887,8 +978,19 @@ class Bridge:
             metadata=metadata,
             valid_until=args.get("valid_until"),
             store=store,
-            existing_id=existing_id,
+            existing=existing,
         )
+        # Authoritative, whatever the library dedupes on: it sanitizes content
+        # before matching, so a payload the pre-write check read as new can still
+        # land on the target row. Superseding a memory by itself hides it from
+        # every read, so refuse here rather than link it to itself.
+        if written["id"] == memory_id:
+            raise BridgeError(
+                "supersede_noop",
+                f"the store matched the replacement onto memory {memory_id} itself, so nothing would replace it; "
+                f"{memory_id} was updated in place and is still readable",
+                "Supersede needs content the store treats as different; use memory_expire to retire one unchanged.",
+            )
         try:
             invalidated = bool(store.invalidate(memory_id, replacement_id=written["id"]))
         except Exception as exc:  # noqa: BLE001
@@ -945,7 +1047,7 @@ class Bridge:
 
     def lanes(self, args: Dict[str, Any]) -> Dict[str, Any]:
         exclude = self.lane if args.get("exclude_self", True) else None
-        titles = lane_awareness(self.data_dir, exclude=exclude)
+        titles, lane_states = lane_awareness(self.data_dir, exclude=exclude)
         return {
             "status": "ok",
             "store_verified": True,
@@ -953,7 +1055,12 @@ class Bridge:
             "known_lanes": list(LANES),
             "count": len(titles),
             "titles": titles,
-            "note": "Titles only. Use memory_cross_lane_recall with a reason to read a body.",
+            "lanes": lane_states,
+            "note": (
+                "Titles only. Use memory_cross_lane_recall with a reason to read a body. "
+                "'lanes' carries each lane's proven state: a lane that is not 'ready' contributed "
+                "no titles because it could not be verified, not because it holds nothing."
+            ),
         }
 
     def cross_lane_recall(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -995,10 +1102,7 @@ class Bridge:
     def stats(self, args: Dict[str, Any]) -> Dict[str, Any]:
         verified = preflight(self.data_dir, self.lane, full=True)
         store = open_store(self.data_dir, self.lane, self.channel_for(None), self.session_id)
-        try:
-            stats = store.get_stats()
-        except Exception as exc:  # noqa: BLE001
-            raise BridgeError("stats_failed", f"cannot read stats for lane {self.lane}: {exc}") from exc
+        stats = lane_stats(store, self.data_dir, self.lane)
         return {"status": "ok", "store_verified": True, "lane": self.lane, "preflight": verified, "stats": stats}
 
     # -- helpers --------------------------------------------------------------
@@ -1081,6 +1185,7 @@ TOOL_SPECS: List[Dict[str, Any]] = [
                 "memory_type": {"type": "string"},
                 "veracity": dict(_VERACITY_ENUM),
                 "include_awareness": {"type": "boolean", "default": True},
+                "session_id": dict(_SESSION_ID_PROPERTY),
             },
             "required": ["query"],
         },

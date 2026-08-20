@@ -751,7 +751,8 @@ def write_pointers(
         # keys are left exactly as they are while the rest of the lane
         # reconciles normally.
         guarded = [key for key in stale if key_source(key) in troubled_sources]
-        reconcilable = [key for key in stale if key not in set(guarded)]
+        guarded_keys = set(guarded)
+        reconcilable = [key for key in stale if key not in guarded_keys]
 
         def leave_alone(keys: List[str], why: str) -> None:
             if keys:
@@ -766,7 +767,8 @@ def write_pointers(
             if reconcilable or (ledger and not chaining):
                 skipped.append({"lane": lane, "keys": reconcilable, "reason": reason})
             reconcilable = []
-        retirable = [key for key in reconcilable if key in set(retirable_keys(ledger, current_keys))]
+        retirable_now = set(retirable_keys(ledger, current_keys))
+        retirable = [key for key in reconcilable if key in retirable_now]
 
         if not entries and not reconcilable:
             if ledger and owns_ledger:
@@ -871,7 +873,8 @@ def write_pointers(
                 accounted: Set[str] = set()
                 allowed = set(reconcilable)
                 pending = [key for key in retirable_keys(ledger, current_keys) if key in allowed]
-                for key in [key for key in reconcilable if key not in set(pending)]:
+                pending_keys = set(pending)
+                for key in [key for key in reconcilable if key not in pending_keys]:
                     ledger.pop(key, None)
                 try:
                     reconcile_lane(session, lane, ledger, pending, counts, refusals, accounted)

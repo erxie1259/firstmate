@@ -4,7 +4,7 @@
 `AGENTS.md` section 6 makes data/captain.md, data/learnings.md and
 data/projects.md canonical for their domains, so the memory bridge indexes them
 by POINTER and never by copy: each memory is short enough to act on and names
-the file, section, and line that owns the fact. The canonical file always wins.
+the file and section that own the fact. The canonical file always wins.
 
 Written in Python for the same reason bin/fm-memory-mcp is: it speaks that
 server's stdio JSON-RPC. Every write goes through the bridge, so pinning, the
@@ -42,18 +42,45 @@ IDEMPOTENCE
   Re-running writes no duplicates. Content is derived deterministically, so an
   unchanged section produces the exact text already stored and the store's own
   dedupe returns the same row: reported `created: false` and counted skipped.
+  A section that MOVED says the same thing, so the line number is deliberately
+  outside both the stored text and the digest: it lives in
+  `metadata.canonical_line` alone, and a pure line shift is absorbed by the
+  same dedupe as an untouched section. Rewriting a moved section would retire
+  its row, and the store refuses to write text a retired row already holds -
+  so reverting the edit that moved it could never be indexed again.
   A section that CHANGED produces different text, which would otherwise leave
   two live pointers for one fact. So a ledger beside each bank records the
-  memory id and canonical digest per pointer, and a changed section is written
-  as a supersession of the recorded row instead of a second memory.
+  memory id, canonical digest, and canonical line per pointer, and a changed
+  section is written as a supersession of the recorded row instead of a second
+  memory.
   The ledger is derived, never authoritative: if the recorded row is gone or
   already retired the bridge refuses the supersession, and the pointer is
   written fresh. Deleting the ledger costs one extra pointer per changed
-  section, never a wrong answer.
+  section, never a wrong answer - except that reconciliation below has nothing
+  left to work from, so pointers to sections deleted while the ledger was gone
+  stay live until their key comes back.
   A pointer whose canonical section is EDITED is superseded on the next run,
   not on the edit. Between the two the store's text is stale while the digest
   in its metadata still names what it was derived from, which is what makes the
   drift detectable rather than silent.
+  `metadata.canonical_line` is accurate as of the run that CREATED the row.
+  The store's dedupe updates neither content nor metadata_json when it matches,
+  so a pointer whose section only moved keeps the line it was written with; the
+  ledger beside the bank carries the current line, and the anchor in the
+  content is what finds the section either way.
+
+RECONCILIATION
+  Every run also retires what the canonical files no longer say. A ledger key
+  the current derivation does not produce - a renamed heading, a deleted
+  section, or a repeat renumbered when an earlier same-named section went away
+  - is expired through the bridge's memory_expire, never by a direct write and
+  never by deleting a row. Otherwise a withdrawn captain decision stays live
+  and recall keeps returning it.
+  A key whose row this run rebound to a surviving pointer is dropped from the
+  ledger rather than expired, because that row is the survivor.
+  Expiry respects the same isolation as writing: a lane whose bridge will not
+  start reconciles nothing, and a key it could not reconcile STAYS in the
+  ledger, because that record holds the only id that can retire it later.
 
 FAILURE ISOLATION
   A lane whose bridge refuses to start costs that lane's pointers and no
@@ -61,9 +88,12 @@ FAILURE ISOLATION
   Stopping at the first bad bank would leave how much of the fleet is indexed
   unknowable, which is the failure shape this whole bridge exists to avoid.
 
+COUNTS
+  written, skipped_duplicate, updated, expired, refused, expiry_refused.
+
 EXIT STATUS
-  0 every pointer is durable in the store; 1 anything was refused or unrouted;
-  2 usage.
+  0 every pointer is durable in the store and everything stale was retired;
+  1 anything was refused or unrouted; 2 usage.
 """
 
 from __future__ import annotations
@@ -154,10 +184,11 @@ def excerpt(body: List[str]) -> str:
 def digest(*parts: str) -> str:
     """The canonical digest a later drift pass compares against.
 
-    It covers the whole derived pointer text, not just the excerpt, because the
-    text is what the store dedupes on: a canonical edit that only moves a
-    section's line number still changes what is stored, so it has to change the
-    digest too or the run writes a second live pointer for one fact.
+    It covers the whole derived pointer text, which is exactly what the store
+    dedupes on, so the two agree on what 'changed' means. The line number is
+    deliberately outside both: a section that only MOVED says the same thing,
+    and rewriting it would retire a row whose text a later revert can never
+    write again.
     """
     h = hashlib.sha256()
     for part in parts:
@@ -183,7 +214,7 @@ def pointer(
     content = f"[{tag}] {anchor}."
     if summary:
         content += f" {summary}" if summary.endswith((".", "!", "?")) else f" {summary}."
-    content += f' Canonical: firstmate {canonical_file} § "{anchor}" (line {line}).'
+    content += f' Canonical: firstmate {canonical_file} § "{anchor}".'
     canonical_sha = digest(canonical_file, anchor, content)
     return {
         "key": f"{canonical_file}#{anchor}",
@@ -452,16 +483,71 @@ def write_arguments(entry: Dict[str, Any]) -> Dict[str, Any]:
     return args
 
 
+def ledger_record(entry: Dict[str, Any], memory_id: str) -> Dict[str, Any]:
+    """What the ledger remembers about one pointer that landed."""
+    return {
+        "memory_id": memory_id,
+        "canonical_sha": entry["canonical_sha"],
+        "canonical_line": entry["metadata"]["canonical_line"],
+    }
+
+
+def reconcile_lane(
+    session: BridgeSession,
+    lane: str,
+    ledger: Dict[str, Any],
+    current_keys: Iterable[str],
+    counts: Dict[str, int],
+    refusals: List[Dict[str, Any]],
+) -> None:
+    """Retire the pointers this derivation no longer produces.
+
+    A renamed heading, a deleted section, and a renumbered repeat all read the
+    same way from here: a ledger key the run did not derive. Its row is still
+    live and still claims a canonical section that is gone, which is the stale
+    knowledge the whole index exists to prevent, so it is expired through the
+    bridge. A key whose row this run rebound to a surviving pointer is dropped
+    rather than expired, because that row is the survivor.
+    """
+    current = set(current_keys)
+    live_ids = {
+        (record or {}).get("memory_id")
+        for key, record in ledger.items()
+        if key in current
+    }
+    for key in [key for key in sorted(ledger) if key not in current]:
+        memory_id = (ledger.get(key) or {}).get("memory_id")
+        if not memory_id or memory_id in live_ids:
+            del ledger[key]
+            continue
+        ok, payload = session.call_tool("memory_expire", {"memory_id": memory_id})
+        error = payload.get("error") or {}
+        if ok or error.get("code") == "not_found":
+            counts["expired"] += 1
+            del ledger[key]
+            continue
+        counts["expiry_refused"] += 1
+        refusals.append({"key": key, "lane": lane, "error": error})
+
+
+def lane_failure(exc: BaseException) -> Dict[str, str]:
+    code = "lane_unavailable" if isinstance(exc, PointerError) else "lane_failed"
+    return {"code": code, "message": str(exc) or exc.__class__.__name__}
+
+
 def write_pointers(home: Path, data_dir: Path, pointers: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Write every pointer through the bridge, one serve process per lane."""
     by_lane: Dict[str, List[Dict[str, Any]]] = {}
     for entry in pointers:
         by_lane.setdefault(entry["lane"], []).append(entry)
 
-    counts = {"written": 0, "skipped_duplicate": 0, "updated": 0, "refused": 0}
+    counts = {"written": 0, "skipped_duplicate": 0, "updated": 0,
+              "expired": 0, "refused": 0, "expiry_refused": 0}
     refusals: List[Dict[str, Any]] = []
     for lane in sorted(by_lane):
         ledger = read_ledger(data_dir, lane)
+        entries = by_lane[lane]
+        current_keys = [entry["key"] for entry in entries]
         # A lane whose bridge will not start - an unprovisioned or wiped bank -
         # costs that lane's pointers and nothing else. Stopping the whole index
         # would make one missing bank hide how much of the fleet is indexed,
@@ -469,15 +555,15 @@ def write_pointers(home: Path, data_dir: Path, pointers: List[Dict[str, Any]]) -
         try:
             session = BridgeSession(lane, data_dir, home)
         except PointerError as exc:
-            counts["refused"] += len(by_lane[lane])
+            counts["refused"] += len(entries)
             refusals.append({
                 "lane": lane,
-                "keys": [entry["key"] for entry in by_lane[lane]],
-                "error": {"code": "lane_unavailable", "message": str(exc)},
+                "keys": current_keys,
+                "error": lane_failure(exc),
             })
             continue
         try:
-            entries = by_lane[lane]
+            walked = True
             for index, entry in enumerate(entries):
                 recorded = ledger.get(entry["key"]) or {}
                 args = write_arguments(entry)
@@ -489,35 +575,62 @@ def write_pointers(home: Path, data_dir: Path, pointers: List[Dict[str, Any]]) -
                 # A bridge that dies mid-lane costs the rest of THIS lane and no
                 # other: the remaining keys are reported as refused and the walk
                 # moves on, because a run that aborts here loses the counts for
-                # every pointer that already landed.
+                # every pointer that already landed. Anything unexpected is
+                # treated the same way, for the same reason.
                 try:
+                    payload = {}
+                    superseded = False
                     if superseding:
                         ok, payload = session.call_tool(
                             "memory_supersede", dict(args, memory_id=recorded["memory_id"]))
-                        if ok:
-                            counts["updated"] += 1
-                            ledger[entry["key"]] = {
-                                "memory_id": payload["id"], "canonical_sha": entry["canonical_sha"]}
-                            continue
-                        # The recorded row is gone or already retired, so there
-                        # is nothing to chain onto. Write the pointer on its own.
-                    ok, payload = session.call_tool("memory_remember", args)
-                except PointerError as exc:
+                        superseded = ok
+                        # A refusal means the recorded row is gone or already
+                        # retired, so there is nothing to chain onto and the
+                        # pointer is written on its own.
+                    if not superseded:
+                        ok, payload = session.call_tool("memory_remember", args)
+                except Exception as exc:  # noqa: BLE001
                     stranded = entries[index:]
                     counts["refused"] += len(stranded)
                     refusals.append({
                         "lane": lane,
                         "keys": [item["key"] for item in stranded],
-                        "error": {"code": "lane_unavailable", "message": str(exc)},
+                        "error": lane_failure(exc),
                     })
+                    walked = False
                     break
-                if not ok:
+                # A result the bridge called successful still has to name the
+                # row it landed on: without an id there is nothing to record,
+                # and guessing one would point the ledger at nothing.
+                memory_id = payload.get("id") if ok else None
+                if ok and memory_id and superseded:
+                    counts["updated"] += 1
+                    ledger[entry["key"]] = ledger_record(entry, memory_id)
+                    continue
+                if not ok or not memory_id:
                     counts["refused"] += 1
-                    refusals.append({"key": entry["key"], "lane": lane, "error": payload.get("error")})
+                    refusals.append({
+                        "key": entry["key"],
+                        "lane": lane,
+                        "error": payload.get("error") or {
+                            "code": "malformed_result",
+                            "message": f"lane {lane}: the bridge reported success with no memory id",
+                        },
+                    })
                     continue
                 counts["written" if payload.get("created") else "skipped_duplicate"] += 1
-                ledger[entry["key"]] = {
-                    "memory_id": payload["id"], "canonical_sha": entry["canonical_sha"]}
+                ledger[entry["key"]] = ledger_record(entry, memory_id)
+            if walked:
+                # Only once the walk finished: a lane that lost its bridge has
+                # nothing to expire through, and its unreconciled keys have to
+                # stay in the ledger or the ids needed to retire them later are
+                # stranded with no way back.
+                try:
+                    reconcile_lane(session, lane, ledger, current_keys, counts, refusals)
+                except Exception as exc:  # noqa: BLE001
+                    stale = [key for key in sorted(ledger) if key not in set(current_keys)]
+                    counts["expiry_refused"] += len(stale)
+                    refusals.append({"lane": lane, "keys": stale, "error": lane_failure(exc)})
         finally:
             session.close()
             write_ledger(data_dir, lane, ledger)
@@ -570,10 +683,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         data_dir = Path(raw).expanduser() if raw else Path.home() / ".hermes" / "mnemosyne" / "data"
     try:
         result = write_pointers(home, data_dir, pointers)
-    except PointerError as exc:
-        print(json.dumps({"status": "error", "error": str(exc)}, indent=2))
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"status": "error", "error": str(exc) or exc.__class__.__name__}, indent=2))
         return 1
-    failed = bool(problems) or result["counts"]["refused"]
+    failed = (
+        bool(problems)
+        or result["counts"]["refused"]
+        or result["counts"]["expiry_refused"]
+    )
     print(json.dumps({
         "status": "error" if failed else "ok",
         "home": str(home),

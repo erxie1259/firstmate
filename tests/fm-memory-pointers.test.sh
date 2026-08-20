@@ -107,8 +107,20 @@ import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
 rows = conn.execute(
     "SELECT count(*) FROM working_memory WHERE superseded_by IS NULL"
-    " AND source = 'firstmate-pointers'").fetchone()[0]
+    " AND valid_until IS NULL AND source = 'firstmate-pointers'").fetchone()[0]
 print(rows)
+PY
+}
+
+live_rows_claiming() {  # <data-dir> <lane> <text>
+  fm_pointers_assert_scratch "$1"
+  python3 - "$1/banks/lane-$2/mnemosyne.db" "$3" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+print(conn.execute(
+    "SELECT count(*) FROM working_memory WHERE source='firstmate-pointers'"
+    " AND superseded_by IS NULL AND valid_until IS NULL AND content LIKE ?",
+    ("%" + sys.argv[2] + "%",)).fetchone()[0])
 PY
 }
 
@@ -316,17 +328,17 @@ PY
   pass "fm-memory-pointers: an edited canonical section supersedes its pointer rather than duplicating it"
 }
 
-test_a_shifted_section_supersedes_its_pointer_instead_of_adding_a_second() {
-  local home dir out live superseded
-  skip_without_library "the shifted-section drift test" && return
+test_a_moved_section_is_absorbed_and_reverting_the_move_round_trips() {
+  local home dir out live
+  skip_without_library "the moved-section round-trip test" && return
   home=$(make_home shift-home)
   dir=$(make_lanes shift-dir shared fleet-infra products)
   fm_pointers "$home" "$dir" write >/dev/null || fail "the first pointer run failed"
 
-  # A pointer names the line its fact lives on, so inserting a section above it
-  # changes what the pointer says even though the section itself is untouched.
-  # That has to supersede exactly as an edit does: otherwise every section below
-  # any insertion accumulates a second live pointer on every run.
+  # A section that only MOVED still says the same thing, so its pointer must be
+  # left exactly as it is. Rewriting it would retire the row, and the store
+  # refuses to write text a retired row already holds - so undoing the edit
+  # that moved it could never be indexed again.
   python3 - "$home/data/captain.md" <<'PY'
 import sys
 p = sys.argv[1]
@@ -340,20 +352,150 @@ PY
   out=$(fm_pointers "$home" "$dir" write) || fail "the run after the insertion failed: $out"
   [ "$(json_field "$out" "d['counts']['written']")" = "1" ] \
     || fail "the insertion wrote more than the one genuinely new pointer: $out"
-  [ "$(json_field "$out" "d['counts']['updated']")" = "2" ] \
-    || fail "the shifted sections were not written as supersessions: $out"
+  [ "$(json_field "$out" "d['counts']['updated']")" = "0" ] \
+    || fail "a section that merely moved was rewritten: $out"
+  [ "$(json_field "$out" "d['counts']['refused']")" = "0" ] || fail "the insertion was refused: $out"
   live=$(live_pointer_rows "$dir" shared)
   [ "$live" = "3" ] || fail "an insertion left $live live captain pointers, not three"
-  superseded=$(python3 - "$dir/banks/lane-shared/mnemosyne.db" <<'PY'
-import sqlite3, sys
-conn = sqlite3.connect(sys.argv[1])
-print(conn.execute(
-    "SELECT count(*) FROM working_memory WHERE source='firstmate-pointers'"
-    " AND superseded_by IS NOT NULL").fetchone()[0])
+
+  # Now undo it. The derived text returns to what run one stored, which is the
+  # case that used to be refused forever once the row had been retired.
+  python3 - "$home/data/captain.md" <<'PY'
+import sys
+p = sys.argv[1]
+text = open(p).read()
+open(p, "w").write(text.replace(
+    "## Ship on green only (2026-08-19, captain-decided)\n\n"
+    "Never merge on a red pipeline.\n\n", ""))
 PY
-)
-  [ "$superseded" = "2" ] || fail "the shifted pointers were not retired as history: $superseded"
-  pass "fm-memory-pointers: a section moved by an insertion supersedes its pointer, never duplicates it"
+
+  out=$(fm_pointers "$home" "$dir" write) || fail "the run after reverting the insertion failed: $out"
+  [ "$(json_field "$out" "d['counts']['refused']")" = "0" ] \
+    || fail "reverting the insertion was refused: $out"
+  [ "$(json_field "$out" "d['counts']['written']")" = "0" ] \
+    || fail "reverting the insertion wrote a duplicate pointer: $out"
+  [ "$(json_field "$out" "d['counts']['expired']")" = "1" ] \
+    || fail "the pointer to the section that went away was not retired: $out"
+  [ "$(live_pointer_rows "$dir" shared)" = "2" ] \
+    || fail "reverting left $(live_pointer_rows "$dir" shared) live captain pointers, not two"
+  [ "$(live_rows_claiming "$dir" shared "Ship on green only")" = "0" ] \
+    || fail "a pointer still claims a section that was removed"
+  pass "fm-memory-pointers: a moved section is left alone, and undoing the move round-trips"
+}
+
+test_a_renamed_section_retires_the_pointer_that_named_the_old_heading() {
+  local home dir out
+  skip_without_library "the renamed-section test" && return
+  home=$(make_home rename-home)
+  dir=$(make_lanes rename-dir shared fleet-infra products)
+  fm_pointers "$home" "$dir" write >/dev/null || fail "the first pointer run failed"
+
+  # The heading is what a pointer tells the reader to look for, so a renamed
+  # section must not leave a live pointer sending them to a heading the file no
+  # longer has.
+  python3 - "$home/data/captain.md" <<'PY'
+import sys
+p = sys.argv[1]
+text = open(p).read()
+open(p, "w").write(text.replace(
+    "## Chat is for outcomes only (2026-08-13, captain-decided)",
+    "## Chat carries outcomes only (2026-08-13, captain-decided)"))
+PY
+
+  out=$(fm_pointers "$home" "$dir" write) || fail "the run after the rename failed: $out"
+  [ "$(json_field "$out" "d['counts']['written']")" = "1" ] \
+    || fail "the renamed section did not get its own pointer: $out"
+  [ "$(json_field "$out" "d['counts']['expired']")" = "1" ] \
+    || fail "the pointer naming the old heading was not retired: $out"
+  [ "$(json_field "$out" "d['counts']['refused'] + d['counts']['expiry_refused']")" = "0" ] \
+    || fail "the rename was refused: $out"
+  [ "$(live_rows_claiming "$dir" shared "Chat is for outcomes only")" = "0" ] \
+    || fail "a live pointer still names the heading the rename removed"
+  [ "$(live_rows_claiming "$dir" shared "Chat carries outcomes only")" = "1" ] \
+    || fail "the renamed section does not have exactly one live pointer"
+  [ "$(live_pointer_rows "$dir" shared)" = "2" ] \
+    || fail "the rename changed how many captain pointers are live"
+  pass "fm-memory-pointers: a renamed section retires the pointer that named the old heading"
+}
+
+test_a_deleted_section_leaves_no_live_pointer_claiming_it() {
+  local home dir out
+  skip_without_library "the deleted-section test" && return
+  home=$(make_home delete-home)
+  dir=$(make_lanes delete-dir shared fleet-infra products)
+  fm_pointers "$home" "$dir" write >/dev/null || fail "the first pointer run failed"
+
+  # A withdrawn captain decision that recall still returns is the exact failure
+  # this index exists to prevent, so a deleted section has to take its pointer
+  # with it.
+  python3 - "$home/data/captain.md" <<'PY'
+import sys
+p = sys.argv[1]
+text = open(p).read()
+head, _ = text.split("## Chat is for outcomes only", 1)
+open(p, "w").write(head)
+PY
+
+  out=$(fm_pointers "$home" "$dir" write) || fail "the run after the deletion failed: $out"
+  [ "$(json_field "$out" "d['counts']['expired']")" = "1" ] \
+    || fail "the deleted section's pointer was not retired: $out"
+  [ "$(json_field "$out" "d['counts']['written']")" = "0" ] \
+    || fail "the deletion wrote a new pointer: $out"
+  [ "$(json_field "$out" "d['counts']['refused'] + d['counts']['expiry_refused']")" = "0" ] \
+    || fail "the deletion was refused: $out"
+  [ "$(live_rows_claiming "$dir" shared "Chat is for outcomes only")" = "0" ] \
+    || fail "a live pointer still claims a captain section that was deleted"
+  [ "$(live_pointer_rows "$dir" shared)" = "1" ] \
+    || fail "the surviving captain section lost its pointer too"
+  pass "fm-memory-pointers: a deleted section leaves nothing live still claiming it"
+}
+
+test_deleting_the_first_of_two_same_heading_sections_keeps_the_survivor() {
+  local home dir out rows
+  skip_without_library "the renumbered-repeat test" && return
+  home=$(make_home renumber-home)
+  dir=$(make_lanes renumber-dir shared fleet-infra products)
+  cat >> "$home/data/captain.md" <<'MD'
+
+## Standing decisions
+
+- **Reviews**: never merge on a red pipeline. Set 2026-08-19.
+MD
+  fm_pointers "$home" "$dir" write >/dev/null || fail "the first pointer run failed"
+
+  # Removing the first of two same-heading sections renumbers the survivor onto
+  # the key the deleted one held. The survivor must keep a live pointer: the
+  # ledger key moving is bookkeeping, not a withdrawal.
+  python3 - "$home/data/captain.md" <<'PY'
+import sys
+p = sys.argv[1]
+kept, dropping, dropped = [], False, False
+for line in open(p).read().splitlines(keepends=True):
+    if line.startswith("## "):
+        dropping = not dropped and line.strip() == "## Standing decisions"
+        dropped = dropped or dropping
+    if not dropping:
+        kept.append(line)
+open(p, "w").write("".join(kept))
+PY
+
+  out=$(fm_pointers "$home" "$dir" write) || fail "the run after the deletion failed: $out"
+  [ "$(json_field "$out" "d['counts']['refused'] + d['counts']['expiry_refused']")" = "0" ] \
+    || fail "the renumbered repeat was refused: $out"
+  [ "$(live_rows_claiming "$dir" shared "never merge on a red pipeline")" = "1" ] \
+    || fail "the surviving same-heading section lost its live pointer"
+  [ "$(live_rows_claiming "$dir" shared "every registered project is +yolo")" = "0" ] \
+    || fail "a live pointer still claims the same-heading section that was deleted"
+  [ "$(live_pointer_rows "$dir" shared)" = "2" ] \
+    || fail "the shared lane holds $(live_pointer_rows "$dir" shared) live pointers, not two"
+
+  # And it settles: a further run neither writes, retires, nor refuses anything.
+  rows=$(lane_rows "$dir" shared)
+  out=$(fm_pointers "$home" "$dir" write) || fail "the settling run failed: $out"
+  [ "$(json_field "$out" "d['counts']['written'] + d['counts']['updated'] + d['counts']['expired'] + d['counts']['refused']")" = "0" ] \
+    || fail "the renumbered repeat never settles: $out"
+  [ "$(lane_rows "$dir" shared)" = "$rows" ] || fail "a settled run still grew the store"
+  pass "fm-memory-pointers: deleting the first of two same-heading sections keeps the survivor live"
 }
 
 test_two_sections_sharing_a_heading_keep_one_live_pointer_each() {
@@ -491,6 +633,61 @@ PY
   pass "fm-memory-pointers: a bridge dying mid-lane costs its lane, never the run's counts"
 }
 
+test_a_success_with_no_memory_id_is_refused_not_recorded() {
+  local home dir stub out
+  home=$(make_home payload-home)
+  dir="$TMP_ROOT/payload-dir"
+  fm_pointers_assert_scratch "$dir"
+  mkdir -p "$dir"
+
+  # A bridge that calls a write successful but names no row leaves nothing to
+  # record: a ledger entry pointing at no memory would send the next run's
+  # supersession at a row that does not exist. It has to be a refusal, and it
+  # must not cost the run its counts.
+  stub="$TMP_ROOT/payload-bridge.py"
+  cat > "$stub" <<'PY'
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["method"] == "initialize":
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {}}) + "\n")
+    else:
+        payload = json.dumps({"status": "ok", "store_verified": True, "created": True})
+        sys.stdout.write(json.dumps({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"content": [{"type": "text", "text": payload}]}}) + "\n")
+    sys.stdout.flush()
+PY
+
+  out=$(python3 - "$ROOT/bin/fm-memory-pointers" "$stub" "$home" "$dir" <<'PY'
+import importlib.machinery, importlib.util, json, sys
+from pathlib import Path
+
+module_path, stub, home, data_dir = sys.argv[1:5]
+loader = importlib.machinery.SourceFileLoader("fm_memory_pointers", module_path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+mod.BRIDGE = Path(stub)
+
+pointers, _ = mod.derive(Path(home))
+result = mod.write_pointers(Path(home), Path(data_dir), pointers)
+ledger = mod.read_ledger(Path(data_dir), "shared")
+print(json.dumps({"total": len(pointers), "ledger": ledger, **result}))
+PY
+) || fail "a success carrying no memory id crashed the run: $out"
+
+  [ "$(json_field "$out" "d['counts']['refused'] == d['total']")" = "True" ] \
+    || fail "a success with no memory id was counted as a write: $out"
+  [ "$(json_field "$out" "d['counts']['written'] + d['counts']['skipped_duplicate']")" = "0" ] \
+    || fail "a row that was never named was recorded as stored: $out"
+  [ "$(json_field "$out" "d['ledger']")" = "{}" ] \
+    || fail "the ledger recorded a pointer the bridge never named: $out"
+  [ "$(json_field "$out" "sorted({(r.get('error') or {}).get('code') for r in d['refusals']})")" \
+    = "['malformed_result']" ] || fail "the refusal did not name the malformed result: $out"
+  pass "fm-memory-pointers: a write reported successful with no memory id is refused, not recorded"
+}
+
 test_write_refuses_an_unprovisioned_lane_rather_than_creating_one() {
   local home dir out status
   skip_without_library "the unprovisioned-lane test" && return
@@ -517,9 +714,13 @@ test_plan_reports_an_absent_canonical_file_rather_than_inventing_one
 test_write_is_idempotent_across_runs
 test_write_lands_pointers_in_their_own_lane_and_project
 test_an_edited_section_supersedes_its_pointer_instead_of_adding_a_second
-test_a_shifted_section_supersedes_its_pointer_instead_of_adding_a_second
+test_a_moved_section_is_absorbed_and_reverting_the_move_round_trips
+test_a_renamed_section_retires_the_pointer_that_named_the_old_heading
+test_a_deleted_section_leaves_no_live_pointer_claiming_it
+test_deleting_the_first_of_two_same_heading_sections_keeps_the_survivor
 test_two_sections_sharing_a_heading_keep_one_live_pointer_each
 test_a_lost_ledger_costs_a_duplicate_pointer_not_a_wrong_answer
 test_a_bridge_that_dies_midlane_still_reports_every_lane
+test_a_success_with_no_memory_id_is_refused_not_recorded
 test_write_refuses_an_unprovisioned_lane_rather_than_creating_one
 echo "# all fm-memory-pointers tests passed"

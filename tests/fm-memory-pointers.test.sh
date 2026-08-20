@@ -859,6 +859,75 @@ PY
   pass "fm-memory-pointers: a tool result that is not an object is refused at the bridge boundary"
 }
 
+test_a_ledger_record_that_is_not_an_object_degrades_to_plain_dedupe() {
+  local home dir stub out
+  home=$(make_home corrupt-record-home)
+  dir="$TMP_ROOT/corrupt-record-dir"
+  fm_pointers_assert_scratch "$dir"
+  mkdir -p "$dir/banks/lane-shared"
+
+  # The ledger beside a bank is this tool's own persisted state, so a test may
+  # write one. A record that is not an object remembers nothing readable about
+  # the row it claims - neither a memory id to supersede nor one to retire - so
+  # it must cost a duplicate pointer at worst. Reading it as a record instead
+  # loses every lane's counts, and every rerun fails the same way until the
+  # file is repaired by hand.
+  cat > "$dir/banks/lane-shared/fm-memory-pointers.json" <<JSON
+{
+  "home": "$(cd "$home" && pwd -P)",
+  "pointers": {
+    "data/captain.md#Standing decisions": "not-an-object",
+    "data/captain.md#Long gone": ["also", "not", "an", "object"]
+  }
+}
+JSON
+
+  stub="$TMP_ROOT/corrupt-record-bridge.py"
+  cat > "$stub" <<'PY'
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["method"] == "initialize":
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {}}) + "\n")
+    else:
+        payload = json.dumps({"id": "row-%s" % request["id"], "created": True})
+        sys.stdout.write(json.dumps({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"content": [{"type": "text", "text": payload}]}}) + "\n")
+    sys.stdout.flush()
+PY
+
+  out=$(python3 - "$ROOT/bin/fm-memory-pointers" "$stub" "$home" "$dir" <<'PY'
+import importlib.machinery, importlib.util, json, sys
+from pathlib import Path
+
+module_path, stub, home, data_dir = sys.argv[1:5]
+loader = importlib.machinery.SourceFileLoader("fm_memory_pointers", module_path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+mod.BRIDGE = Path(stub)
+
+pointers = mod.derive(Path(home)).pointers
+result = mod.write_pointers(Path(home), Path(data_dir), pointers)
+ledger, recorded = mod.read_ledger(Path(data_dir), "shared")
+print(json.dumps({"total": len(pointers), "ledger": ledger, "home": recorded, **result}))
+PY
+) || fail "a malformed ledger record crashed the whole run: $out"
+
+  [ "$(json_field "$out" "d['counts']['written'] == d['total']")" = "True" ] \
+    || fail "a malformed ledger record cost the run its pointers: $out"
+  [ "$(json_field "$out" "d['counts']['expired'] + d['counts']['expiry_refused']")" = "0" ] \
+    || fail "a record naming no readable row was treated as retirable: $out"
+  [ "$(json_field "$out" "all(isinstance(r, dict) for r in d['ledger'].values())")" = "True" ] \
+    || fail "the rewritten ledger still carries a record that is not an object: $out"
+  [ "$(json_field "$out" "'data/captain.md#Long gone' in d['ledger']")" = "False" ] \
+    || fail "an unreadable record for a section that is gone was kept: $out"
+  [ "$(json_field "$out" "'data/captain.md#Standing decisions' in d['ledger']")" = "True" ] \
+    || fail "the run did not re-record the section it just wrote: $out"
+  pass "fm-memory-pointers: a ledger record that is not an object degrades to plain dedupe"
+}
+
 test_two_sections_sharing_a_heading_keep_one_live_pointer_each() {
   local home dir first second rows_first rows_second live superseded
   skip_without_library "the repeated-heading test" && return
@@ -1187,6 +1256,7 @@ test_a_ledger_from_another_home_neither_retires_nor_supersedes
 test_a_run_from_another_home_records_nothing_in_the_ledger_it_does_not_own
 test_a_bridge_that_will_not_start_at_all_costs_its_lanes_not_the_run
 test_a_tool_result_that_is_not_an_object_is_refused_not_crashed
+test_a_ledger_record_that_is_not_an_object_degrades_to_plain_dedupe
 test_two_sections_sharing_a_heading_keep_one_live_pointer_each
 test_a_lost_ledger_costs_a_duplicate_pointer_not_a_wrong_answer
 test_a_bridge_that_dies_midlane_still_reports_every_lane

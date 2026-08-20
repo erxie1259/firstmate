@@ -463,6 +463,11 @@ def read_ledger(data_dir: Path, lane: str) -> Tuple[Dict[str, Any], Optional[str
     longer produces, and a derivation from ANOTHER tree does not produce this
     one's pointers either. A ledger written before the home was recorded reads
     as unbound, which is adopted rather than acted on.
+
+    A record that is not an object remembers nothing readable about the row it
+    claims, so it is dropped exactly as an unparseable file is. The ledger is
+    derived state: every corruption of it has to cost a duplicate pointer at
+    worst, never the whole run.
     """
     try:
         loaded = json.loads(ledger_path(data_dir, lane).read_text(encoding="utf-8"))
@@ -473,8 +478,12 @@ def read_ledger(data_dir: Path, lane: str) -> Tuple[Dict[str, Any], Optional[str
     records = loaded.get("pointers")
     if isinstance(records, dict):
         recorded = loaded.get("home")
-        return (records, recorded if isinstance(recorded, str) else None)
-    return (loaded, None)
+        return (readable_records(records), recorded if isinstance(recorded, str) else None)
+    return (readable_records(loaded), None)
+
+
+def readable_records(records: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: record for key, record in records.items() if isinstance(record, dict)}
 
 
 def write_ledger(data_dir: Path, lane: str, ledger: Dict[str, Any], home: Optional[str]) -> None:
@@ -628,13 +637,15 @@ def ledger_record(entry: Dict[str, Any], memory_id: str) -> Dict[str, Any]:
 
 
 def reconciliation_state(recorded_home: Optional[str], home_key: str) -> Tuple[bool, bool, str]:
-    """(may retire, may chain onto recorded ids, why not).
+    """(may retire, owns this ledger, why not).
 
     A ledger naming another tree records rows this run did not create, and a
     derivation from another tree does not produce them either. Chaining onto
     them would retire them exactly as irreversibly as expiring them, so a
-    foreign ledger is neither retired from nor superseded through: this run
-    writes plainly and leaves those rows alone.
+    foreign ledger is neither retired from nor superseded through, and nothing
+    is recorded in it either: this run writes plainly and leaves it alone.
+    Ownership is decided here and nowhere else, because a second copy of the
+    rule could drift out of step with this one and re-open exactly that.
     """
     if recorded_home is None:
         return (False, True, "the ledger recorded no home, so it was adopted and nothing was retired")
@@ -737,13 +748,12 @@ def write_pointers(
     home_key = str(home.resolve())
     for lane in sorted(by_lane):
         ledger, recorded_home = ledgers[lane]
-        reconciling, chaining, reason = reconciliation_state(recorded_home, home_key)
         # A ledger bound to another tree is left exactly as its owner wrote it.
         # Rebinding it would retire this home's absent keys on the very next
         # run, and rewriting its records would point the owner's reconciliation
         # at rows this run created, so its next stale key would retire a
         # pointer it never wrote. This run writes plainly and records nothing.
-        owns_ledger = recorded_home in (None, home_key)
+        reconciling, owns_ledger, reason = reconciliation_state(recorded_home, home_key)
         entries = by_lane[lane]
         current_keys = [entry["key"] for entry in entries]
         stale = stale_keys(ledger, current_keys)
@@ -764,7 +774,7 @@ def write_pointers(
             # A foreign ledger is reported even with nothing stale in it: this
             # run wrote past rows it does not own and reconciled none of them,
             # which is not the same outcome as a run that reconciled the lane.
-            if reconcilable or (ledger and not chaining):
+            if reconcilable or (ledger and not owns_ledger):
                 skipped.append({"lane": lane, "keys": reconcilable, "reason": reason})
             reconcilable = []
         retirable_now = set(retirable_keys(ledger, current_keys))
@@ -800,7 +810,7 @@ def write_pointers(
                 recorded = ledger.get(entry["key"]) or {}
                 args = write_arguments(entry)
                 superseding = bool(
-                    chaining
+                    owns_ledger
                     and recorded.get("memory_id")
                     and recorded.get("canonical_sha")
                     and recorded["canonical_sha"] != entry["canonical_sha"]

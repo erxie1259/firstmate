@@ -67,6 +67,23 @@ conn.close()
 PY
 }
 
+# Add one working memory with exact content, so a test can assert on what the
+# awareness index does and does not carry.
+add_memory() {  # <data-dir> <lane> <id> <content> <importance> <channel>
+  local data_dir=$1
+  fm_memory_assert_scratch "$data_dir"
+  python3 - "$data_dir/banks/lane-$2/mnemosyne.db" "$3" "$4" "$5" "$6" <<'ADDPY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute(
+    "INSERT INTO working_memory (id, content, importance, scope, channel_id, consolidated_at)"
+    " VALUES (?, ?, ?, 'global', ?, '2026-08-20T00:00:00')",
+    (sys.argv[2], sys.argv[3], float(sys.argv[4]), sys.argv[5]))
+conn.commit()
+conn.close()
+ADDPY
+}
+
 write_record() {
   local data_dir=$1 lane=$2 floor=$3
   fm_memory_assert_scratch "$data_dir"
@@ -87,6 +104,16 @@ make_ready_lane() {
   local data_dir=$1 lane=$2 rows=${3:-2}
   make_store "$data_dir" "$lane" "$rows"
   write_record "$data_dir" "$lane" 1
+}
+
+# Rows in a scratch bank, read directly, so a test can prove the bridge left the
+# store exactly as it claims.
+count_rows() {  # <data-dir> <lane>
+  fm_memory_assert_scratch "$1"
+  python3 - "$1/banks/lane-$2/mnemosyne.db" <<'CNTPY'
+import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute("SELECT count(*) FROM working_memory").fetchone()[0])
+CNTPY
 }
 
 json_field() {  # <json> <python-expression over `d`>
@@ -271,7 +298,7 @@ test_refuses_unresolved_lane() {
 }
 
 test_resolves_lane_from_the_project_registry() {
-  local dir home out
+  local dir home out status
   dir="$TMP_ROOT/registry"
   home="$TMP_ROOT/registry-home"
   make_ready_lane "$dir" products
@@ -285,6 +312,7 @@ test_resolves_lane_from_the_project_registry() {
 - decoy [no-mistakes] - description mentioning lane:products, which is not an annotation (added 2026-08-02)
 - prose-bracket - migrating the [lane:personal] tooling (added 2026-08-02)
 - trailing-bracket [no-mistakes] - later note [lane:personal] about it (added 2026-08-02)
+- empty-lane [no-mistakes lane:] - the token is there but names nothing (added 2026-08-02)
 MD
   out=$(FM_HOME="$home" "$MCP" preflight --project flags --data-dir "$dir" 2>&1) \
     || fail "registry lane resolution failed: $out"
@@ -320,6 +348,17 @@ MD
   out=$(FM_HOME="$home" "$MCP" preflight --project trailing-bracket --data-dir "$dir" 2>&1) \
     && fail "a bracket after the annotation was accepted as a lane token"
   assert_contains "$out" "carries no lane:<name> token" "a bracket after the annotation was read as a lane token"
+
+  # A token that names no lane is not a lane. --lane must refuse rather than
+  # answer with a blank one, because a mechanical caller taking its exit code
+  # at its word would route a write nowhere at all.
+  status=0
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-project-mode.sh" --lane empty-lane 2>/dev/null) || status=$?
+  [ "$status" -ne 0 ] || fail "an empty lane: token was answered instead of refused"
+  [ -z "$out" ] || fail "a refused lane lookup still printed a lane: '$out'"
+  out=$(FM_HOME="$home" "$MCP" preflight --project empty-lane --data-dir "$dir" 2>&1) \
+    && fail "an empty lane: token was accepted as a mapping"
+  assert_contains "$out" '"code": "lane_unresolved"' "an empty lane: token did not report lane_unresolved"
   pass "fm-memory-mcp: maps a project to its lane, and refuses when the registry does not say"
 }
 
@@ -1492,6 +1531,221 @@ PY
   pass "fm-memory-mcp: the memory_type a caller writes is reported back and readable"
 }
 
+# --- provisioning ------------------------------------------------------------
+
+test_provisioning_refuses_a_populated_bank_it_did_not_provision() {
+  local dir out
+  # A bank file that is already there was put there by something. Seeding it
+  # would mix this lane into a store nobody here provisioned, and the memories
+  # already in it would start answering this lane's recalls.
+  dir="$TMP_ROOT/provision-populated"
+  make_store "$dir" products 3
+  out=$(fm_memory_mcp "$dir" provision --lane products) && fail "provisioning wrote into a populated bank"
+  assert_contains "$out" '"code": "bank_populated"' "a populated bank was not refused as such: $out"
+  assert_contains "$out" "--adopt" "the refusal did not name the deliberate override"
+  [ ! -f "$dir/banks/lane-products/fm-memory-provision.json" ] \
+    || fail "a refused provisioning still claimed the bank with a record"
+  [ "$(count_rows "$dir" products)" = "3" ] || fail "a refused provisioning changed the bank's contents"
+
+  # --adopt is the deliberate act: it records the bank as it stands, and seeds nothing.
+  out=$(fm_memory_mcp "$dir" provision --lane products --adopt) || fail "--adopt was refused: $out"
+  [ "$(json_field "$out" "d['action']")" = "adopted" ] || fail "--adopt did not report an adoption: $out"
+  [ "$(json_field "$out" "d['provisioned']['row_floor']")" = "3" ] \
+    || fail "adoption did not record the bank's true size: $out"
+  [ "$(count_rows "$dir" products)" = "3" ] || fail "adoption seeded a bank it was told to take as-is"
+  fm_memory_mcp "$dir" preflight --lane products >/dev/null || fail "an adopted bank does not pass preflight"
+  pass "fm-memory-mcp: provisioning refuses a populated bank it did not provision, and adoption is explicit"
+}
+
+test_provisioning_refuses_a_database_it_cannot_read_as_a_store() {
+  local dir out
+  dir="$TMP_ROOT/provision-foreign"
+  mkdir -p "$dir/banks/lane-personal"
+  printf 'not a database at all' > "$dir/banks/lane-personal/mnemosyne.db"
+  out=$(fm_memory_mcp "$dir" provision --lane personal) && fail "provisioning wrote over an unreadable file"
+  assert_contains "$out" '"code": "bank_unrecognized"' "an unreadable bank file was not refused as such: $out"
+  [ "$(cat "$dir/banks/lane-personal/mnemosyne.db")" = "not a database at all" ] \
+    || fail "a refused provisioning still altered the file"
+  pass "fm-memory-mcp: provisioning refuses a bank file it cannot read as a store"
+}
+
+test_provisioning_is_idempotent() {
+  local dir first second record_before record_after
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the provisioning idempotence test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the provisioning idempotence test"
+    return
+  fi
+  dir="$TMP_ROOT/provision-idempotent"
+  mkdir -p "$dir"
+  first=$(fm_memory_mcp "$dir" provision --lane brand-business) || fail "provisioning failed: $first"
+  [ "$(json_field "$first" "d['action']")" = "provisioned" ] \
+    || fail "a first provisioning did not report a create: $first"
+  [ "$(count_rows "$dir" brand-business)" = "1" ] || fail "provisioning did not leave exactly its seed"
+  record_before=$(cat "$dir/banks/lane-brand-business/fm-memory-provision.json")
+
+  second=$(fm_memory_mcp "$dir" provision --lane brand-business) || fail "re-provisioning failed: $second"
+  [ "$(json_field "$second" "d['action']")" = "already_provisioned" ] \
+    || fail "re-provisioning did not report the bank already there: $second"
+  [ "$(json_field "$second" "d['checks']['working_memory_rows']")" = "1" ] \
+    || fail "re-provisioning reported a size it did not measure: $second"
+  [ "$(count_rows "$dir" brand-business)" = "1" ] || fail "re-provisioning wrote a second seed"
+  record_after=$(cat "$dir/banks/lane-brand-business/fm-memory-provision.json")
+  # The floor is what a wipe is measured against, so a re-run must never move
+  # it - record-floor is the deliberate act for that.
+  [ "$record_before" = "$record_after" ] || fail "re-provisioning rewrote the provisioning record"
+  pass "fm-memory-mcp: provisioning a lane twice creates one bank, one seed, and one record"
+}
+
+test_provisioning_a_wiped_lane_reports_the_wipe_instead_of_reseeding() {
+  local dir out
+  # Re-seeding would put rows back into a wiped bank and make the wipe
+  # unrecoverable as a fact. The re-run has to say what it found.
+  dir="$TMP_ROOT/provision-wiped"
+  make_store "$dir" personal 0
+  write_record "$dir" personal 6
+  out=$(fm_memory_mcp "$dir" provision --lane personal) && fail "provisioning quietly reseeded a wiped bank"
+  assert_contains "$out" '"code": "store_empty"' "a wiped bank was not reported as such on re-provision: $out"
+  [ "$(count_rows "$dir" personal)" = "0" ] || fail "a refused re-provisioning still wrote into the wiped bank"
+  pass "fm-memory-mcp: re-provisioning a wiped lane reports the wipe rather than reseeding it"
+}
+
+test_provision_all_reports_every_lane_and_fails_on_any_refusal() {
+  local dir out status actions
+  dir="$TMP_ROOT/provision-all"
+  make_ready_lane "$dir" products 2
+  make_ready_lane "$dir" shared 2
+  make_ready_lane "$dir" personal 2
+  make_ready_lane "$dir" fleet-infra 2
+  make_ready_lane "$dir" client-services 2
+  # One lane holds memories nobody here provisioned; the walk must refuse that
+  # one and still account for the other five.
+  make_store "$dir" brand-business 3
+
+  status=0
+  out=$(fm_memory_mcp "$dir" provision --all) || status=$?
+  [ "$status" -eq 1 ] || fail "a walk containing a refusal exited $status, not 1"
+  [ "$(json_field "$out" "d['refused']")" = "1" ] || fail "the walk did not count the refusal: $out"
+  [ "$(json_field "$out" "len(d['lanes'])")" = "6" ] || fail "the walk did not account for all six lanes: $out"
+  actions=$(json_field "$out" "','.join(sorted(f\"{l['lane']}={l['action']}\" for l in d['lanes']))")
+  case "$actions" in
+    *"brand-business=refused"*) ;;
+    *) fail "the populated lane was not refused: $actions" ;;
+  esac
+  [ "$(json_field "$out" "sum(1 for l in d['lanes'] if l['action']=='already_provisioned')")" = "5" ] \
+    || fail "the five healthy lanes were not all reported already provisioned: $actions"
+  pass "fm-memory-mcp: provision --all accounts for every lane and exits nonzero on a refusal"
+}
+
+test_provision_all_makes_every_lane_pass_preflight() {
+  local dir out lane
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the provision --all create test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the provision --all create test"
+    return
+  fi
+  dir="$TMP_ROOT/provision-all-create"
+  mkdir -p "$dir"
+  out=$(fm_memory_mcp "$dir" provision --all) || fail "provisioning every lane failed: $out"
+  [ "$(json_field "$out" "d['refused']")" = "0" ] || fail "a fresh walk refused a lane: $out"
+  for lane in products client-services brand-business fleet-infra personal shared; do
+    fm_memory_mcp "$dir" preflight --lane "$lane" >/dev/null \
+      || fail "lane $lane does not pass preflight after provisioning"
+  done
+  # And the second walk is a no-op that still proves every bank.
+  out=$(fm_memory_mcp "$dir" provision --all) || fail "a second walk failed: $out"
+  [ "$(json_field "$out" "sum(1 for l in d['lanes'] if l['action']=='already_provisioned')")" = "6" ] \
+    || fail "a second walk did not treat all six lanes as already provisioned: $out"
+  pass "fm-memory-mcp: provision --all creates all six lanes and each one passes preflight"
+}
+
+# --- the cross-lane awareness index ------------------------------------------
+
+test_awareness_index_carries_titles_and_never_bodies() {
+  local dir out title
+  dir="$TMP_ROOT/awareness-index"
+  make_store "$dir" products 0
+  write_record "$dir" products 1
+  add_memory "$dir" products long1 \
+    "IMPORTANT HEAD: this lane memory is deliberately far longer than the awareness title budget, and everything past it is body text no other lane may read. SECRET TAIL." \
+    0.9 flags
+  # Below the awareness importance floor: an index of everything would drown
+  # the reader, so a quiet memory contributes nothing.
+  add_memory "$dir" products quiet1 "A minor note nobody needs across lanes." 0.2 flags
+  make_ready_lane "$dir" shared 1
+
+  out=$(fm_memory_mcp "$dir" awareness) || fail "the awareness index failed: $out"
+  title=$(json_field "$out" "next(t['title'] for t in d['titles'] if t['id']=='long1')")
+  [ "${#title}" -le 120 ] || fail "an awareness title exceeded the title budget: ${#title} chars"
+  assert_contains "$title" "IMPORTANT HEAD" "the title did not carry the head of the memory"
+  assert_not_contains "$out" "SECRET TAIL" "the awareness index leaked a memory body across lanes"
+  [ "$(json_field "$out" "sum(1 for t in d['titles'] if t['id']=='quiet1')")" = "0" ] \
+    || fail "a memory below the awareness floor was indexed: $out"
+  [ "$(json_field "$out" "next(t['channel_id'] for t in d['titles'] if t['id']=='long1')")" = "flags" ] \
+    || fail "the index did not carry the project a title belongs to: $out"
+
+  # --exclude gives the view an agent serving that lane gets: its own lane is
+  # its recall, not its awareness.
+  out=$(fm_memory_mcp "$dir" awareness --exclude products) || fail "an excluded awareness index failed: $out"
+  [ "$(json_field "$out" "sum(1 for t in d['titles'] if t['lane']=='products')")" = "0" ] \
+    || fail "--exclude still indexed the excluded lane: $out"
+  [ "$(json_field "$out" "sum(1 for l in d['lanes'] if l['lane']=='products')")" = "0" ] \
+    || fail "--exclude still reported the excluded lane's state: $out"
+  pass "fm-memory-mcp: the awareness index carries bounded titles, never bodies, and honors --exclude"
+}
+
+test_awareness_index_tells_a_wiped_lane_apart_from_an_empty_one() {
+  local dir out states quiet_state wiped_state
+  # Same requirement the memory_lanes tool answers, on the standing index: an
+  # empty title list must never mean both "quiet" and "that bank is gone".
+  dir="$TMP_ROOT/awareness-states"
+  make_ready_lane "$dir" products 2
+  # Provisioned, healthy, and genuinely quiet: every memory is below the floor.
+  make_store "$dir" shared 0
+  write_record "$dir" shared 1
+  add_memory "$dir" shared quiet "Nothing here rises to cross-lane importance." 0.1 _lane
+  # Provisioned and then wiped: the record survives, the rows do not.
+  make_store "$dir" personal 0
+  write_record "$dir" personal 5
+
+  out=$(fm_memory_mcp "$dir" awareness) || fail "the awareness index failed on a broken lane: $out"
+  states=$(json_field "$out" "','.join(sorted(f\"{l['lane']}={l['state']}\" for l in d['lanes']))")
+  case "$states" in *"shared=ready"*) ;; *) fail "the quiet lane was not reported ready: $states" ;; esac
+  case "$states" in *"personal=store_empty"*) ;; *) fail "the wiped lane was not reported broken: $states" ;; esac
+  case "$states" in
+    *"fleet-infra=unprovisioned"*) ;;
+    *) fail "a lane with no bank was not reported unprovisioned: $states" ;;
+  esac
+  [ "$(json_field "$out" "next(l['title_count'] for l in d['lanes'] if l['lane']=='shared')")" = "0" ] \
+    || fail "the quiet lane contributed titles it does not have: $out"
+  [ "$(json_field "$out" "next(l['title_count'] for l in d['lanes'] if l['lane']=='personal')")" = "0" ] \
+    || fail "the wiped lane contributed titles: $out"
+  # Both contribute nothing; only the state tells them apart, which is the point.
+  quiet_state=$(json_field "$out" "next(l['state'] for l in d['lanes'] if l['lane']=='shared')")
+  wiped_state=$(json_field "$out" "next(l['state'] for l in d['lanes'] if l['lane']=='personal')")
+  [ "$quiet_state" != "$wiped_state" ] || fail "a quiet lane and a wiped lane reported the same state"
+  pass "fm-memory-mcp: the awareness index tells a wiped lane apart from a quiet one"
+}
+
+test_awareness_index_attaches_all_six_lane_banks_at_once() {
+  local dir out lane
+  # Six lanes plus the main connection is the whole reason lane=bank is viable;
+  # SQLite caps attachments at ten. Prove all six attach in one read.
+  dir="$TMP_ROOT/awareness-attach"
+  for lane in products client-services brand-business fleet-infra personal shared; do
+    make_store "$dir" "$lane" 0
+    write_record "$dir" "$lane" 1
+    add_memory "$dir" "$lane" "t-$lane" "A cross-lane title from $lane." 0.8 _lane
+  done
+  out=$(fm_memory_mcp "$dir" awareness) || fail "attaching all six lane banks failed: $out"
+  [ "$(json_field "$out" "sum(1 for l in d['lanes'] if l['state']=='ready')")" = "6" ] \
+    || fail "not every lane bank attached: $out"
+  [ "$(json_field "$out" "len({t['lane'] for t in d['titles']})")" = "6" ] \
+    || fail "not every lane contributed a title: $out"
+  pass "fm-memory-mcp: all six lane banks attach read-only at once, under SQLite's limit"
+}
+
+
 test_preflight_refuses_missing_data_dir
 test_preflight_refuses_missing_bank
 test_preflight_refuses_unprovisioned_bank
@@ -1538,3 +1792,12 @@ test_retired_refusals_name_the_live_head_of_the_chain
 test_a_dedupe_update_reports_the_row_it_actually_left_behind
 test_superseding_an_expired_target_is_refused_with_a_true_reason
 test_the_memory_type_a_caller_writes_can_be_read_back
+test_provisioning_refuses_a_populated_bank_it_did_not_provision
+test_provisioning_refuses_a_database_it_cannot_read_as_a_store
+test_provisioning_is_idempotent
+test_provisioning_a_wiped_lane_reports_the_wipe_instead_of_reseeding
+test_provision_all_reports_every_lane_and_fails_on_any_refusal
+test_provision_all_makes_every_lane_pass_preflight
+test_awareness_index_carries_titles_and_never_bodies
+test_awareness_index_tells_a_wiped_lane_apart_from_an_empty_one
+test_awareness_index_attaches_all_six_lane_banks_at_once

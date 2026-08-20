@@ -12,13 +12,23 @@ Usage:
       carries nothing else; diagnostics go to stderr.
   fm-memory-mcp preflight [--lane L] [--project P] [--data-dir D]
       Run the full store proof and print it. Exit 1 on any refusal.
-  fm-memory-mcp provision --lane L [--data-dir D]
+  fm-memory-mcp provision (--lane L | --all) [--adopt] [--data-dir D]
       Create a lane bank, seed it with its own lane memory, and record the row
-      floor the preflight measures against.
+      floor the preflight measures against. Idempotent: a lane that already
+      carries a provisioning record is proved and left alone, never re-seeded.
+      A bank file that already holds memories but carries no record of ours is
+      refused (`bank_populated`), because seeding it would mix this lane into a
+      store nobody here provisioned; `--adopt` is the deliberate override and
+      records it at its current size without writing a seed. `--all` walks
+      every lane, reports each outcome, and exits 1 if any was refused.
   fm-memory-mcp record-floor --lane L [--data-dir D]
       Re-record that floor at the lane's current size, after a migration.
   fm-memory-mcp lanes [--data-dir D]
       Report every lane's bank path and readiness.
+  fm-memory-mcp awareness [--exclude L] [--data-dir D]
+      Print the tier-3 cross-lane index the memory_lanes tool serves: titles
+      only, never bodies, with each lane's proved state. `--exclude` gives the
+      view an agent serving that lane gets.
   fm-memory-mcp --help
 
 LANES AND ADDRESSING
@@ -1570,9 +1580,84 @@ def _write(stdout, message: Dict[str, Any]) -> None:
 # --- maintenance subcommands -------------------------------------------------
 
 
-def cmd_provision(data_dir: Path, lane: str) -> Dict[str, Any]:
+def existing_bank_rows(db_path: Path) -> Optional[int]:
+    """How many working memories a bank file already holds, or None if it is
+    not a readable Mnemosyne store.
+
+    Provisioning has to ask this before it opens anything read-write, and the
+    answer has to come from an inspection connection: a foreign, corrupt, or
+    half-written file must not be created, migrated, or upgraded by the act of
+    looking at it.
+    """
+    try:
+        conn, _mode = open_for_inspection(db_path)
+    except BridgeError:
+        return None
+    try:
+        return int(conn.execute("SELECT count(*) FROM working_memory").fetchone()[0])
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def cmd_provision(data_dir: Path, lane: str, adopt: bool = False) -> Dict[str, Any]:
+    """Create a lane bank once, and answer without touching it every time after.
+
+    Three states, told apart before anything is opened read-write:
+
+    - Already provisioned. Prove the bank and change nothing. A re-run must not
+      write a second seed, and must not re-record a floor that a wipe is still
+      supposed to be measured against - `record-floor` is the deliberate act
+      for that.
+    - A bank file already holding memories, with no record of ours. Refuse. It
+      was put there by something else, and seeding it would mix this lane into
+      a store nobody here provisioned. `--adopt` is the deliberate override:
+      it records the bank at its current size and writes no seed.
+    - Nothing, or the empty store Mnemosyne auto-creates at any writable path.
+      Create, seed, and record.
+    """
     db_path = bank_db_path(data_dir, lane)
     record_path = provision_record_path(data_dir, lane)
+
+    if record_path.is_file():
+        record = read_provision_record(data_dir, lane)
+        verified = preflight(data_dir, lane, full=True)
+        return {
+            "status": "ok",
+            "action": "already_provisioned",
+            "lane": lane,
+            "provisioned": record,
+            "checks": verified["checks"],
+        }
+
+    if db_path.is_file():
+        rows = existing_bank_rows(db_path)
+        if rows is None:
+            raise BridgeError(
+                "bank_unrecognized",
+                f"{db_path} already exists and is not a readable Mnemosyne store",
+                "Move it aside deliberately; provisioning never writes into a database it cannot read.",
+            )
+        if rows > 0 and not adopt:
+            raise BridgeError(
+                "bank_populated",
+                f"{db_path} already holds {rows} working memories but carries no provisioning record",
+                f"Move it aside, or adopt it as-is with: fm-memory-mcp provision --lane {lane} --adopt",
+            )
+        if rows > 0:
+            record = {
+                "version": PROVISION_VERSION,
+                "lane": lane,
+                "bank": bank_for_lane(lane),
+                "db_path": str(db_path),
+                "provisioned_at": now_iso(),
+                "adopted": True,
+                "row_floor": rows,
+            }
+            record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+            return {"status": "ok", "action": "adopted", "lane": lane, "provisioned": record}
+
     open_store(data_dir, lane, LANE_CHANNEL, DEFAULT_SESSION)  # creates the bank
     if not db_path.is_file():
         raise BridgeError("provision_failed", f"bank database was not created at {db_path}")
@@ -1605,7 +1690,32 @@ def cmd_provision(data_dir: Path, lane: str) -> Dict[str, Any]:
         "row_floor": max(rows, 1),
     }
     record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    return {"status": "ok", "provisioned": record, "seed_memory": written["id"]}
+    return {"status": "ok", "action": "provisioned", "lane": lane, "provisioned": record,
+            "seed_memory": written["id"]}
+
+
+def cmd_provision_all(data_dir: Path, adopt: bool = False) -> Dict[str, Any]:
+    """Provision every lane, and report each one's own outcome.
+
+    One lane's refusal never stops the others. The fleet needs to know which
+    banks are ready and exactly which are not, and a run that stopped at the
+    first problem would leave the rest of that answer undiscoverable.
+    """
+    lanes: List[Dict[str, Any]] = []
+    refused = 0
+    for lane in LANES:
+        try:
+            outcome = cmd_provision(data_dir, lane, adopt=adopt)
+            lanes.append({"lane": lane, "action": outcome["action"]})
+        except BridgeError as exc:
+            refused += 1
+            lanes.append({"lane": lane, "action": "refused", "error": exc.payload()["error"]})
+    return {
+        "status": "error" if refused else "ok",
+        "data_dir": str(data_dir),
+        "refused": refused,
+        "lanes": lanes,
+    }
 
 
 def cmd_record_floor(data_dir: Path, lane: str) -> Dict[str, Any]:
@@ -1617,6 +1727,27 @@ def cmd_record_floor(data_dir: Path, lane: str) -> Dict[str, Any]:
     record["floor_recorded_at"] = now_iso()
     provision_record_path(data_dir, lane).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     return {"status": "ok", "provisioned": record}
+
+
+def cmd_awareness(data_dir: Path, exclude: Optional[str]) -> Dict[str, Any]:
+    """The tier-3 cross-lane index on the command line.
+
+    Exactly the call the memory_lanes tool makes, so the standing index and
+    what an agent sees can never drift apart: read-only, titles only, never
+    bodies, and every lane carrying the state it proved. `--exclude` gives the
+    view an agent serving that lane gets; without it the index covers all six.
+    """
+    titles, lane_states = lane_awareness(data_dir, exclude=exclude)
+    return {
+        "status": "ok",
+        "data_dir": str(data_dir),
+        "excluded_lane": exclude,
+        "title_chars": AWARENESS_TITLE_CHARS,
+        "min_importance": AWARENESS_MIN_IMPORTANCE,
+        "count": len(titles),
+        "lanes": lane_states,
+        "titles": titles,
+    }
 
 
 def cmd_lanes(data_dir: Path) -> Dict[str, Any]:
@@ -1646,9 +1777,13 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=True,
     )
-    parser.add_argument("command", choices=["serve", "preflight", "provision", "record-floor", "lanes"])
+    parser.add_argument("command", choices=["serve", "preflight", "provision", "record-floor", "lanes", "awareness"])
     parser.add_argument("--lane", help="One of: " + ", ".join(LANES))
     parser.add_argument("--project", help="Project name; mapped to a lane through the registry")
+    parser.add_argument("--all", action="store_true", help="provision: every lane, reporting each outcome")
+    parser.add_argument("--adopt", action="store_true",
+                        help="provision: record an existing populated bank as-is, writing no seed")
+    parser.add_argument("--exclude", help="awareness: omit this lane, the view an agent serving it gets")
     parser.add_argument("--data-dir", help="Mnemosyne data dir (default: MNEMOSYNE_DATA_DIR, then ~/.hermes/mnemosyne/data)")
     parser.add_argument("--session", default=os.environ.get("FM_MEMORY_SESSION", DEFAULT_SESSION),
                         help="Provenance session id, never a scoping axis")
@@ -1663,6 +1798,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.command == "lanes":
             print(json.dumps(cmd_lanes(data_dir), indent=2))
             return 0
+        if args.command == "awareness":
+            exclude = args.exclude
+            if exclude is not None and exclude not in LANES:
+                raise BridgeError("unknown_lane", f"lane {exclude!r} is not one of: {', '.join(LANES)}")
+            print(json.dumps(cmd_awareness(data_dir, exclude), indent=2))
+            return 0
+        if args.command == "provision" and args.all:
+            result = cmd_provision_all(data_dir, adopt=args.adopt)
+            print(json.dumps(result, indent=2))
+            return 1 if result["refused"] else 0
 
         lane = resolve_lane(args.lane, args.project)
 
@@ -1671,7 +1816,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(json.dumps(result, indent=2))
             return 0
         if args.command == "provision":
-            print(json.dumps(cmd_provision(data_dir, lane), indent=2))
+            print(json.dumps(cmd_provision(data_dir, lane, adopt=args.adopt), indent=2))
             return 0
         if args.command == "record-floor":
             print(json.dumps(cmd_record_floor(data_dir, lane), indent=2))

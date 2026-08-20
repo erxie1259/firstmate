@@ -154,7 +154,6 @@ AWARENESS_LIMIT = 15
 
 BANK_NAME_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
 REGISTRY_LANE_RE = re.compile(r"(?<![A-Za-z0-9_-])lane:([a-z0-9-]+)")
-REGISTRY_ANNOTATION_RE = re.compile(r"\[([^\]]*)\]")
 
 
 class BridgeError(Exception):
@@ -211,6 +210,23 @@ def registry_path() -> Path:
     return Path(__file__).resolve().parent.parent / "data" / "projects.md"
 
 
+def registry_annotation(fields: List[str]) -> Optional[str]:
+    """The bracket annotation of a registry line, exactly as its owner reads it.
+
+    bin/fm-project-mode.sh treats field 3 as the annotation only when it opens
+    with `[`, and takes it through the first field that closes with `]`. Any
+    other bracket on the line belongs to the human-readable description.
+    """
+    if len(fields) < 3 or not fields[2].startswith("["):
+        return None
+    parts: List[str] = []
+    for field in fields[2:]:
+        parts.append(field)
+        if field.endswith("]"):
+            break
+    return " ".join(parts).removeprefix("[").removesuffix("]")
+
+
 def lane_from_registry(project: str) -> Tuple[bool, Optional[str]]:
     """Read a project's optional `lane:<name>` token from the registry.
 
@@ -227,10 +243,12 @@ def lane_from_registry(project: str) -> Tuple[bool, Optional[str]]:
         if len(fields) < 2 or fields[0] != "-" or fields[1] != project:
             continue
         # Only the bracket annotation carries tokens; a description must never
-        # be able to name a lane by accident.
-        annotation = REGISTRY_ANNOTATION_RE.search(line)
-        if annotation:
-            match = REGISTRY_LANE_RE.search(annotation.group(1))
+        # be able to name a lane by accident. bin/fm-project-mode.sh owns this
+        # line format and reads the annotation as the bracket group that starts
+        # at field 3, so anything later on the line is description, not tokens.
+        annotation = registry_annotation(fields)
+        if annotation is not None:
+            match = REGISTRY_LANE_RE.search(annotation)
             if match:
                 return (True, match.group(1))
         return (True, None)
@@ -572,6 +590,7 @@ def write_memory(
         raise BridgeError("invalid_argument", "importance must be between 0 and 1")
 
     store = open_store(data_dir, lane, channel_id, session_id)
+    existing_id = duplicate_id(store, content)
     try:
         memory_id = store.beam.remember(
             content,
@@ -591,6 +610,7 @@ def write_memory(
         "status": "ok",
         "store_verified": True,
         "id": memory_id,
+        "created": memory_id != existing_id,
         "lane": lane,
         "bank": bank_for_lane(lane),
         "channel_id": channel_id,
@@ -601,6 +621,23 @@ def write_memory(
         "consolidated_at": consolidated_at,
         "pinned": True,
     }
+
+
+def duplicate_id(store, content: str) -> Optional[str]:
+    """The id the store's dedupe would update in place instead of writing anew.
+
+    The library dedupes on (session_id, content) and returns the matched row's
+    id, so a caller that needs to know whether a write creates or mutates has to
+    ask the same question first - after the fact the mutation has already landed.
+    """
+    try:
+        row = store.conn.execute(
+            "SELECT id FROM working_memory WHERE session_id = ? AND content = ? LIMIT 1",
+            (store.session_id, content),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise BridgeError("read_failed", f"cannot check working_memory for a duplicate: {exc}") from exc
+    return row[0] if row else None
 
 
 def read_memory(store, memory_id: str) -> Optional[Dict[str, Any]]:
@@ -813,12 +850,25 @@ class Bridge:
         session_id = args.get("session_id") or self.session_id
         metadata = dict(args.get("metadata") or {})
         metadata["supersedes"] = memory_id
+        channel_id = self.channel_for(args.get("project"))
+        store = open_store(self.data_dir, lane, channel_id, session_id)
+        # Ask before writing: the store dedupes on (session_id, content), so
+        # replacement content identical to the target would update that very row
+        # in place - moving its channel and overwriting its fields - and then
+        # supersede it by itself. Refuse first, while it is still untouched.
+        if duplicate_id(store, args.get("content", "")) == memory_id:
+            raise BridgeError(
+                "supersede_noop",
+                f"the replacement content is identical to memory {memory_id}, so nothing would replace it; "
+                f"{memory_id} is untouched and still readable",
+                "Supersede needs content that differs; use memory_expire to retire a memory unchanged.",
+            )
         # New row first: a crash between the steps leaves a duplicate, which is
         # recoverable, rather than a gap, which is silent memory loss.
         written = write_memory(
             self.data_dir,
             lane,
-            self.channel_for(args.get("project")),
+            channel_id,
             session_id,
             args.get("content", ""),
             source=args.get("source") or DEFAULT_SOURCE,
@@ -829,18 +879,6 @@ class Bridge:
             metadata=metadata,
             valid_until=args.get("valid_until"),
         )
-        if written["id"] == memory_id:
-            # The store dedupes on (session_id, content), so byte-identical
-            # replacement content updates the target in place and hands back its
-            # own id. Superseding it by itself would expire the memory and hide
-            # it from every read, so refuse instead: the row is still intact.
-            raise BridgeError(
-                "supersede_noop",
-                f"the replacement content is identical to memory {memory_id}, which was updated in place "
-                f"rather than replaced; {memory_id} is unchanged and still readable",
-                "Supersede needs content that differs; use memory_expire to retire a memory unchanged.",
-            )
-        store = open_store(self.data_dir, lane, self.channel_for(args.get("project")), session_id)
         try:
             invalidated = bool(store.invalidate(memory_id, replacement_id=written["id"]))
         except Exception as exc:  # noqa: BLE001
@@ -861,13 +899,27 @@ class Bridge:
         store = open_store(
             self.data_dir, self.lane, self.channel_for(None), args.get("session_id") or self.session_id
         )
+        # invalidate() writes superseded_by unconditionally, so expiring an
+        # already-superseded memory with no replacement would erase its pointer
+        # to the row that replaced it. Re-supply the link so the chain survives.
+        existing = read_memory(store, memory_id)
+        if existing is None:
+            raise BridgeError("not_found", f"memory {memory_id} was not found in lane {self.lane}")
+        superseded_by = existing.get("superseded_by")
         try:
-            expired = bool(store.invalidate(memory_id))
+            expired = bool(store.invalidate(memory_id, replacement_id=superseded_by))
         except Exception as exc:  # noqa: BLE001
             raise BridgeError("expire_failed", f"cannot expire {memory_id}: {exc}") from exc
         if not expired:
             raise BridgeError("not_found", f"memory {memory_id} was not found in lane {self.lane}")
-        return {"status": "ok", "store_verified": True, "id": memory_id, "lane": self.lane, "expired": True}
+        return {
+            "status": "ok",
+            "store_verified": True,
+            "id": memory_id,
+            "lane": self.lane,
+            "expired": True,
+            "superseded_by": superseded_by,
+        }
 
     def get(self, args: Dict[str, Any]) -> Dict[str, Any]:
         memory_id = args.get("memory_id") or ""

@@ -282,6 +282,8 @@ test_resolves_lane_from_the_project_registry() {
 - house-memory [no-mistakes lane:personal] - home memory project (added 2026-08-02)
 - comfy-test [no-mistakes] - no lane token yet (added 2026-08-02)
 - decoy [no-mistakes] - description mentioning lane:products, which is not an annotation (added 2026-08-02)
+- prose-bracket - migrating the [lane:personal] tooling (added 2026-08-02)
+- trailing-bracket [no-mistakes] - later note [lane:personal] about it (added 2026-08-02)
 MD
   out=$(FM_HOME="$home" "$MCP" preflight --project flags --data-dir "$dir" 2>&1) \
     || fail "registry lane resolution failed: $out"
@@ -307,6 +309,16 @@ MD
   out=$(FM_HOME="$home" "$MCP" preflight --project decoy --data-dir "$dir" 2>&1) \
     && fail "a lane named in a description was accepted as a mapping"
   assert_contains "$out" "carries no lane:<name> token" "a description lane token was read as an annotation"
+
+  # bin/fm-project-mode.sh owns this line format and only reads an annotation
+  # when field 3 opens with '['. A bracket anywhere else is description, so it
+  # must not route a write either - with or without a real annotation ahead of it.
+  out=$(FM_HOME="$home" "$MCP" preflight --project prose-bracket --data-dir "$dir" 2>&1) \
+    && fail "a bracket in a description was accepted as an annotation"
+  assert_contains "$out" "carries no lane:<name> token" "a description bracket was read as an annotation"
+  out=$(FM_HOME="$home" "$MCP" preflight --project trailing-bracket --data-dir "$dir" 2>&1) \
+    && fail "a bracket after the annotation was accepted as a lane token"
+  assert_contains "$out" "carries no lane:<name> token" "a bracket after the annotation was read as a lane token"
   pass "fm-memory-mcp: maps a project to its lane, and refuses when the registry does not say"
 }
 
@@ -556,7 +568,7 @@ test_supersede_refuses_identical_content_and_leaves_the_memory_readable() {
   [ -n "$first" ] || fail "no id came back from the first write"
 
   out=$(serve_rpc "$dir" products \
-    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_supersede\",\"arguments\":{\"memory_id\":\"$first\",\"content\":\"A standing decision worth keeping.\",\"project\":\"flags\",\"importance\":0.9}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_supersede\",\"arguments\":{\"memory_id\":\"$first\",\"content\":\"A standing decision worth keeping.\",\"project\":\"other-project\",\"importance\":0.9,\"memory_type\":\"observation\"}}}" \
     | tail -n 1)
   out=$(tool_payload "$out")
   [ "$(json_field "$out" "d['isError']")" = "True" ] || fail "superseding a memory with its own content was reported successful: $out"
@@ -565,12 +577,15 @@ test_supersede_refuses_identical_content_and_leaves_the_memory_readable() {
   row=$(python3 - "$dir/banks/lane-products/mnemosyne.db" "$first" <<'PY_ROW'
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
-r = conn.execute("SELECT superseded_by IS NULL, valid_until IS NULL FROM working_memory WHERE id = ?",
-                 (sys.argv[2],)).fetchone()
+r = conn.execute(
+    "SELECT superseded_by IS NULL, valid_until IS NULL, channel_id, importance, memory_type"
+    " FROM working_memory WHERE id = ?", (sys.argv[2],)).fetchone()
 print("|".join(str(x) for x in r))
 PY_ROW
 )
-  [ "$row" = "1|1" ] || fail "the refused supersede still expired or superseded the memory: $row"
+  # "untouched" has to mean the whole row: the dedupe update would also move the
+  # memory out of its project channel and overwrite its importance and type.
+  [ "$row" = "1|1|flags|0.5|decision" ] || fail "the refused supersede still mutated the memory: $row"
 
   out=$(serve_rpc "$dir" products \
     "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_get\",\"arguments\":{\"memory_id\":\"$first\"}}}" \
@@ -578,6 +593,46 @@ PY_ROW
   out=$(tool_payload "$out")
   [ "$(json_field "$out" "d['isError']")" = "False" ] || fail "the memory was unreadable after a refused supersede: $out"
   pass "fm-memory-mcp: superseding a memory with its own content is refused and leaves it readable"
+}
+
+test_expiring_a_superseded_memory_keeps_its_replacement_link() {
+  local dir first replacement out
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the expire-chain test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the expire-chain test"
+    return
+  fi
+  dir="$TMP_ROOT/expire-chain"
+  mkdir -p "$dir"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+  first=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"The decision before it was revised.","project":"flags"}}}' \
+    | tail -n 1)
+  first=$(json_field "$(tool_payload "$first")" "d['payload']['id']")
+  [ -n "$first" ] || fail "no id came back from the first write"
+
+  replacement=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_supersede\",\"arguments\":{\"memory_id\":\"$first\",\"content\":\"The decision after it was revised.\",\"project\":\"flags\"}}}" \
+    | tail -n 1)
+  replacement=$(tool_payload "$replacement")
+  [ "$(json_field "$replacement" "d['isError']")" = "False" ] || fail "supersede failed: $replacement"
+  replacement=$(json_field "$replacement" "d['payload']['id']")
+
+  # Expiring an already-superseded memory must not erase the pointer that makes
+  # the supersession chain queryable as history.
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_expire\",\"arguments\":{\"memory_id\":\"$first\"}}}" \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "False" ] || fail "expiring a superseded memory failed: $out"
+
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_get\",\"arguments\":{\"memory_id\":\"$first\"}}}" \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['payload']['memory']['superseded_by']")" = "$replacement" ] \
+    || fail "expiring the memory erased its link to the replacement: $out"
+  pass "fm-memory-mcp: expiring an already-superseded memory keeps its link to the replacement"
 }
 
 test_a_session_scoped_write_is_readable_and_expirable_under_the_same_session() {
@@ -690,6 +745,7 @@ test_provisioned_lane_writes_are_global_and_pinned
 test_pinned_writes_survive_the_trim_that_deletes_unpinned_rows
 test_supersede_marks_the_old_memory_and_links_the_replacement
 test_supersede_refuses_identical_content_and_leaves_the_memory_readable
+test_expiring_a_superseded_memory_keeps_its_replacement_link
 test_a_session_scoped_write_is_readable_and_expirable_under_the_same_session
 test_a_lane_is_never_visible_to_another_lanes_recall
 test_the_default_bank_is_never_touched

@@ -536,6 +536,86 @@ PY
   pass "fm-memory-mcp: supersede writes the replacement first, then links and expires the old memory"
 }
 
+test_supersede_refuses_identical_content_and_leaves_the_memory_readable() {
+  local dir first out row
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the identical-content supersede test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the identical-content supersede test"
+    return
+  fi
+  dir="$TMP_ROOT/supersede-identical"
+  mkdir -p "$dir"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+  # The store dedupes on (session_id, content), so re-sending the same content
+  # updates the target in place and returns its own id. Superseding it by itself
+  # would expire the memory and hide it from every read.
+  first=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"A standing decision worth keeping.","project":"flags","memory_type":"decision"}}}' \
+    | tail -n 1)
+  first=$(json_field "$(tool_payload "$first")" "d['payload']['id']")
+  [ -n "$first" ] || fail "no id came back from the first write"
+
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_supersede\",\"arguments\":{\"memory_id\":\"$first\",\"content\":\"A standing decision worth keeping.\",\"project\":\"flags\",\"importance\":0.9}}}" \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "True" ] || fail "superseding a memory with its own content was reported successful: $out"
+  [ "$(json_field "$out" "d['payload']['error']['code']")" = "supersede_noop" ] || fail "the refusal was not typed supersede_noop: $out"
+
+  row=$(python3 - "$dir/banks/lane-products/mnemosyne.db" "$first" <<'PY_ROW'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+r = conn.execute("SELECT superseded_by IS NULL, valid_until IS NULL FROM working_memory WHERE id = ?",
+                 (sys.argv[2],)).fetchone()
+print("|".join(str(x) for x in r))
+PY_ROW
+)
+  [ "$row" = "1|1" ] || fail "the refused supersede still expired or superseded the memory: $row"
+
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_get\",\"arguments\":{\"memory_id\":\"$first\"}}}" \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "False" ] || fail "the memory was unreadable after a refused supersede: $out"
+  pass "fm-memory-mcp: superseding a memory with its own content is refused and leaves it readable"
+}
+
+test_a_session_scoped_write_is_readable_and_expirable_under_the_same_session() {
+  local dir written id out
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the session-override test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the session-override test"
+    return
+  fi
+  dir="$TMP_ROOT/session-override"
+  mkdir -p "$dir"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+  # session_id is provenance on the way in; it must also be what the read and
+  # expire paths match on, or a session-scoped write is unreachable by the very
+  # client that just made it.
+  written=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"A session-scoped note from another agent.","scope":"session","session_id":"other-agent"}}}' \
+    | tail -n 1)
+  written=$(tool_payload "$written")
+  [ "$(json_field "$written" "d['isError']")" = "False" ] || fail "the session-scoped write failed: $written"
+  id=$(json_field "$written" "d['payload']['id']")
+  [ -n "$id" ] || fail "no id came back from the session-scoped write"
+
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_get\",\"arguments\":{\"memory_id\":\"$id\",\"session_id\":\"other-agent\"}}}" \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "False" ] || fail "a session-scoped memory could not be read back under its own session: $out"
+  [ "$(json_field "$out" "d['payload']['memory']['session_id']")" = "other-agent" ] || fail "the memory did not record the overridden session: $out"
+
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_expire\",\"arguments\":{\"memory_id\":\"$id\",\"session_id\":\"other-agent\"}}}" \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['isError']")" = "False" ] || fail "a session-scoped memory could not be expired under its own session: $out"
+  pass "fm-memory-mcp: a session-scoped write is readable and expirable under the session it names"
+}
+
 test_a_lane_is_never_visible_to_another_lanes_recall() {
   local dir out count
   if ! library_available; then
@@ -609,5 +689,7 @@ test_a_failing_store_never_answers_an_empty_success
 test_provisioned_lane_writes_are_global_and_pinned
 test_pinned_writes_survive_the_trim_that_deletes_unpinned_rows
 test_supersede_marks_the_old_memory_and_links_the_replacement
+test_supersede_refuses_identical_content_and_leaves_the_memory_readable
+test_a_session_scoped_write_is_readable_and_expirable_under_the_same_session
 test_a_lane_is_never_visible_to_another_lanes_recall
 test_the_default_bank_is_never_touched

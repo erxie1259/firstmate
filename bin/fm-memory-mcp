@@ -829,6 +829,17 @@ class Bridge:
             metadata=metadata,
             valid_until=args.get("valid_until"),
         )
+        if written["id"] == memory_id:
+            # The store dedupes on (session_id, content), so byte-identical
+            # replacement content updates the target in place and hands back its
+            # own id. Superseding it by itself would expire the memory and hide
+            # it from every read, so refuse instead: the row is still intact.
+            raise BridgeError(
+                "supersede_noop",
+                f"the replacement content is identical to memory {memory_id}, which was updated in place "
+                f"rather than replaced; {memory_id} is unchanged and still readable",
+                "Supersede needs content that differs; use memory_expire to retire a memory unchanged.",
+            )
         store = open_store(self.data_dir, lane, self.channel_for(args.get("project")), session_id)
         try:
             invalidated = bool(store.invalidate(memory_id, replacement_id=written["id"]))
@@ -847,7 +858,9 @@ class Bridge:
         memory_id = args.get("memory_id") or ""
         if not memory_id:
             raise BridgeError("invalid_argument", "memory_id is required")
-        store = open_store(self.data_dir, self.lane, self.channel_for(None), self.session_id)
+        store = open_store(
+            self.data_dir, self.lane, self.channel_for(None), args.get("session_id") or self.session_id
+        )
         try:
             expired = bool(store.invalidate(memory_id))
         except Exception as exc:  # noqa: BLE001
@@ -860,7 +873,9 @@ class Bridge:
         memory_id = args.get("memory_id") or ""
         if not memory_id:
             raise BridgeError("invalid_argument", "memory_id is required")
-        store = open_store(self.data_dir, self.lane, self.channel_for(None), self.session_id)
+        store = open_store(
+            self.data_dir, self.lane, self.channel_for(None), args.get("session_id") or self.session_id
+        )
         memory = read_memory(store, memory_id)
         if memory is None:
             raise BridgeError("not_found", f"memory {memory_id} was not found in lane {self.lane}")
@@ -956,6 +971,14 @@ class Bridge:
 _LANE_ENUM = {"type": "string", "enum": list(LANES)}
 _SCOPE_ENUM = {"type": "string", "enum": list(SCOPES), "default": "global"}
 _VERACITY_ENUM = {"type": "string", "enum": list(VERACITIES)}
+_SESSION_ID_PROPERTY = {
+    "type": "string",
+    "description": (
+        "Act as this session instead of the server's own. It is the provenance a write records and the "
+        "session a session-scoped read, expire, or supersede matches, so pass the same one to every call "
+        "that must reach the row."
+    ),
+}
 
 _WRITE_PROPERTIES: Dict[str, Any] = {
     "content": {"type": "string", "description": "The memory text. Clean prose; the bridge sets structure itself."},
@@ -968,7 +991,7 @@ _WRITE_PROPERTIES: Dict[str, Any] = {
     "source": {"type": "string", "default": DEFAULT_SOURCE},
     "metadata": {"type": "object", "description": "Provenance. Round-trips faithfully but is not filterable in recall."},
     "valid_until": {"type": "string", "description": "ISO timestamp for a fact with a known shelf life."},
-    "session_id": {"type": "string", "description": "Provenance override; omit to record this server's session."},
+    "session_id": dict(_SESSION_ID_PROPERTY),
 }
 
 TOOL_SPECS: List[Dict[str, Any]] = [
@@ -1020,13 +1043,21 @@ TOOL_SPECS: List[Dict[str, Any]] = [
             "Mark a memory as no longer claimed to be true, with no replacement. For observed externals "
             "with a shelf life, not for decisions - supersede those instead. Nothing is ever deleted."
         ),
-        "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string"}}, "required": ["memory_id"]},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"memory_id": {"type": "string"}, "session_id": _SESSION_ID_PROPERTY},
+            "required": ["memory_id"],
+        },
         "handler": "expire",
     },
     {
         "name": "memory_get",
         "description": "Read one memory by id, including global memories written by other sessions.",
-        "inputSchema": {"type": "object", "properties": {"memory_id": {"type": "string"}}, "required": ["memory_id"]},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"memory_id": {"type": "string"}, "session_id": _SESSION_ID_PROPERTY},
+            "required": ["memory_id"],
+        },
         "handler": "get",
     },
     {

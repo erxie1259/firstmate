@@ -298,7 +298,7 @@ test_refuses_unresolved_lane() {
 }
 
 test_resolves_lane_from_the_project_registry() {
-  local dir home out
+  local dir home out status
   dir="$TMP_ROOT/registry"
   home="$TMP_ROOT/registry-home"
   make_ready_lane "$dir" products
@@ -312,6 +312,7 @@ test_resolves_lane_from_the_project_registry() {
 - decoy [no-mistakes] - description mentioning lane:products, which is not an annotation (added 2026-08-02)
 - prose-bracket - migrating the [lane:personal] tooling (added 2026-08-02)
 - trailing-bracket [no-mistakes] - later note [lane:personal] about it (added 2026-08-02)
+- empty-lane [no-mistakes lane:] - the token is there but names nothing (added 2026-08-02)
 MD
   out=$(FM_HOME="$home" "$MCP" preflight --project flags --data-dir "$dir" 2>&1) \
     || fail "registry lane resolution failed: $out"
@@ -347,6 +348,17 @@ MD
   out=$(FM_HOME="$home" "$MCP" preflight --project trailing-bracket --data-dir "$dir" 2>&1) \
     && fail "a bracket after the annotation was accepted as a lane token"
   assert_contains "$out" "carries no lane:<name> token" "a bracket after the annotation was read as a lane token"
+
+  # A token that names no lane is not a lane. --lane must refuse rather than
+  # answer with a blank one, because a mechanical caller taking its exit code
+  # at its word would route a write nowhere at all.
+  status=0
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-project-mode.sh" --lane empty-lane 2>/dev/null) || status=$?
+  [ "$status" -ne 0 ] || fail "an empty lane: token was answered instead of refused"
+  [ -z "$out" ] || fail "a refused lane lookup still printed a lane: '$out'"
+  out=$(FM_HOME="$home" "$MCP" preflight --project empty-lane --data-dir "$dir" 2>&1) \
+    && fail "an empty lane: token was accepted as a mapping"
+  assert_contains "$out" '"code": "lane_unresolved"' "an empty lane: token did not report lane_unresolved"
   pass "fm-memory-mcp: maps a project to its lane, and refuses when the registry does not say"
 }
 

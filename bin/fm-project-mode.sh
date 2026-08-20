@@ -96,7 +96,9 @@ parsed=$(awk -v n="$NAME" '
       # positionally made a lane-only annotation look like an unknown mode.
       for (j=1; j<=k; j++) {
         if (a[j]=="+yolo") { yolo="on"; continue }
-        if (a[j] ~ /^lane:/) { if (lane=="-") { t=a[j]; sub(/^lane:/, "", t); lane=t } continue }
+        # An empty value after "lane:" names no lane, so it is left absent
+        # rather than answered with a blank one.
+        if (a[j] ~ /^lane:/) { if (lane=="-") { t=a[j]; sub(/^lane:/, "", t); if (t!="") lane=t } continue }
         if (a[j]!="" && !seen) { mode=a[j]; seen=1 }
       }
     }
@@ -112,7 +114,7 @@ if [ "$WANT_LANE" -eq 1 ]; then
     echo "warn: project \"$NAME\" is not in $REG" >&2
     exit 1
   fi
-  if [ "$lane" = "-" ]; then
+  if [ "$lane" = "-" ] || [ -z "$lane" ]; then
     echo "warn: project \"$NAME\" carries no lane:<name> token in $REG" >&2
     exit 1
   fi

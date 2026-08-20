@@ -723,7 +723,140 @@ PY
     || fail "the original home was locked out of its own ledger: $out"
   [ "$(live_rows_claiming "$dir" shared "Never send routine acknowledgements")" = "1" ] \
     || fail "the original home no longer holds exactly one live pointer for its section"
+
+  # The foreign run wrote a row of its own for the same key. If it had also
+  # recorded that row in the ledger it does not own, the owning home's next
+  # reconciliation would aim at the OTHER home's row: deleting the section here
+  # would retire a pointer this run never wrote and leave its own row live,
+  # claiming a section that is gone.
+  python3 - "$home/data/captain.md" <<'PY'
+import sys
+p = sys.argv[1]
+text = open(p).read()
+open(p, "w").write(text.split("## Chat is for outcomes only")[0])
+PY
+  out=$(fm_pointers "$home" "$dir" write) || fail "the reconciling run from the original home failed: $out"
+  [ "$(json_field "$out" "d['counts']['expired']")" = "1" ] \
+    || fail "the original home did not retire its own deleted section: $out"
+  [ "$(live_rows_claiming "$dir" shared "Never send routine acknowledgements")" = "0" ] \
+    || fail "the original home's pointer for a deleted section is still live: $out"
+  [ "$(live_rows_claiming "$dir" shared "This second checkout says something else entirely")" = "1" ] \
+    || fail "the other home's row was retired by a run that does not own its ledger: $out"
   pass "fm-memory-pointers: a ledger from another home is neither retired from nor superseded through"
+}
+
+test_a_run_from_another_home_records_nothing_in_the_ledger_it_does_not_own() {
+  local home other dir before after
+  skip_without_library "the foreign-ledger record test" && return
+  home=$(make_home foreign-record-home-a)
+  dir=$(make_lanes foreign-record-dir shared fleet-infra products)
+  fm_pointers "$home" "$dir" write >/dev/null || fail "the first pointer run failed"
+  before=$(cat "$dir/banks/lane-shared/fm-memory-pointers.json")
+
+  other=$(make_home foreign-record-home-b)
+  python3 - "$other/data/captain.md" <<'PY'
+import sys
+p = sys.argv[1]
+text = open(p).read()
+open(p, "w").write(text.replace(
+    "Never send routine acknowledgements.",
+    "A foreign checkout with its own text for the same heading."))
+PY
+  fm_pointers "$other" "$dir" write >/dev/null
+
+  after=$(cat "$dir/banks/lane-shared/fm-memory-pointers.json")
+  [ "$before" = "$after" ] \
+    || fail "a run from another tree rewrote a ledger it does not own"
+  pass "fm-memory-pointers: a run from another tree leaves the ledger it does not own byte-identical"
+}
+
+test_a_bridge_that_will_not_start_at_all_costs_its_lanes_not_the_run() {
+  local home dir out
+  home=$(make_home no-bridge-home)
+  dir="$TMP_ROOT/no-bridge-dir"
+  fm_pointers_assert_scratch "$dir"
+  mkdir -p "$dir"
+
+  # An interpreter that is not there fails in the spawn itself, which raises an
+  # OSError rather than the tool's own typed error. That still costs the lanes
+  # their pointers and nothing more: a run that lets it escape loses the counts
+  # for every pointer, so nothing can say how much of the fleet landed.
+  out=$(python3 - "$ROOT/bin/fm-memory-pointers" "$TMP_ROOT/no-such-python" "$home" "$dir" <<'PY'
+import importlib.machinery, importlib.util, json, sys
+from pathlib import Path
+
+module_path, interpreter, home, data_dir = sys.argv[1:5]
+loader = importlib.machinery.SourceFileLoader("fm_memory_pointers", module_path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+mod.sys.executable = interpreter
+
+pointers = mod.derive(Path(home)).pointers
+result = mod.write_pointers(Path(home), Path(data_dir), pointers)
+print(json.dumps({"total": len(pointers), **result}))
+PY
+) || fail "a bridge that could not be spawned crashed the run: $out"
+
+  [ "$(json_field "$out" "d['counts']['refused'] == d['total']")" = "True" ] \
+    || fail "the pointers of a lane whose bridge never started were not counted: $out"
+  [ "$(json_field "$out" "sorted({r['lane'] for r in d['refusals']})")" \
+    = "['fleet-infra', 'products', 'shared']" ] \
+    || fail "not every lane was walked and reported: $out"
+  [ "$(json_field "$out" "sorted({r['error']['code'] for r in d['refusals']})")" = "['lane_failed']" ] \
+    || fail "a spawn failure was not reported as a lane failure: $out"
+  pass "fm-memory-pointers: a bridge that cannot even be spawned costs its lanes, never the run"
+}
+
+test_a_tool_result_that_is_not_an_object_is_refused_not_crashed() {
+  local home dir stub out
+  home=$(make_home nonobject-home)
+  dir="$TMP_ROOT/nonobject-dir"
+  fm_pointers_assert_scratch "$dir"
+  mkdir -p "$dir"
+
+  # Valid JSON that is not an object cannot answer "which row did this land
+  # on". Reading it as one would raise past the guards that keep a lane's
+  # failure from costing the run, so it is refused at the bridge boundary.
+  stub="$TMP_ROOT/nonobject-bridge.py"
+  cat > "$stub" <<'PY'
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["method"] == "initialize":
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {}}) + "\n")
+    else:
+        sys.stdout.write(json.dumps({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": {"content": [{"type": "text", "text": "[\"not\", \"an\", \"object\"]"}]}}) + "\n")
+    sys.stdout.flush()
+PY
+
+  out=$(python3 - "$ROOT/bin/fm-memory-pointers" "$stub" "$home" "$dir" <<'PY'
+import importlib.machinery, importlib.util, json, sys
+from pathlib import Path
+
+module_path, stub, home, data_dir = sys.argv[1:5]
+loader = importlib.machinery.SourceFileLoader("fm_memory_pointers", module_path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+mod.BRIDGE = Path(stub)
+
+pointers = mod.derive(Path(home)).pointers
+result = mod.write_pointers(Path(home), Path(data_dir), pointers)
+ledger, _ = mod.read_ledger(Path(data_dir), "shared")
+print(json.dumps({"total": len(pointers), "ledger": ledger, **result}))
+PY
+) || fail "a non-object tool result crashed the run: $out"
+
+  [ "$(json_field "$out" "d['counts']['refused'] == d['total']")" = "True" ] \
+    || fail "a non-object tool result did not account for every pointer: $out"
+  [ "$(json_field "$out" "d['counts']['written'] + d['counts']['skipped_duplicate']")" = "0" ] \
+    || fail "a non-object tool result was counted as a stored row: $out"
+  [ "$(json_field "$out" "d['ledger']")" = "{}" ] \
+    || fail "a non-object tool result was recorded in the ledger: $out"
+  pass "fm-memory-pointers: a tool result that is not an object is refused at the bridge boundary"
 }
 
 test_two_sections_sharing_a_heading_keep_one_live_pointer_each() {
@@ -1051,6 +1184,9 @@ test_an_emptied_learnings_file_with_pointers_indexed_refuses
 test_an_emptied_canonical_file_retires_nothing_and_refuses
 test_a_canonical_file_with_no_sections_retires_nothing_and_refuses
 test_a_ledger_from_another_home_neither_retires_nor_supersedes
+test_a_run_from_another_home_records_nothing_in_the_ledger_it_does_not_own
+test_a_bridge_that_will_not_start_at_all_costs_its_lanes_not_the_run
+test_a_tool_result_that_is_not_an_object_is_refused_not_crashed
 test_two_sections_sharing_a_heading_keep_one_live_pointer_each
 test_a_lost_ledger_costs_a_duplicate_pointer_not_a_wrong_answer
 test_a_bridge_that_dies_midlane_still_reports_every_lane

@@ -537,6 +537,13 @@ class BridgeSession:
             payload = json.loads(result["content"][0]["text"])
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise PointerError(f"lane {self.lane}: unreadable {name} result: {exc}") from exc
+        # Every caller reads the payload as an object; a list or a bare string
+        # is refused here rather than raising an AttributeError past the guards
+        # that keep one lane's failure from costing the run.
+        if not isinstance(payload, dict):
+            raise PointerError(
+                f"lane {self.lane}: the bridge answered {name} with "
+                f"{type(payload).__name__}, not an object")
         return (not result.get("isError", False), payload)
 
     def close(self) -> None:
@@ -731,9 +738,12 @@ def write_pointers(
     for lane in sorted(by_lane):
         ledger, recorded_home = ledgers[lane]
         reconciling, chaining, reason = reconciliation_state(recorded_home, home_key)
-        # A ledger bound to another tree stays bound to it: rebinding here
-        # would retire this home's absent keys on the very next run.
-        ledger_home = home_key if recorded_home in (None, home_key) else recorded_home
+        # A ledger bound to another tree is left exactly as its owner wrote it.
+        # Rebinding it would retire this home's absent keys on the very next
+        # run, and rewriting its records would point the owner's reconciliation
+        # at rows this run created, so its next stale key would retire a
+        # pointer it never wrote. This run writes plainly and records nothing.
+        owns_ledger = recorded_home in (None, home_key)
         entries = by_lane[lane]
         current_keys = [entry["key"] for entry in entries]
         stale = stale_keys(ledger, current_keys)
@@ -759,8 +769,8 @@ def write_pointers(
         retirable = [key for key in reconcilable if key in set(retirable_keys(ledger, current_keys))]
 
         if not entries and not reconcilable:
-            if ledger:
-                write_ledger(data_dir, lane, ledger, ledger_home)
+            if ledger and owns_ledger:
+                write_ledger(data_dir, lane, ledger, home_key)
             continue
         # A lane whose bridge will not start - an unprovisioned or wiped bank -
         # costs that lane's pointers and nothing else. Stopping the whole index
@@ -768,7 +778,7 @@ def write_pointers(
         # and the run has to report exactly which pointers did not land.
         try:
             session = BridgeSession(lane, data_dir, home)
-        except PointerError as exc:
+        except Exception as exc:  # noqa: BLE001
             counts["refused"] += len(entries)
             if entries:
                 refusals.append({
@@ -834,7 +844,8 @@ def write_pointers(
                 memory_id = payload.get("id") if ok else None
                 if ok and memory_id and superseded:
                     counts["updated"] += 1
-                    ledger[entry["key"]] = ledger_record(entry, memory_id)
+                    if owns_ledger:
+                        ledger[entry["key"]] = ledger_record(entry, memory_id)
                     continue
                 if not ok or not memory_id:
                     counts["refused"] += 1
@@ -849,7 +860,8 @@ def write_pointers(
                     })
                     continue
                 counts["written" if payload.get("created") else "skipped_duplicate"] += 1
-                ledger[entry["key"]] = ledger_record(entry, memory_id)
+                if owns_ledger:
+                    ledger[entry["key"]] = ledger_record(entry, memory_id)
             if walked and reconcilable:
                 # Only once the walk finished: a lane that lost its bridge has
                 # nothing to expire through, and its unreconciled keys have to
@@ -875,7 +887,8 @@ def write_pointers(
                         })
         finally:
             session.close()
-            write_ledger(data_dir, lane, ledger, ledger_home)
+            if owns_ledger:
+                write_ledger(data_dir, lane, ledger, home_key)
     result: Dict[str, Any] = {"counts": counts, "refusals": refusals}
     if skipped:
         result["skipped_reconciliation"] = skipped

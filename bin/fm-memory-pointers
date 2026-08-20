@@ -152,7 +152,13 @@ def excerpt(body: List[str]) -> str:
 
 
 def digest(*parts: str) -> str:
-    """The canonical digest a later drift pass compares against."""
+    """The canonical digest a later drift pass compares against.
+
+    It covers the whole derived pointer text, not just the excerpt, because the
+    text is what the store dedupes on: a canonical edit that only moves a
+    section's line number still changes what is stored, so it has to change the
+    digest too or the run writes a second live pointer for one fact.
+    """
     h = hashlib.sha256()
     for part in parts:
         h.update(part.encode("utf-8"))
@@ -178,6 +184,7 @@ def pointer(
     if summary:
         content += f" {summary}" if summary.endswith((".", "!", "?")) else f" {summary}."
     content += f' Canonical: firstmate {canonical_file} § "{anchor}" (line {line}).'
+    canonical_sha = digest(canonical_file, anchor, content)
     return {
         "key": f"{canonical_file}#{anchor}",
         "lane": lane,
@@ -186,13 +193,13 @@ def pointer(
         "memory_type": memory_type,
         "importance": importance,
         "veracity": veracity,
-        "canonical_sha": digest(canonical_file, anchor, summary),
+        "canonical_sha": canonical_sha,
         "metadata": {
             "pointer": True,
             "canonical_file": canonical_file,
             "canonical_anchor": anchor,
             "canonical_line": line,
-            "canonical_sha": digest(canonical_file, anchor, summary),
+            "canonical_sha": canonical_sha,
         },
     }
 
@@ -360,7 +367,10 @@ class BridgeSession:
         if not line:
             stderr = (self.proc.stderr.read() if self.proc.stderr else "").strip()
             raise PointerError(f"lane {self.lane}: the bridge answered nothing. {stderr}")
-        return json.loads(line)
+        try:
+            return json.loads(line)
+        except ValueError as exc:
+            raise PointerError(f"lane {self.lane}: the bridge answered unparseable JSON: {exc}") from exc
 
     def call_tool(self, name: str, arguments: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
         """(ok, payload) - a typed refusal is data, never an exception."""
@@ -368,7 +378,10 @@ class BridgeSession:
         if "result" not in response:
             raise PointerError(f"lane {self.lane}: {json.dumps(response.get('error'))}")
         result = response["result"]
-        payload = json.loads(result["content"][0]["text"])
+        try:
+            payload = json.loads(result["content"][0]["text"])
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise PointerError(f"lane {self.lane}: unreadable {name} result: {exc}") from exc
         return (not result.get("isError", False), payload)
 
     def close(self) -> None:
@@ -425,7 +438,8 @@ def write_pointers(home: Path, data_dir: Path, pointers: List[Dict[str, Any]]) -
             })
             continue
         try:
-            for entry in by_lane[lane]:
+            entries = by_lane[lane]
+            for index, entry in enumerate(entries):
                 recorded = ledger.get(entry["key"]) or {}
                 args = write_arguments(entry)
                 superseding = bool(
@@ -433,17 +447,31 @@ def write_pointers(home: Path, data_dir: Path, pointers: List[Dict[str, Any]]) -
                     and recorded.get("canonical_sha")
                     and recorded["canonical_sha"] != entry["canonical_sha"]
                 )
-                if superseding:
-                    ok, payload = session.call_tool(
-                        "memory_supersede", dict(args, memory_id=recorded["memory_id"]))
-                    if ok:
-                        counts["updated"] += 1
-                        ledger[entry["key"]] = {
-                            "memory_id": payload["id"], "canonical_sha": entry["canonical_sha"]}
-                        continue
-                    # The recorded row is gone or already retired, so there is
-                    # nothing to chain onto. Write the pointer on its own.
-                ok, payload = session.call_tool("memory_remember", args)
+                # A bridge that dies mid-lane costs the rest of THIS lane and no
+                # other: the remaining keys are reported as refused and the walk
+                # moves on, because a run that aborts here loses the counts for
+                # every pointer that already landed.
+                try:
+                    if superseding:
+                        ok, payload = session.call_tool(
+                            "memory_supersede", dict(args, memory_id=recorded["memory_id"]))
+                        if ok:
+                            counts["updated"] += 1
+                            ledger[entry["key"]] = {
+                                "memory_id": payload["id"], "canonical_sha": entry["canonical_sha"]}
+                            continue
+                        # The recorded row is gone or already retired, so there
+                        # is nothing to chain onto. Write the pointer on its own.
+                    ok, payload = session.call_tool("memory_remember", args)
+                except PointerError as exc:
+                    stranded = entries[index:]
+                    counts["refused"] += len(stranded)
+                    refusals.append({
+                        "lane": lane,
+                        "keys": [item["key"] for item in stranded],
+                        "error": {"code": "lane_unavailable", "message": str(exc)},
+                    })
+                    break
                 if not ok:
                     counts["refused"] += 1
                     refusals.append({"key": entry["key"], "lane": lane, "error": payload.get("error")})

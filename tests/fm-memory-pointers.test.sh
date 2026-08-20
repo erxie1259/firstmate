@@ -316,6 +316,46 @@ PY
   pass "fm-memory-pointers: an edited canonical section supersedes its pointer rather than duplicating it"
 }
 
+test_a_shifted_section_supersedes_its_pointer_instead_of_adding_a_second() {
+  local home dir out live superseded
+  skip_without_library "the shifted-section drift test" && return
+  home=$(make_home shift-home)
+  dir=$(make_lanes shift-dir shared fleet-infra products)
+  fm_pointers "$home" "$dir" write >/dev/null || fail "the first pointer run failed"
+
+  # A pointer names the line its fact lives on, so inserting a section above it
+  # changes what the pointer says even though the section itself is untouched.
+  # That has to supersede exactly as an edit does: otherwise every section below
+  # any insertion accumulates a second live pointer on every run.
+  python3 - "$home/data/captain.md" <<'PY'
+import sys
+p = sys.argv[1]
+text = open(p).read()
+head, rest = text.split("## Standing decisions", 1)
+open(p, "w").write(
+    head + "## Ship on green only (2026-08-19, captain-decided)\n\n"
+    "Never merge on a red pipeline.\n\n## Standing decisions" + rest)
+PY
+
+  out=$(fm_pointers "$home" "$dir" write) || fail "the run after the insertion failed: $out"
+  [ "$(json_field "$out" "d['counts']['written']")" = "1" ] \
+    || fail "the insertion wrote more than the one genuinely new pointer: $out"
+  [ "$(json_field "$out" "d['counts']['updated']")" = "2" ] \
+    || fail "the shifted sections were not written as supersessions: $out"
+  live=$(live_pointer_rows "$dir" shared)
+  [ "$live" = "3" ] || fail "an insertion left $live live captain pointers, not three"
+  superseded=$(python3 - "$dir/banks/lane-shared/mnemosyne.db" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+print(conn.execute(
+    "SELECT count(*) FROM working_memory WHERE source='firstmate-pointers'"
+    " AND superseded_by IS NOT NULL").fetchone()[0])
+PY
+)
+  [ "$superseded" = "2" ] || fail "the shifted pointers were not retired as history: $superseded"
+  pass "fm-memory-pointers: a section moved by an insertion supersedes its pointer, never duplicates it"
+}
+
 test_a_lost_ledger_costs_a_duplicate_pointer_not_a_wrong_answer() {
   local home dir out live
   skip_without_library "the lost-ledger test" && return
@@ -362,6 +402,7 @@ test_plan_reports_an_absent_canonical_file_rather_than_inventing_one
 test_write_is_idempotent_across_runs
 test_write_lands_pointers_in_their_own_lane_and_project
 test_an_edited_section_supersedes_its_pointer_instead_of_adding_a_second
+test_a_shifted_section_supersedes_its_pointer_instead_of_adding_a_second
 test_a_lost_ledger_costs_a_duplicate_pointer_not_a_wrong_answer
 test_write_refuses_an_unprovisioned_lane_rather_than_creating_one
 echo "# all fm-memory-pointers tests passed"

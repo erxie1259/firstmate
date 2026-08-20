@@ -1229,10 +1229,10 @@ test_a_non_canonical_shelf_life_is_recallable_not_dead_on_arrival() {
   # its wall-clock digits rather than the instant it names. Anything reported
   # pinned and durable has to actually be recallable.
   #
-  # Both values are the last second of today, which is what puts the separator
-  # and the offset digits where the compare actually reaches them - a later date
-  # would sort correctly whatever follows it. Within the final minute of the day
-  # there is no same-day future second, so the value rolls to tomorrow and the
+  # The space-separated value is the last second of today, which is what puts
+  # the separator where the compare actually reaches it - a later date would
+  # sort correctly whatever follows it. Within the final minute of the day there
+  # is no same-day future second, so the value rolls to tomorrow and the
   # assertions still hold, just without that pressure.
   dir="$TMP_ROOT/canonical-shelf-life"
   mkdir -p "$dir"
@@ -1243,13 +1243,15 @@ end = now.replace(hour=23, minute=59, second=59, microsecond=0)
 if end <= now + timedelta(seconds=30):
     end += timedelta(days=1)
 print(end.strftime('%Y-%m-%d %H:%M:%S'))")
+  # Rendered in a zone four hours behind local, so its wall-clock digits read
+  # two hours BEFORE now even though the instant is two hours after it. Written
+  # verbatim it sorts below now_iso() and the store treats it as long expired;
+  # only converting it to local time makes the text compare agree with the clock.
   offset=$(python3 -c "
-from datetime import datetime, timedelta
-now = datetime.now().astimezone()
-end = now.replace(hour=23, minute=59, second=59, microsecond=0)
-if end <= now + timedelta(seconds=30):
-    end += timedelta(days=1)
-print(end.isoformat())")
+from datetime import datetime, timedelta, timezone
+local = datetime.now().astimezone()
+behind = timezone(local.utcoffset() - timedelta(hours=4))
+print((local + timedelta(hours=2)).astimezone(behind).isoformat())")
   fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
 
   out=$(serve_rpc "$dir" products \
@@ -1345,6 +1347,102 @@ test_retired_refusals_name_the_live_head_of_the_chain() {
   pass "fm-memory-mcp: refusals point at the live head of a chain, never at a retired link"
 }
 
+test_a_dedupe_update_reports_the_row_it_actually_left_behind() {
+  local dir first second row tomorrow
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the dedupe-payload test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the dedupe-payload test"
+    return
+  fi
+  # The store's dedupe update keeps the higher importance, keeps the old
+  # veracity when this call says 'unknown', and COALESCEs valid_until - so the
+  # second caller asked for a permanent, low-importance, unknown memory and got
+  # someone else's. Echoing the request back would call that pinned and durable
+  # and leave the shelf life to surface as a refusal the next day.
+  dir="$TMP_ROOT/dedupe-payload"
+  mkdir -p "$dir"
+  tomorrow=$(python3 -c "from datetime import datetime, timedelta; print((datetime.now()+timedelta(days=1)).isoformat())")
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+
+  first=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_remember\",\"arguments\":{\"content\":\"The vendor contract runs out soon.\",\"project\":\"alpha\",\"importance\":0.9,\"veracity\":\"stated\",\"valid_until\":\"$tomorrow\"}}}" \
+    | tail -n 1)
+  first=$(tool_payload "$first")
+  [ "$(json_field "$first" "d['isError']")" = "False" ] || fail "the first write failed: $first"
+  first=$(json_field "$first" "d['payload']['id']")
+
+  second=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"The vendor contract runs out soon.","project":"alpha","importance":0.2}}}' \
+    | tail -n 1)
+  second=$(tool_payload "$second")
+  [ "$(json_field "$second" "d['isError']")" = "False" ] || fail "the re-assertion failed: $second"
+  [ "$(json_field "$second" "d['payload']['created']")" = "False" ] || fail "the re-assertion did not take the dedupe path: $second"
+  [ "$(json_field "$second" "d['payload']['id']")" = "$first" ] || fail "the dedupe path did not land on the first row: $second"
+
+  # What it reports has to be what the row holds, not what was just asked for.
+  [ "$(json_field "$second" "d['payload']['importance']")" = "0.9" ] \
+    || fail "the response echoed the requested importance instead of the row's: $second"
+  [ "$(json_field "$second" "d['payload']['veracity']")" = "stated" ] \
+    || fail "the response echoed the requested veracity instead of the row's: $second"
+  [ "$(json_field "$second" "d['payload']['valid_until']")" = "$tomorrow" ] \
+    || fail "a caller who asked for a permanent memory was not told the row expires: $second"
+
+  row=$(python3 - "$dir/banks/lane-products/mnemosyne.db" "$first" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+r = conn.execute("SELECT importance, veracity, valid_until FROM working_memory WHERE id = ?",
+                 (sys.argv[2],)).fetchone()
+print("|".join(str(x) for x in r))
+PY
+)
+  [ "$row" = "0.9|stated|$tomorrow" ] || fail "the reported state is not the stored state: $row"
+  pass "fm-memory-mcp: a dedupe update reports the row it actually left behind"
+}
+
+test_superseding_an_expired_target_is_refused_with_a_true_reason() {
+  local dir first out message
+  if ! library_available; then
+    echo "note: mnemosyne not importable under $(command -v python3); skipping the expired-target test" >&2
+    pass "fm-memory-mcp: mnemosyne not installed, skipping the expired-target test"
+    return
+  fi
+  # An expired memory carries no superseded_by and has no live rival, so a
+  # refusal that blames a discarded link and two live rows is describing a
+  # different memory than the one in front of it.
+  dir="$TMP_ROOT/expired-target"
+  mkdir -p "$dir"
+  fm_memory_mcp "$dir" provision --lane products >/dev/null || fail "provisioning failed"
+  first=$(serve_rpc "$dir" products \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_remember","arguments":{"content":"The staging cluster runs the old image.","project":"alpha"}}}' \
+    | tail -n 1)
+  first=$(json_field "$(tool_payload "$first")" "d['payload']['id']")
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_expire\",\"arguments\":{\"memory_id\":\"$first\"}}}" \
+    | tail -n 1)
+  [ "$(json_field "$(tool_payload "$out")" "d['isError']")" = "False" ] || fail "expire failed: $out"
+
+  out=$(serve_rpc "$dir" products \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_supersede\",\"arguments\":{\"memory_id\":\"$first\",\"content\":\"The staging cluster runs the new image.\",\"project\":\"alpha\"}}}" \
+    | tail -n 1)
+  out=$(tool_payload "$out")
+  [ "$(json_field "$out" "d['payload']['error']['code']")" = "supersede_target_retired" ] \
+    || fail "superseding an expired target was not refused: $out"
+  message=$(json_field "$out" "d['payload']['error']['message']")
+  case "$message" in
+    *"discard that link"*) fail "the refusal claimed a discarded link the expired memory does not have: $message" ;;
+    *) ;;
+  esac
+  case "$message" in
+    *"two live rows"*) fail "the refusal claimed a competing live row that does not exist: $message" ;;
+    *) ;;
+  esac
+  case "$message" in
+    *expired*) ;;
+    *) fail "the refusal did not say what is actually true of the target: $message" ;;
+  esac
+  pass "fm-memory-mcp: superseding an expired target is refused for the reason that is actually true"
+}
+
 test_preflight_refuses_missing_data_dir
 test_preflight_refuses_missing_bank
 test_preflight_refuses_unprovisioned_bank
@@ -1388,3 +1486,5 @@ test_a_valid_until_already_in_the_past_is_refused
 test_a_malformed_valid_until_is_refused
 test_a_non_canonical_shelf_life_is_recallable_not_dead_on_arrival
 test_retired_refusals_name_the_live_head_of_the_chain
+test_a_dedupe_update_reports_the_row_it_actually_left_behind
+test_superseding_an_expired_target_is_refused_with_a_true_reason

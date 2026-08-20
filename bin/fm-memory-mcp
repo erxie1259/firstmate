@@ -681,6 +681,19 @@ def write_memory(
     if not memory_id:
         raise BridgeError("write_failed", f"remember returned no id in lane {lane}")
     consolidated_at = pin_write(store, memory_id, memory_type)
+    # Report the row, not the request. The library's dedupe update keeps the
+    # higher importance, keeps the old veracity when this call says 'unknown',
+    # and COALESCEs valid_until - so a caller who asked for a permanent memory
+    # at importance 0.2 can land on a row that is 0.9, 'stated', and expires
+    # tomorrow. Echoing the arguments back would call that pinned and durable
+    # and leave the shelf life to be discovered by a refusal the next day.
+    stored = read_memory(store, memory_id)
+    if stored is None:
+        raise BridgeError(
+            "write_failed",
+            f"memory {memory_id} was written in lane {lane} but cannot be read back",
+            "Treat the write as failed; its stored state cannot be confirmed.",
+        )
     return {
         "status": "ok",
         "store_verified": True,
@@ -688,11 +701,12 @@ def write_memory(
         "created": memory_id != existing_id,
         "lane": lane,
         "bank": bank_for_lane(lane),
-        "channel_id": channel_id,
-        "scope": scope,
-        "veracity": veracity,
-        "memory_type": memory_type,
-        "importance": importance,
+        "channel_id": stored.get("channel_id"),
+        "scope": stored.get("scope"),
+        "veracity": stored.get("veracity"),
+        "memory_type": stored.get("memory_type"),
+        "importance": stored.get("importance"),
+        "valid_until": stored.get("valid_until"),
         "consolidated_at": consolidated_at,
         "pinned": True,
     }
@@ -1122,19 +1136,28 @@ class Bridge:
         if target is None:
             raise BridgeError("not_found", f"memory {memory_id} was not found in lane {lane}")
         target_retired = retired_state(target)
-        if target_retired:
+        if target_retired == "superseded":
             replacement = target.get("superseded_by")
             head = live_head(store, replacement)
             raise BridgeError(
                 "supersede_target_retired",
-                f"memory {memory_id} in lane {lane} was already {target_retired}"
-                + (f", replaced by memory {replacement}" if replacement else "")
-                + "; superseding it again would discard that link and leave two live rows claiming the same fact",
+                f"memory {memory_id} in lane {lane} was already superseded by memory {replacement}; "
+                f"superseding it again would discard that link and leave two live rows claiming the same fact",
                 (
                     f"Supersede {head} instead - that is the row still claimed to be true."
                     if head
-                    else "Nothing live replaces it; write this as a new memory instead."
+                    else f"Memory {replacement} is retired too, so nothing live claims this fact; "
+                    f"write the revision as a new memory."
                 ),
+            )
+        if target_retired:
+            raise BridgeError(
+                "supersede_target_retired",
+                f"memory {memory_id} in lane {lane} expired at {target.get('valid_until')} and nothing "
+                f"replaced it, so there is no live claim here to revise; superseding it would record a "
+                f"replacement for a memory this lane already stopped claiming",
+                "Write the fact as a new memory; nothing live is being revised, and this bridge does not "
+                "bring an expired memory back as a side effect.",
             )
         # Ask before writing: the store dedupes on (session_id, content), so
         # replacement content identical to the target would update that very row

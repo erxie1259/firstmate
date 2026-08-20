@@ -584,9 +584,93 @@ PY
     || fail "the learnings pointers were retired because their file could not be read"
   [ "$(live_pointer_rows "$dir" products)" = "1" ] \
     || fail "a lane with no derived pointers was emptied on an incomplete derivation"
-  [ "$(json_field "$out" "sorted(l['lane'] for l in d['skipped_reconciliation']['lanes'])")" \
+  [ "$(json_field "$out" "sorted(l['lane'] for l in d['skipped_reconciliation'])")" \
     = "['fleet-infra', 'products']" ] || fail "the run did not report which lanes it left alone: $out"
   pass "fm-memory-pointers: a derivation that reported problems retires nothing and names what it skipped"
+}
+
+test_an_emptied_canonical_file_retires_nothing_and_refuses() {
+  local home dir out status
+  skip_without_library "the emptied-canonical-file test" && return
+  home=$(make_home emptied-home)
+  dir=$(make_lanes emptied-dir shared fleet-infra products)
+  fm_pointers "$home" "$dir" write >/dev/null || fail "the first pointer run failed"
+
+  # Truncated mid-write, emptied by accident, restored from an empty backup:
+  # a readable file with nothing in it is indistinguishable from every section
+  # having been deleted. Retiring on that reading cannot be undone, because the
+  # bridge will not write text a retired row already holds, so the run refuses.
+  : > "$home/data/captain.md"
+
+  status=0
+  out=$(fm_pointers "$home" "$dir" write) || status=$?
+  [ "$status" -eq 1 ] || fail "an emptied canonical file exited $status, not 1"
+  [ "$(json_field "$out" "d['counts']['expired']")" = "0" ] \
+    || fail "an emptied canonical file retired pointers: $out"
+  [ "$(live_pointer_rows "$dir" shared)" = "2" ] \
+    || fail "the shared lane was emptied on the strength of an empty file"
+  [ "$(json_field "$out" "any('captain.md' in p for p in d['problems'])")" = "True" ] \
+    || fail "the emptied file was not reported as a problem: $out"
+  pass "fm-memory-pointers: a canonical file emptied to nothing is refused, never obeyed"
+}
+
+test_a_canonical_file_with_no_sections_retires_nothing_and_refuses() {
+  local home dir out status
+  skip_without_library "the sectionless-canonical-file test" && return
+  home=$(make_home sectionless-home)
+  dir=$(make_lanes sectionless-dir shared fleet-infra products)
+  fm_pointers "$home" "$dir" write >/dev/null || fail "the first pointer run failed"
+
+  # Present, readable, and full of prose, but restructured out of `## `
+  # headings: the derivation is empty for the same reason and costs the same.
+  cat > "$home/data/captain.md" <<'MD'
+# Captain preferences
+
+Everything here was reorganised and no longer uses second-level headings.
+MD
+
+  status=0
+  out=$(fm_pointers "$home" "$dir" write) || status=$?
+  [ "$status" -eq 1 ] || fail "a canonical file with no sections exited $status, not 1"
+  [ "$(json_field "$out" "d['counts']['expired']")" = "0" ] \
+    || fail "a file with no sections retired pointers: $out"
+  [ "$(live_pointer_rows "$dir" shared)" = "2" ] \
+    || fail "the shared lane was emptied by a file that merely lost its headings"
+  pass "fm-memory-pointers: a canonical file that derives no sections is refused, never obeyed"
+}
+
+test_a_ledger_from_another_home_reconciles_nothing() {
+  local home other dir out
+  skip_without_library "the mismatched-home test" && return
+  home=$(make_home ledger-home-a)
+  dir=$(make_lanes ledger-home-dir shared fleet-infra products)
+  fm_pointers "$home" "$dir" write >/dev/null || fail "the first pointer run failed"
+
+  # A second tree derives a complete, problem-free set of its own. Nothing it
+  # fails to produce was deleted - it was simply never this home's - so a run
+  # against it must not retire the first home's index.
+  other=$(make_home ledger-home-b)
+  python3 - "$other/data/captain.md" <<'PY'
+import sys
+open(sys.argv[1], "w").write(
+    "# Captain preferences\n\n## A different tree entirely\n\nIts own sections, its own facts.\n")
+PY
+
+  out=$(fm_pointers "$other" "$dir" write) || fail "the run from another home failed: $out"
+  [ "$(json_field "$out" "d['counts']['expired']")" = "0" ] \
+    || fail "a run from another home retired this home's pointers: $out"
+  [ "$(live_rows_claiming "$dir" shared "Chat is for outcomes only")" = "1" ] \
+    || fail "the first home's pointer was retired by a run from another tree"
+  [ "$(json_field "$out" "sorted({l['lane'] for l in d['skipped_reconciliation']})")" \
+    = "['shared']" ] || fail "the run did not report the lane it left alone: $out"
+  [ "$(json_field "$out" "all('ledger-home-a' in l['reason'] for l in d['skipped_reconciliation'])")" \
+    = "True" ] || fail "the report does not name the home the ledger belongs to: $out"
+  # And the first home still reconciles normally, so the binding is not a
+  # one-way lock on the ledger.
+  out=$(fm_pointers "$home" "$dir" write) || fail "the run from the original home failed: $out"
+  [ "$(json_field "$out" "'skipped_reconciliation' in d")" = "False" ] \
+    || fail "the original home was locked out of its own ledger: $out"
+  pass "fm-memory-pointers: a ledger written from another home reconciles nothing and says so"
 }
 
 test_two_sections_sharing_a_heading_keep_one_live_pointer_each() {
@@ -668,6 +752,19 @@ test_a_bridge_that_dies_midlane_still_reports_every_lane() {
   # disk, crashed after startup - and the run has to survive it: the pointers
   # that already landed stay counted, the stranded ones are named, and the
   # remaining lanes are still walked.
+  # A pointer written by an earlier run whose section is gone: the expiry half
+  # of this lane dies with the same bridge, and it has to be reported rather
+  # than left neither retired nor counted.
+  mkdir -p "$dir/banks/lane-shared"
+  cat > "$dir/banks/lane-shared/fm-memory-pointers.json" <<JSON
+{
+  "home": "$(cd "$home" && pwd -P)",
+  "pointers": {
+    "data/captain.md#Withdrawn": {"memory_id": "zzz", "canonical_sha": "9", "canonical_line": 2}
+  }
+}
+JSON
+
   stub="$TMP_ROOT/midlane-bridge.py"
   cat > "$stub" <<'PY'
 import json, sys
@@ -700,8 +797,9 @@ loader.exec_module(mod)
 mod.BRIDGE = Path(stub)
 
 pointers, problems = mod.derive(Path(home))
-result = mod.write_pointers(Path(home), Path(data_dir), pointers)
-print(json.dumps({"total": len(pointers), "problems": problems, **result}))
+result = mod.write_pointers(Path(home), Path(data_dir), pointers, problems)
+ledger, _ = mod.read_ledger(Path(data_dir), "shared")
+print(json.dumps({"total": len(pointers), "problems": problems, "ledger": ledger, **result}))
 PY
 ) || fail "a bridge dying mid-lane crashed the run: $out"
 
@@ -721,6 +819,15 @@ PY
   # the next run supersedes those rows rather than duplicating them.
   [ -f "$dir/banks/lane-shared/fm-memory-pointers.json" ] \
     || fail "a lane that failed mid-way lost the ledger for the pointer that landed"
+  # The stale pointer it could not retire is counted and named as an expiry
+  # refusal, apart from the writes that did not land.
+  [ "$(json_field "$out" "d['counts']['expiry_refused']")" = "1" ] \
+    || fail "the stale pointer the dead bridge could not retire was not counted: $out"
+  [ "$(json_field "$out" "sorted(k for r in d['refusals'] if r['kind'] == 'expiry' for k in r['keys'])")" \
+    = "['data/captain.md#Withdrawn']" ] \
+    || fail "the stale pointer was not reported apart from the write refusals: $out"
+  [ "$(json_field "$out" "'data/captain.md#Withdrawn' in d['ledger']")" = "True" ] \
+    || fail "the id needed to retire the stale pointer later was dropped: $out"
   pass "fm-memory-pointers: a bridge dying mid-lane costs its lane, never the run's counts"
 }
 
@@ -763,7 +870,7 @@ mod.BRIDGE = Path(stub)
 
 pointers, _ = mod.derive(Path(home))
 result = mod.write_pointers(Path(home), Path(data_dir), pointers)
-ledger = mod.read_ledger(Path(data_dir), "shared")
+ledger, _ = mod.read_ledger(Path(data_dir), "shared")
 print(json.dumps({"total": len(pointers), "ledger": ledger, **result}))
 PY
 ) || fail "a success carrying no memory id crashed the run: $out"
@@ -788,10 +895,13 @@ test_a_bridge_dying_during_reconciliation_counts_each_key_once() {
 
   # The ledger beside a bank is this tool's own persisted state, so a test can
   # seed one: two pointers written by an earlier run whose sections are gone.
-  cat > "$dir/banks/lane-shared/fm-memory-pointers.json" <<'JSON'
+  cat > "$dir/banks/lane-shared/fm-memory-pointers.json" <<JSON
 {
-  "data/captain.md#Gone one": {"memory_id": "aaa", "canonical_sha": "1", "canonical_line": 3},
-  "data/captain.md#Gone two": {"memory_id": "bbb", "canonical_sha": "2", "canonical_line": 9}
+  "home": "$(cd "$home" && pwd -P)",
+  "pointers": {
+    "data/captain.md#Gone one": {"memory_id": "aaa", "canonical_sha": "1", "canonical_line": 3},
+    "data/captain.md#Gone two": {"memory_id": "bbb", "canonical_sha": "2", "canonical_line": 9}
+  }
 }
 JSON
 
@@ -830,7 +940,7 @@ loader.exec_module(mod)
 mod.BRIDGE = Path(stub)
 
 result = mod.write_pointers(Path(home), Path(data_dir), [], [])
-ledger = mod.read_ledger(Path(data_dir), "shared")
+ledger, _ = mod.read_ledger(Path(data_dir), "shared")
 print(json.dumps({"ledger": sorted(ledger), **result}))
 PY
 ) || fail "a bridge dying during reconciliation crashed the run: $out"
@@ -882,6 +992,9 @@ test_deleting_the_first_of_two_same_heading_sections_keeps_the_survivor
 test_re_laning_a_project_retires_the_pointer_in_the_lane_it_left
 test_removing_a_lanes_last_project_retires_its_pointer
 test_an_incomplete_derivation_retires_nothing_and_says_so
+test_an_emptied_canonical_file_retires_nothing_and_refuses
+test_a_canonical_file_with_no_sections_retires_nothing_and_refuses
+test_a_ledger_from_another_home_reconciles_nothing
 test_two_sections_sharing_a_heading_keep_one_live_pointer_each
 test_a_lost_ledger_costs_a_duplicate_pointer_not_a_wrong_answer
 test_a_bridge_that_dies_midlane_still_reports_every_lane

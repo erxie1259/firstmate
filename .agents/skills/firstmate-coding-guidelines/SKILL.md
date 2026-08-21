@@ -3,7 +3,7 @@ name: firstmate-coding-guidelines
 description: >-
   Agent-only reference for changing firstmate's shared, tracked material per AGENTS.md section 1.
   Use before editing any of that material, whether working as firstmate directly or as a crewmate briefed on a firstmate-repo task.
-  Covers the knowledge-placement decision tree, the one-owner rule for contracts, the inline-stub pattern for content moved into a skill, AGENTS.md size discipline, trigger hygiene for new skills, and repo style rules (one sentence per line, plain dash, no agent co-author, shellcheck-clean bin scripts, colocated tests, and maintainer-verification evidence).
+  Covers the knowledge-placement decision tree, the one-owner rule for contracts, the inline-stub pattern for content moved into a skill, AGENTS.md size discipline, trigger hygiene for new skills, and repo style rules (one sentence per line, plain dash, no agent co-author, shellcheck-clean bin scripts that also run on stock macOS Bash 3.2, colocated tests, and maintainer-verification evidence).
 user-invocable: false
 metadata:
   internal: true
@@ -118,6 +118,11 @@ Run `bin/fm-doc-audience-check.sh`; it enforces classification, README setup rou
 - Plain dash `-`, never an em dash.
 - Never add an agent name as a commit co-author.
 - `bin/*.sh` and `bin/backends/*.sh` must pass `shellcheck`.
+- Every `bin/` script and `tests/` script must run on stock macOS Bash 3.2, the shell every Apple Silicon home actually uses.
+- That rules out `\uXXXX` inside Bash `$'...'` ANSI-C quoting, which 3.2 emits literally rather than resolving; write the literal glyph instead, and leave `\uXXXX` alone inside JS, jq, or JSON literals, where the consuming language resolves it.
+- It also requires `"${arr[@]+"${arr[@]}"}"` wherever an array can be empty under `set -u`.
+- Under `set -e` on 3.2 a failed `.` kills the shell outright, past `|| true` and past `if !`, so a sourced path must be guaranteed to exist or errexit must be disabled around the source; there is no guard form that catches it.
+- Conversely, 3.2 does not carry `set -e` into a compound-command redirection (`{ ...; } > file`) or into a command substitution, so build such output in memory and publish it with one simple command carrying an explicit failure branch.
 - Run `bin/fm-lint.sh` before treating a script change as done; it is the single owner of the lint definition (file set, config, and pinned shellcheck version) that CI and the no-mistakes pre-push gate both invoke, and it refuses to run under any other shellcheck version.
 - Colocate tests with the existing pattern in `tests/`, name them `<subject>.test.sh`, and extend an existing script rather than inventing a new runner.
 - Tests must exercise behavior through an executable or public interface and must never assert implementation-source bytes, including through parsers, regexes, snapshots, or indirect wrappers.

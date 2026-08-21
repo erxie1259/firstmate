@@ -98,6 +98,13 @@
 #   even when they select different backends. A fresh spawn first takes the
 #   per-home task-set lock and refuses rather than waits when forced teardown owns
 #   it; relaunch is exempt because the existing task's control lock covers it.
+#   Every spawn, fresh or relaunch, publishes state/<id>.meta by renaming a
+#   private temporary into place, so a truncated or unwritable record never
+#   becomes a live task: a failed publication aborts the spawn through the
+#   normal abort cleanup instead of printing the success line. A remote
+#   secondmate whose endpoint metadata cannot be staged or published fails the
+#   same way but leaves the remote route in place for reconciliation, because
+#   its agent is already running on the remote host.
 #   With no harness arg, a crewmate/scout spawn resolves the CREW harness only when
 #   config/crew-dispatch.json is absent. When that file exists, crewmate/scout
 #   spawns require an explicit harness so firstmate cannot silently skip dispatch
@@ -176,6 +183,9 @@
 # resolver because `cursor` is not the CLI name. A cursor SECONDMATE instead runs
 # the tracked project-scope .cursor/hooks.json in its own home, whose stop-hook
 # park owns that home's supervision (docs/supervision-protocols/cursor.md).
+# Either binding is an optional busy-detection sidecar, so a binding that cannot
+# be written warns loudly and leaves the spawn healthy; that task's busy state
+# then classifies unknown rather than idle.
 # On success prints: spawned <id> harness=<name> kind=<ship|scout|secondmate> [mode=<mode> yolo=<on|off>] window=<backend-target> worktree=<path>
 # A ship task records the explicit mode/yolo it was passed; a secondmate spawn records
 # mode=secondmate, yolo=off, home=, and projects=; a scout records neither, and both the
@@ -399,7 +409,7 @@ fi
 spawn_remote_secondmate() {
   local id=$1 remote host root home harness positional model effort backend out rc meta tmp
   local remote_backend remote_target remote_harness remote_herdr_session registry_lock remote_lock remote_generation
-  local remote_traceparent remote_recorded_traceparent
+  local remote_traceparent remote_recorded_traceparent meta_body
   local -a launch_args
   id=${POS[0]:-}
   fm_task_id_creation_valid "$id" || { echo "error: invalid task id" >&2; return 2; }
@@ -607,7 +617,7 @@ spawn_remote_secondmate() {
   remote_recorded_traceparent=$(printf '%s\n' "$out" | sed -n 's/^traceparent=//p' | tail -1)
   fm_trace_context_valid "$remote_recorded_traceparent" || remote_recorded_traceparent=
   tmp="$meta.tmp.$$"
-  {
+  meta_body=$(
     echo "window=remote:$id"
     echo "endpoint_task_id=$id"
     echo "worktree=$home"
@@ -627,8 +637,23 @@ spawn_remote_secondmate() {
     echo "remote_herdr_session=$remote_herdr_session"
     echo "remote_target=$remote_target"
     [ -z "$remote_recorded_traceparent" ] || echo "traceparent=$remote_recorded_traceparent"
-  } > "$tmp"
-  mv -f -- "$tmp" "$meta"
+  )
+  if ! printf '%s\n' "$meta_body" > "$tmp"; then
+    rm -f -- "$tmp"
+    fm_lock_release "$remote_lock" || true
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: remote secondmate $id launched, but its endpoint metadata could not be staged at $tmp; preserving the remote route for reconciliation" >&2
+    return 1
+  fi
+  if ! mv -f -- "$tmp" "$meta"; then
+    rm -f -- "$tmp"
+    fm_lock_release "$remote_lock" || true
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: remote secondmate $id launched, but its endpoint metadata could not be published at $meta; preserving the remote route for reconciliation" >&2
+    return 1
+  fi
   if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
     SPAWN_TASK_SET_LOCK_HELD=0
     fm_lock_release "$SPAWN_TASK_SET_LOCK"
@@ -691,7 +716,7 @@ parse_orca_worktree_result() {
 }
 
 spawn_abort_cleanup() {
-  local status=$?
+  local status=$? spawn_abort_lock_rc
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] \
      && [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] \
      && [ -n "$SPAWN_META_TMP" ] \
@@ -718,7 +743,19 @@ spawn_abort_cleanup() {
   fi
   if [ "$HERDR_PROJECTION_ABORT_CLEANUP" = 1 ] \
      && [ "$HERDR_PRESENTATION_ORDER_LOCK_HELD" != 1 ]; then
-    if ! spawn_herdr_presentation_order_lock_acquire "${HERDR_PROJECTION_ABORT_SESSION:-}"; then
+    # Best-effort, so it takes the adapter's short deadline rather than the
+    # contention budget: an operator who just interrupted a spawn is watching
+    # this run, and a multi-minute wait here reads as a hang. Losing the race
+    # only retains the projection journal for a later recovery.
+    spawn_abort_lock_rc=0
+    spawn_herdr_presentation_order_lock_acquire \
+      "${HERDR_PROJECTION_ABORT_SESSION:-}" \
+      "$(fm_backend_herdr_presentation_lock_best_effort_wait_attempts)" \
+      "before cleaning up the aborted projection of $ID" || spawn_abort_lock_rc=$?
+    if [ "$spawn_abort_lock_rc" -eq 2 ]; then
+      echo "warning: herdr presentation focus lock path could not be resolved; retaining the projection journal and refusing concurrent abort cleanup" >&2
+      HERDR_PROJECTION_ABORT_CLEANUP=0
+    elif [ "$spawn_abort_lock_rc" -ne 0 ]; then
       echo "warning: herdr presentation focus lock unavailable; retaining the projection journal and refusing concurrent abort cleanup" >&2
       HERDR_PROJECTION_ABORT_CLEANUP=0
     fi
@@ -790,21 +827,24 @@ trap spawn_abort_cleanup EXIT
 # One bounded lock per live Herdr session/socket, shared across all homes.
 # <session> is required so secondmate and primary spawns serialize against the
 # same session without writing any other home's state directory.
+# The wait budget is NOT defined here: bin/backends/herdr.sh owns the lock path
+# and the one budget derived from the longest legitimate hold, so this spawn,
+# fm-teardown.sh, and the adapter's own pane close cannot drift apart.
+# <attempts> is passed only by an acquirer whose deadline is deliberately
+# tighter than that contention budget.
+# Returns 2 when the lock PATH could not be resolved at all and 1 when the
+# lock itself stayed contended, so a caller reporting the refusal names the one
+# that actually happened rather than blaming contention for an unreachable
+# session or an unwritable namespace.
 spawn_herdr_presentation_order_lock_acquire() {
-  local session=${1:-} attempt lock_path
+  local session=${1:-} attempts=${2:-} waiting_for=${3:-} lock_path
   [ -n "$session" ] || session=$(fm_backend_herdr_session)
-  lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") || return 1
+  lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") || return 2
   HERDR_PRESENTATION_ORDER_LOCK="$lock_path"
-  attempt=0
-  while [ "$attempt" -lt 50 ]; do
-    if fm_lock_try_acquire "$HERDR_PRESENTATION_ORDER_LOCK"; then
-      HERDR_PRESENTATION_ORDER_LOCK_HELD=1
-      return 0
-    fi
-    sleep 0.1
-    attempt=$((attempt + 1))
-  done
-  return 1
+  fm_backend_herdr_presentation_lock_acquire_wait \
+    "$HERDR_PRESENTATION_ORDER_LOCK" "$attempts" "$waiting_for" || return 1
+  HERDR_PRESENTATION_ORDER_LOCK_HELD=1
+  return 0
 }
 
 clear_relaunch_harness_wiring() {
@@ -1906,7 +1946,8 @@ case "$BACKEND" in
           echo "error: herdr presentation recovery could not ensure its exact named session" >&2
           exit 1
         }
-        spawn_herdr_presentation_order_lock_acquire "$HERDR_SES" || {
+        spawn_herdr_presentation_order_lock_acquire "$HERDR_SES" "" \
+            "before resuming the interrupted presentation recovery of $ID" || {
           echo "error: herdr presentation recovery could not acquire its session lock; refusing a concurrent resume" >&2
           exit 1
         }
@@ -1951,7 +1992,8 @@ case "$BACKEND" in
         elif [ "${FM_BACKEND_HERDR_PRESENTATION_PREFERENCE:-default}" = default ] \
           && ! fm_backend_herdr_presentation_default_supported "$STATE" "$HERDR_SES"; then
           :
-        elif spawn_herdr_presentation_order_lock_acquire "$HERDR_SES"; then
+        elif spawn_herdr_presentation_order_lock_acquire "$HERDR_SES" "" \
+          "before projecting $ID into its parent workspace"; then
           # The projected child is placed and bound UNDER this launcher's exact
           # parent workspace. Its own herdr pane identity names that workspace
           # directly; the label lookup is only the fallback for a launcher with
@@ -2522,16 +2564,22 @@ EOF
       MUSE_SESSIONS_ROOT="${MUSE_DATA_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}}/muse/sessions"
       MUSE_BINDING_ID="$$.$RANDOM.$(date +%s)"
       rm -f "$STATE/$ID.muse-session-current"
-      {
+      MUSE_SIDECAR=$(
         printf 'sessions_root=%s\n' "$MUSE_SESSIONS_ROOT"
         printf 'workspace_root=%s\n' "$WT"
         printf 'binding_id=%s\n' "$MUSE_BINDING_ID"
         while IFS= read -r MUSE_PRIOR_LOG; do
-          [ -n "$MUSE_PRIOR_LOG" ] && printf 'prior_log=%s\n' "$MUSE_PRIOR_LOG"
+          if [ -n "$MUSE_PRIOR_LOG" ]; then
+            printf 'prior_log=%s\n' "$MUSE_PRIOR_LOG"
+          fi
         done <<EOF
 $(fm_busy_muse_matching_logs "$MUSE_SESSIONS_ROOT" "$WT" || true)
 EOF
-      } > "$STATE/$ID.muse-session"
+      )
+      printf '%s\n' "$MUSE_SIDECAR" > "$STATE/$ID.muse-session" || {
+        rm -f "$STATE/$ID.muse-session"
+        echo "warning: could not write the muse session binding at $STATE/$ID.muse-session; this task's busy state will classify unknown rather than idle" >&2
+      }
       ;;
     cursor*)
       # Cursor's turn lifecycle is neither a hook nor a launch flag: it writes
@@ -2545,7 +2593,7 @@ EOF
       # conversation instead of its predecessor's. The classifier then accepts
       # only one remaining conversation and never guesses between incarnations.
       CURSOR_PROJECTS_ROOT="${CURSOR_PROJECTS_ROOT_OVERRIDE:-$HOME/.cursor/projects}"
-      {
+      CURSOR_SIDECAR=$(
         printf 'projects_root=%s\n' "$CURSOR_PROJECTS_ROOT"
         printf 'workspace_root=%s\n' "$WT"
         if CURSOR_PRIOR_PROJECT=$(fm_busy_cursor_project_dir "$CURSOR_PROJECTS_ROOT" "$WT" 2>/dev/null); then
@@ -2554,7 +2602,11 @@ EOF
             printf 'prior_conversation=%s\n' "$(basename -- "${CURSOR_PRIOR_DIR%/}")"
           done
         fi
-      } > "$STATE/$ID.cursor-session"
+      )
+      printf '%s\n' "$CURSOR_SIDECAR" > "$STATE/$ID.cursor-session" || {
+        rm -f "$STATE/$ID.cursor-session"
+        echo "warning: could not write the cursor session binding at $STATE/$ID.cursor-session; this task's busy state will classify unknown rather than idle" >&2
+      }
       ;;
     kimi*)
       # Kimi's Stop hook is global, but it is inert unless cwd contains this
@@ -2628,6 +2680,9 @@ if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_META_LOCK_HELD=1
   SPAWN_META_TMP="$STATE/.$ID.meta.relaunch.${BASHPID:-$$}"
   SPAWN_META_PATH=$SPAWN_META_TMP
+else
+  SPAWN_META_TMP="$STATE/.$ID.meta.${BASHPID:-$$}"
+  SPAWN_META_PATH=$SPAWN_META_TMP
 fi
 preserve_relaunch_meta() {
   awk -F= '
@@ -2638,7 +2693,15 @@ preserve_relaunch_meta() {
     !($1 in owned)
   ' "$RELAUNCH_META"
 }
-{
+if [ "$RELAUNCH" -eq 1 ]; then
+  RELAUNCH_PRESERVED=$(preserve_relaunch_meta) || {
+    echo "error: cannot read existing task metadata at $RELAUNCH_META" >&2
+    exit 1
+  }
+else
+  RELAUNCH_PRESERVED=
+fi
+META_BODY=$(
   echo "window=$META_WINDOW"
   echo "endpoint_task_id=$ID"
   echo "worktree=$WT"
@@ -2680,13 +2743,38 @@ preserve_relaunch_meta() {
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
-  if [ "$RELAUNCH" -eq 1 ]; then
-    preserve_relaunch_meta
-  fi
+  [ -z "$RELAUNCH_PRESERVED" ] || printf '%s\n' "$RELAUNCH_PRESERVED"
   if [ "$SPAWN_CONTROL_PARENT" = 1 ] && [ -n "${FM_CONTROL_RELAUNCH_TX:-}" ]; then
     echo "control_relaunch_tx=$FM_CONTROL_RELAUNCH_TX"
   fi
-} > "$SPAWN_META_PATH"
+)
+# The body is assembled in memory first so that publishing it is ONE simple
+# command: stock macOS Bash 3.2 does not treat a failed redirection on a
+# compound command as a fatal errexit condition, nor does it carry errexit into
+# a command substitution, so a `{ ... } > "$path"` block let both an
+# unwritable path and a mid-block write failure publish nothing or a truncated
+# record while the spawn printed its success line and exited 0, leaking the
+# backend's terminal and worktree past the abort cleanup this exit restores.
+# A simple command's redirection failure IS observable through `||` on 3.2, and
+# every failure mode of the assembly above now has its own explicit branch.
+# The body always lands in a private temporary first and is renamed into place,
+# so a write that fails PART WAY - ENOSPC, quota, EIO - leaves the truncated
+# record where the abort cleanup already removes it rather than publishing a
+# live task whose worktree= and tasktmp= a reader would resolve as empty.
+printf '%s\n' "$META_BODY" > "$SPAWN_META_PATH" || {
+  echo "error: cannot publish task metadata at $STATE/$ID.meta" >&2
+  exit 1
+}
+# `mv` moves its source INTO an existing directory rather than failing, so a
+# metadata path occupied by a directory would quietly land the record at
+# state/<id>.meta/<temporary name> and let the spawn print its success line
+# while no reader can resolve the task. The rename is only atomic over a file
+# or a missing path, so refuse anything else here and let the abort cleanup
+# release the backend's terminal and worktree.
+if [ -d "$STATE/$ID.meta" ]; then
+  echo "error: cannot publish task metadata at $STATE/$ID.meta: Is a directory" >&2
+  exit 1
+fi
 if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_META_PUBLISH_STARTED=1
   mv -f "$SPAWN_META_TMP" "$STATE/$ID.meta"
@@ -2695,6 +2783,12 @@ if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_META_TMP=
   fm_lock_release "$SPAWN_META_LOCK"
   SPAWN_META_LOCK_HELD=0
+else
+  mv -f "$SPAWN_META_TMP" "$STATE/$ID.meta" || {
+    echo "error: cannot publish task metadata at $STATE/$ID.meta" >&2
+    exit 1
+  }
+  SPAWN_META_TMP=
 fi
 if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
   # The record is published, so this task is now part of the set a teardown

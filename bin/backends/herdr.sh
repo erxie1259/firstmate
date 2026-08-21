@@ -752,6 +752,71 @@ fm_backend_herdr_presentation_session_lock_path() {  # <session>
   printf '%s/order-%s.lock' "$dir" "$key"
 }
 
+# fm_backend_herdr_presentation_lock_wait_attempts: the ONE budget every
+# acquirer of the lock above waits with, owned here beside the lock path
+# itself so spawn, teardown, and the pane close cannot drift apart.
+# A projected spawn holds the lock from before its workspace exists until
+# after the harness launch, and that span contains the worktree-discovery
+# poll's full 60 one-second rounds, so the budget is derived from that longest
+# legitimate hold rather than picked: 1800 rounds, comfortably past the ~90s
+# worst case. A round is one fm_lock_try_acquire arbitration PLUS the 0.1s
+# sleep, not 0.1s, so measured wall clock runs about 2.6x the nominal round
+# math: 1800 rounds is roughly 470s in practice, not the 180s the round count
+# alone suggests. It stays BOUNDED on purpose, so a genuinely wedged holder
+# still refuses loudly instead of hanging its acquirer forever.
+# The override exists so a contention test can prove the bounded-refusal
+# contract against a real live holder without paying the production budget in
+# wall clock; a malformed or non-positive value falls back to the derived one.
+fm_backend_herdr_presentation_lock_wait_attempts() {
+  local attempts=${FM_HERDR_PRESENTATION_LOCK_WAIT_ATTEMPTS:-}
+  case "$attempts" in
+    ''|*[!0-9]*) attempts=1800 ;;
+  esac
+  [ "$attempts" -gt 0 ] || attempts=1800
+  printf '%s' "$attempts"
+}
+
+# fm_backend_herdr_presentation_lock_best_effort_wait_attempts: the deadline
+# for an acquirer whose result is discarded, so it must not inherit the
+# contention budget above.
+# A best-effort close on a scheduled sweep or an interrupted spawn's cleanup
+# has nothing to gain from outlasting a legitimate hold - it only makes a
+# periodic sweep or a Ctrl-C read as a hang - so it gives up after 50 rounds
+# and leaves the work to the correctness-critical acquirer that follows. Each
+# round is a lock arbitration plus the 0.1s sleep, so that measures at roughly
+# 13s of wall clock against a live holder rather than the 5s the round count
+# alone suggests.
+fm_backend_herdr_presentation_lock_best_effort_wait_attempts() {
+  printf '%s' 50
+}
+
+# fm_backend_herdr_presentation_lock_acquire_wait: poll for the session
+# presentation lock within the shared budget. An explicit <attempts> is for an
+# acquirer whose own deadline is deliberately tighter than the contention
+# budget, such as a discarded best-effort close.
+# <waiting-for> makes a long wait legible: the notice is emitted once, and
+# only after the first try has actually failed, so an uncontended acquire stays
+# silent and a caller that never reaches the poll never announces a wait that
+# did not happen. The seconds it announces are measured wall clock, about 2.6x
+# the nominal round math, so the operator-visible number matches the wait the
+# budgets above document rather than understating it.
+fm_backend_herdr_presentation_lock_acquire_wait() {  # <lock-path> [attempts] [waiting-for]
+  local lock_path=$1 attempts=${2:-} waiting_for=${3:-} attempt=0
+  [ -n "$lock_path" ] || return 1
+  [ -n "$attempts" ] || attempts=$(fm_backend_herdr_presentation_lock_wait_attempts)
+  while [ "$attempt" -lt "$attempts" ]; do
+    if fm_lock_try_acquire "$lock_path"; then
+      return 0
+    fi
+    if [ "$attempt" -eq 0 ] && [ -n "$waiting_for" ]; then
+      echo "waiting up to $((attempts * 26 / 100))s for the contended herdr session presentation lock $waiting_for" >&2
+    fi
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
 # fm_backend_herdr_projection_focus_snapshot: print the exact active
 # workspace and tab ids as one tab-separated record.
 # Presentation mutations use this read-only snapshot as their sole focus
@@ -2861,20 +2926,20 @@ fm_backend_herdr_kill_serialized() {  # <session> <pane>
 fm_backend_herdr_kill() {  # <target>
   fm_backend_herdr_target_ready "$1" || return 0
   local session=$FM_BACKEND_HERDR_SESSION pane=$FM_BACKEND_HERDR_PANE
-  local lock_path attempt=0 lock_held=0
+  local lock_path lock_held=0
   if ! declare -F fm_lock_try_acquire >/dev/null 2>&1; then
     # shellcheck source=bin/fm-wake-lib.sh
     . "$FM_BACKEND_HERDR_ROOT/bin/fm-wake-lib.sh"
   fi
   if lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session"); then
-    while [ "$attempt" -lt 50 ]; do
-      if fm_lock_try_acquire "$lock_path"; then
-        lock_held=1
-        break
-      fi
-      sleep 0.1
-      attempt=$((attempt + 1))
-    done
+    # Best-effort: every caller discards this function's result, and
+    # bin/fm-bootstrap.sh reaches it once per dead secondmate endpoint on a
+    # scheduled sweep, so it must not pay the full contention budget.
+    if fm_backend_herdr_presentation_lock_acquire_wait "$lock_path" \
+        "$(fm_backend_herdr_presentation_lock_best_effort_wait_attempts)" \
+        "before closing the task pane of $session"; then
+      lock_held=1
+    fi
   fi
   if [ "$lock_held" = 1 ]; then
     fm_backend_herdr_kill_serialized "$session" "$pane"

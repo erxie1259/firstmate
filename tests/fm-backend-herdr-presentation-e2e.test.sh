@@ -388,6 +388,21 @@ spawn_task() {  # <id> <home> <project>
     "$ROOT/bin/fm-spawn.sh" "$id" "$project" "sh -c 'sleep 120'" --mode no-mistakes --yolo off --backend herdr
 }
 
+# The contention cases below hold the real session presentation lock from a
+# live process, so there is no stale-steal shortcut and the spawn must exhaust
+# its whole acquire budget before it can fall back flat. Exercising the refusal
+# is the point; paying the production 1800-round budget - roughly 470s of wall
+# clock, since each round is a lock arbitration plus its 0.1s sleep - twice is
+# not.
+# The budget is injected through the one override the adapter owns, so the
+# contention, the acquire loop, and the flat-fallback assertion are all the
+# real ones - only the deadline is shortened.
+CONTENDED_LOCK_WAIT_ATTEMPTS=20
+spawn_task_under_held_lock() {  # <id> <home> <project>
+  FM_HERDR_PRESENTATION_LOCK_WAIT_ATTEMPTS="$CONTENDED_LOCK_WAIT_ATTEMPTS" \
+    spawn_task "$@"
+}
+
 finish_concurrent_spawn() {  # <id> <status> <stdout> <stderr>
   local id=$1 status=$2 out=$3 err=$4
   [ "$status" -ne 0 ] || return 0
@@ -700,7 +715,7 @@ while [ ! -e "$LOCK_CONTENTION_READY" ] && kill -0 "$LOCK_CONTENTION_OWNER_PID" 
 LOCK_CONTENTION_START=$(log_line_count)
 LOCK_CONTENTION_FOCUS_START=$(focus_audit_line_count)
 LOCK_CONTENTION_MOVE_START=$(wc -l < "$MOVE_CALL_LOG" | tr -d '[:space:]')
-if spawn_task lock-contended "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/lock-contended.out" 2> "$TMP_ROOT/lock-contended.err"; then
+if spawn_task_under_held_lock lock-contended "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/lock-contended.out" 2> "$TMP_ROOT/lock-contended.err"; then
   LOCK_CONTENTION_STATUS=0
 else
   LOCK_CONTENTION_STATUS=$?
@@ -712,6 +727,12 @@ LOCK_CONTENTION_OWNER_PID=
   || fail "bounded presentation lock contention did not fall back to a successful flat spawn: $(cat "$TMP_ROOT/lock-contended.err")"
 grep -F "presentation focus lock unavailable; using the ordinary flat layout without projection" "$TMP_ROOT/lock-contended.err" >/dev/null 2>&1 \
   || fail "bounded presentation lock contention did not warn about flat fallback"
+# The notice announces MEASURED wall clock, not the nominal round count: a
+# round is one lock arbitration plus the 0.1s sleep, so the injected 20-round
+# budget is about 5s and not the 2s the round math alone suggests.
+grep -F "waiting up to 5s for the contended herdr session presentation lock before projecting lock-contended into its parent workspace" \
+  "$TMP_ROOT/lock-contended.err" >/dev/null 2>&1 \
+  || fail "bounded presentation lock contention did not announce its measured wall-clock wait"
 LOCK_CONTENTION_META="$HOME_DIR/state/lock-contended.meta"
 remember_meta_worktree "$LOCK_CONTENTION_META" >/dev/null
 LOCK_CONTENTION_WSID=$(grep '^herdr_workspace_id=' "$LOCK_CONTENTION_META" | cut -d= -f2-)
@@ -1123,7 +1144,7 @@ while [ ! -e "$CROSS_LOCK_READY" ] && kill -0 "$CROSS_LOCK_PID" 2>/dev/null; do 
 [ -e "$CROSS_LOCK_READY" ] || fail "could not hold the cross-home session presentation lock"
 mkdir -p "$SECOND_HOME_A/data/aflat"
 printf 'Flat fallback under session lock contention.\n' > "$SECOND_HOME_A/data/aflat/brief.md"
-if spawn_task aflat "$SECOND_HOME_A" "$PROJECT_DIR" > "$TMP_ROOT/aflat.out" 2> "$TMP_ROOT/aflat.err"; then
+if spawn_task_under_held_lock aflat "$SECOND_HOME_A" "$PROJECT_DIR" > "$TMP_ROOT/aflat.out" 2> "$TMP_ROOT/aflat.err"; then
   AFLAT_STATUS=0
 else
   AFLAT_STATUS=$?

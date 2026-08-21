@@ -13,6 +13,25 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# copy_renamed_executable <src> <dst>: put a RUNNABLE copy of <src> at <dst>.
+# Every detection case below needs a real process whose name is the fixture's,
+# which means copying an interpreter under that name. On Apple Silicon macOS the
+# system Bash is platform-signed and its signature does not survive a plain
+# copy: the copy is SIGKILLed by AMFI the instant it execs, so the probe never
+# runs and the case reports an empty verdict - a false negative for the positive
+# case and a vacuous pass for the anchored-negative one. Re-sign the copy ad hoc
+# where codesign exists, then prove the copy actually runs before any case
+# depends on it. Linux needs neither step.
+copy_renamed_executable() {  # <src> <dst>
+  local src=$1 dst=$2
+  cp "$src" "$dst" || fail "fixture: cannot copy $src to $dst"
+  if command -v codesign >/dev/null 2>&1; then
+    codesign --force --sign - "$dst" >/dev/null 2>&1 || true
+  fi
+  "$dst" -c ':' >/dev/null 2>&1 \
+    || fail "fixture: the renamed copy $dst does not run; every case using it would be vacuous"
+}
+
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 HARNESS="$ROOT/bin/fm-harness.sh"
@@ -97,7 +116,7 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  cp "$(command -v bash)" "$fakebin/muse-bin-test-version"
+  copy_renamed_executable "$(command -v bash)" "$fakebin/muse-bin-test-version"
   cat > "$fakebin/muse" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -166,7 +185,7 @@ test_detects_versioned_process_ancestor() {
   dir="$TMP_ROOT/detect"
   mkdir -p "$dir"
   for bin in muse-bin-0.1.0-R708.1 muse-bin-9.9.9-RZZZ.9 muse; do
-    cp "$(command -v bash)" "$dir/$bin"
+    copy_renamed_executable "$(command -v bash)" "$dir/$bin"
     out=$(env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT \
       "$dir/$bin" -c "r=\$(\"$HARNESS\"); printf '%s' \"\$r\"")
     [ "$out" = muse ] || fail "fm-harness.sh under process '$bin' reported '$out', expected muse"
@@ -181,7 +200,7 @@ test_detection_is_anchored() {
   dir="$TMP_ROOT/detect-neg"
   mkdir -p "$dir"
   for bin in musescore amuse notmuse-bin muse-binary muse-bind; do
-    cp "$(command -v bash)" "$dir/$bin"
+    copy_renamed_executable "$(command -v bash)" "$dir/$bin"
     out=$(env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT \
       "$dir/$bin" -c "r=\$(\"$HARNESS\"); printf '%s' \"\$r\"")
     [ "$out" != muse ] || fail "fm-harness.sh misdetected unrelated process '$bin' as muse"

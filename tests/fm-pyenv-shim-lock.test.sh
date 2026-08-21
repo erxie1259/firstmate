@@ -296,6 +296,34 @@ test_a_rehash_older_than_its_lock_is_refused_however_long_it_runs() {
   pass "a rehash that predates its lock keeps holding it however long it has been running"
 }
 
+# An unreadable process table must not cost the tool its primary path. A lock
+# well past the staleness threshold is decided by its age alone, so it is still
+# cleared when `ps` cannot be consulted; a young lock, whose verdict genuinely
+# needs the process table, must still refuse to guess.
+test_an_unreadable_process_table_still_clears_a_stale_lock() {
+  local out status
+  read_case "$(make_case ps-unreadable)"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$CASE_DIR/ps-broken"
+  chmod +x "$CASE_DIR/ps-broken"
+  PS_WRAPPER="$CASE_DIR/ps-broken"
+  write_lock 'body' old
+  out=$(run_clear)
+  status=$?
+  expect_code 0 "$status" "a long-orphaned lock must still be cleared when the process table cannot be read"
+  assert_contains "$out" "cleared orphaned pyenv rehash lock" \
+    "an unreadable process table blocked the fault this tool exists for"
+  assert_absent "$LOCK" "the long-orphaned lock survived an unreadable process table"
+
+  write_lock 'body'
+  out=$(run_clear)
+  status=$?
+  expect_code 1 "$status" "a young lock with no readable process table must refuse to guess"
+  assert_contains "$out" "cannot tell whether a pyenv rehash is running" \
+    "the refusal did not name the reason"
+  assert_present "$LOCK" "a young lock was cleared without any evidence about running rehashes"
+  pass "an unreadable process table still clears a stale lock but never a young one"
+}
+
 # The narrow surface is the reason this command can be allowlisted at all: it
 # must never become a general file mover.
 test_arguments_are_refused() {
@@ -334,6 +362,7 @@ test_a_command_line_mention_is_not_a_holder
 test_a_stale_lock_is_cleared_even_while_waiters_run
 test_a_young_lock_with_a_waiting_rehash_is_cleared
 test_a_rehash_older_than_its_lock_is_refused_however_long_it_runs
+test_an_unreadable_process_table_still_clears_a_stale_lock
 test_arguments_are_refused
 test_an_unexpected_file_type_is_refused
 

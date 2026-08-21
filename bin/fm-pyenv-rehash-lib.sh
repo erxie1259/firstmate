@@ -227,11 +227,16 @@ fm_pyenv_rehash_pids() {
 # Every unprovable case keeps the process in the set so the caller refuses: an
 # unreadable elapsed time, an unreadable lock mtime, and any difference inside
 # FM_PYENV_REHASH_START_SLACK_SECS.
+#
+# The clock is read BEFORE the scan and the mtime after it, so neither the time
+# the scan takes nor a rewrite of the lock during it can push a derived start
+# past the lock. Both reads therefore err toward keeping a process in the set,
+# which keeps the slack a bound rather than an assumption about scan latency.
 fm_pyenv_rehash_live_pids() {  # <lock-path>
   local scanned mtime now
+  now=$(date +%s) || now=""
   scanned=$(fm_pyenv_rehash_scan) || return 1
   mtime=$(fm_pyenv_mtime "${1:-}") || mtime=""
-  now=$(date +%s) || now=""
   if [ -z "$mtime" ] || [ -z "$now" ]; then
     printf '%s' "$scanned" | awk -F '\t' 'NF { print $1 }'
     return 0
@@ -271,20 +276,22 @@ fm_pyenv_pid_has_ancestor() {  # <pid> <ancestor> [rows]
 #
 # The rule, in one place: a lock older than FM_PYENV_REHASH_STALE_SECS is
 # orphaned no matter which rehash processes are alive, since an ordinary rehash
-# cycle finishes far inside that. A younger lock is live only while a process
-# that could actually be its holder exists, which fm_pyenv_rehash_live_pids
-# decides from the lock's own mtime; when none does, the young lock is re-sampled
-# once after a short settle before being called orphaned, so a rehash that
-# started between the two reads is not stepped on.
+# cycle finishes far inside that. Age alone settles that case, so it is decided
+# before any process is looked at and an unreadable process table cannot turn
+# the fault this tool exists for into `unknown`. A younger lock is live only
+# while a process that could actually be its holder exists, which
+# fm_pyenv_rehash_live_pids decides from the lock's own mtime; when none does,
+# the young lock is re-sampled once after a short settle before being called
+# orphaned, so a rehash that started between the two reads is not stepped on.
 fm_pyenv_shim_lock_state() {  # <lock-path>
   local lock=$1 age pids
   [ -e "$lock" ] || { printf 'absent\n'; return 0; }
   age=$(fm_pyenv_shim_lock_age_seconds "$lock") || { printf 'unknown\n'; return 0; }
-  pids=$(fm_pyenv_rehash_live_pids "$lock") || { printf 'unknown\n'; return 0; }
   if [ "$age" -ge "$FM_PYENV_REHASH_STALE_SECS" ]; then
     printf 'orphaned\n'
     return 0
   fi
+  pids=$(fm_pyenv_rehash_live_pids "$lock") || { printf 'unknown\n'; return 0; }
   if [ -n "$pids" ]; then
     printf 'live %s\n' "$(printf '%s\n' "$pids" | head -1)"
     return 0

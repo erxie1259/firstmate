@@ -78,9 +78,11 @@ fm_pyenv_shim_lock_age_seconds() {  # <path>
   printf '%s\n' "$age"
 }
 
-# fm_pyenv_process_rows: one `pid<TAB>ppid<TAB>argv0<TAB>argv1` row per process.
-# Taken once per classification so every question below is answered from the same
-# snapshot rather than racing separate `ps` calls against each other.
+# fm_pyenv_process_rows: one `pid<TAB>ppid<TAB>etime<TAB>argv0<TAB>argv1` row per
+# process. Taken once per classification so every question below is answered from
+# the same snapshot rather than racing separate `ps` calls against each other -
+# including how long each process has been running, which is why the elapsed-time
+# column is part of this one read rather than a per-pid `ps` of its own.
 # A shell path containing a space would split wrong and simply fail to match,
 # which loses a detection rather than inventing one.
 fm_pyenv_process_rows() {
@@ -88,9 +90,54 @@ fm_pyenv_process_rows() {
   command -v "$ps_bin" >/dev/null 2>&1 || return 1
   # Captured before awk sees it: a pipeline would report awk's status and turn an
   # unreadable process table into a confident empty answer.
-  raw=$("$ps_bin" -axo pid=,ppid=,args= 2>/dev/null) || return 1
+  raw=$("$ps_bin" -axo pid=,ppid=,etime=,args= 2>/dev/null) || return 1
   [ -n "$raw" ] || return 1
-  printf '%s\n' "$raw" | awk '{ printf "%s\t%s\t%s\t%s\n", $1, $2, $3, $4 }'
+  printf '%s\n' "$raw" | awk '{ printf "%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4, $5 }'
+}
+
+# fm_pyenv_etime_seconds: <etime> in whole seconds, parsing the [[dd-]hh:]mm:ss
+# form both BSD and GNU `ps` print. Status 1 means the value could not be read at
+# all, which callers must treat as "cannot prove anything about this process"
+# rather than as an age of zero.
+fm_pyenv_etime_seconds() {  # <etime>
+  local e=$1 days=0 rest h=0 m=0 s part
+  case "$e" in
+    ''|*[!0-9:-]*) return 1 ;;
+  esac
+  case "$e" in
+    *-*) days=${e%%-*}; rest=${e#*-} ;;
+    *) rest=$e ;;
+  esac
+  case "$rest" in
+    *:*:*)
+      h=${rest%%:*}
+      m=${rest#*:}; m=${m%%:*}
+      s=${rest##*:}
+      ;;
+    *:*)
+      m=${rest%%:*}
+      s=${rest#*:}
+      ;;
+    *) s=$rest ;;
+  esac
+  for part in "$days" "$h" "$m" "$s"; do
+    case "$part" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+  done
+  printf '%s\n' "$(( ((10#$days * 24 + 10#$h) * 60 + 10#$m) * 60 + 10#$s ))"
+}
+
+# fm_pyenv_rehash_timeout_secs: pyenv's own PYENV_REHASH_TIMEOUT, which is how
+# long a rehash waits for the lock before giving up. Defaults to pyenv's own
+# default of 60; an unusable value falls back to it rather than being trusted.
+fm_pyenv_rehash_timeout_secs() {
+  local t=${PYENV_REHASH_TIMEOUT:-60}
+  case "$t" in
+    ''|*[!0-9]*) t=60 ;;
+  esac
+  [ "$t" -gt 0 ] || t=60
+  printf '%s\n' "$t"
 }
 
 # fm_pyenv_is_shell_argv0: <argv0> names a recognized interactive-or-script shell.
@@ -127,17 +174,18 @@ fm_pyenv_ancestry() {  # <pid> <rows>
   done
 }
 
-# fm_pyenv_rehash_live_pids: pids of every genuine live pyenv-rehash process,
-# excluding this process and its ancestors. Empty output with status 0 means
-# none; status 1 means the process table could not be read at all, which is a
+# fm_pyenv_rehash_scan: one `pid<TAB>elapsed-seconds` row for every genuine live
+# pyenv-rehash process, holder or waiter, excluding this process and its
+# ancestors. The elapsed field is empty when `ps` gave no readable time for that
+# process. Status 1 means the process table could not be read at all, which is a
 # refusal to guess rather than an answer of "none".
-fm_pyenv_rehash_live_pids() {
-  local rows exclude pid argv0 argv1
+fm_pyenv_rehash_scan() {
+  local rows exclude pid etime argv0 argv1 elapsed
   rows=$(fm_pyenv_process_rows) || return 1
   exclude=$(fm_pyenv_ancestry "$$" "$rows")
   # Field 2 is the parent pid, needed by the ancestry walks that share these
   # rows but not here, so it is read into the throwaway and left unnamed.
-  while IFS=$'\t' read -r pid _ argv0 argv1; do
+  while IFS=$'\t' read -r pid _ etime argv0 argv1; do
     [ -n "${argv1:-}" ] || continue
     [ "${argv1##*/}" = pyenv-rehash ] || continue
     fm_pyenv_is_shell_argv0 "$argv0" || continue
@@ -145,10 +193,44 @@ fm_pyenv_rehash_live_pids() {
     # path, but only a real invocation has argv1 pointing at the executable file.
     [ -f "$argv1" ] && [ -x "$argv1" ] || continue
     printf '%s\n' "$exclude" | grep -qx -- "$pid" && continue
-    printf '%s\n' "$pid"
+    elapsed=$(fm_pyenv_etime_seconds "${etime:-}") || elapsed=""
+    printf '%s\t%s\n' "$pid" "$elapsed"
   done <<EOF
 $rows
 EOF
+}
+
+# fm_pyenv_rehash_pids: pids of every genuine live pyenv-rehash process, whether
+# it holds the lock or is only waiting for it. This is the raw "a real rehash is
+# running here" question, which is what a blocked terminal's diagnosis asks.
+fm_pyenv_rehash_pids() {
+  local scanned
+  scanned=$(fm_pyenv_rehash_scan) || return 1
+  printf '%s' "$scanned" | awk -F '\t' 'NF { print $1 }'
+}
+
+# fm_pyenv_rehash_live_pids: pids of every genuine live pyenv-rehash process that
+# could still be HOLDING the lock. This is the holder set, and it is the only
+# place that knows the waiter rule; every consumer inherits it from here.
+#
+# Why long-lived rehash processes are dropped, which SHARPENS this identity
+# rather than loosening it: pyenv's own acquire loop gives up after
+# PYENV_REHASH_TIMEOUT, so a rehash process that has itself been running longer
+# than that has by pyenv's own contract already stopped trying to take the lock -
+# it is a waiter, and it can never be the holder. A rehash that genuinely just
+# started still blocks any clear, exactly as before. An unreadable elapsed time
+# proves nothing, so such a process stays in the holder set and clearing is
+# refused, which is the safe direction.
+fm_pyenv_rehash_live_pids() {
+  local scanned timeout
+  scanned=$(fm_pyenv_rehash_scan) || return 1
+  timeout=$(fm_pyenv_rehash_timeout_secs)
+  printf '%s' "$scanned" | awk -F '\t' -v t="$timeout" '
+    NF {
+      if ($2 != "" && $2 + 0 > t + 0) next
+      print $1
+    }
+  '
 }
 
 # fm_pyenv_pid_has_ancestor: <pid> is <ancestor> or descends from it, bounded the

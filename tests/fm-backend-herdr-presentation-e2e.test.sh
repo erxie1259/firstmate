@@ -727,6 +727,12 @@ LOCK_CONTENTION_OWNER_PID=
   || fail "bounded presentation lock contention did not fall back to a successful flat spawn: $(cat "$TMP_ROOT/lock-contended.err")"
 grep -F "presentation focus lock unavailable; using the ordinary flat layout without projection" "$TMP_ROOT/lock-contended.err" >/dev/null 2>&1 \
   || fail "bounded presentation lock contention did not warn about flat fallback"
+# The notice announces MEASURED wall clock, not the nominal round count: a
+# round is one lock arbitration plus the 0.1s sleep, so the injected 20-round
+# budget is about 5s and not the 2s the round math alone suggests.
+grep -F "waiting up to 5s for the contended herdr session presentation lock before projecting lock-contended into its parent workspace" \
+  "$TMP_ROOT/lock-contended.err" >/dev/null 2>&1 \
+  || fail "bounded presentation lock contention did not announce its measured wall-clock wait"
 LOCK_CONTENTION_META="$HOME_DIR/state/lock-contended.meta"
 remember_meta_worktree "$LOCK_CONTENTION_META" >/dev/null
 LOCK_CONTENTION_WSID=$(grep '^herdr_workspace_id=' "$LOCK_CONTENTION_META" | cut -d= -f2-)

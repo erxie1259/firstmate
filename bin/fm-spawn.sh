@@ -2670,6 +2670,9 @@ if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_META_LOCK_HELD=1
   SPAWN_META_TMP="$STATE/.$ID.meta.relaunch.${BASHPID:-$$}"
   SPAWN_META_PATH=$SPAWN_META_TMP
+else
+  SPAWN_META_TMP="$STATE/.$ID.meta.${BASHPID:-$$}"
+  SPAWN_META_PATH=$SPAWN_META_TMP
 fi
 preserve_relaunch_meta() {
   awk -F= '
@@ -2744,8 +2747,12 @@ META_BODY=$(
 # backend's terminal and worktree past the abort cleanup this exit restores.
 # A simple command's redirection failure IS observable through `||` on 3.2, and
 # every failure mode of the assembly above now has its own explicit branch.
+# The body always lands in a private temporary first and is renamed into place,
+# so a write that fails PART WAY - ENOSPC, quota, EIO - leaves the truncated
+# record where the abort cleanup already removes it rather than publishing a
+# live task whose worktree= and tasktmp= a reader would resolve as empty.
 printf '%s\n' "$META_BODY" > "$SPAWN_META_PATH" || {
-  echo "error: cannot publish task metadata at $SPAWN_META_PATH" >&2
+  echo "error: cannot publish task metadata at $STATE/$ID.meta" >&2
   exit 1
 }
 if [ "$RELAUNCH" -eq 1 ]; then
@@ -2756,6 +2763,12 @@ if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_META_TMP=
   fm_lock_release "$SPAWN_META_LOCK"
   SPAWN_META_LOCK_HELD=0
+else
+  mv -f "$SPAWN_META_TMP" "$STATE/$ID.meta" || {
+    echo "error: cannot publish task metadata at $STATE/$ID.meta" >&2
+    exit 1
+  }
+  SPAWN_META_TMP=
 fi
 if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
   # The record is published, so this task is now part of the set a teardown

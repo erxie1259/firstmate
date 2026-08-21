@@ -752,6 +752,45 @@ fm_backend_herdr_presentation_session_lock_path() {  # <session>
   printf '%s/order-%s.lock' "$dir" "$key"
 }
 
+# fm_backend_herdr_presentation_lock_wait_attempts: the ONE budget every
+# acquirer of the lock above waits with, owned here beside the lock path
+# itself so spawn, teardown, and the pane close cannot drift apart.
+# A projected spawn holds the lock from before its workspace exists until
+# after the harness launch, and that span contains the worktree-discovery
+# poll's full 60 one-second rounds, so the budget is derived from that longest
+# legitimate hold rather than picked: 1800 rounds of 0.1s is 180s, roughly
+# twice the worst case. It stays BOUNDED on purpose, so a genuinely wedged
+# holder still refuses loudly instead of hanging its acquirer forever.
+# The override exists so a contention test can prove the bounded-refusal
+# contract against a real live holder without paying the production budget in
+# wall clock; a malformed or non-positive value falls back to the derived one.
+fm_backend_herdr_presentation_lock_wait_attempts() {
+  local attempts=${FM_HERDR_PRESENTATION_LOCK_WAIT_ATTEMPTS:-}
+  case "$attempts" in
+    ''|*[!0-9]*) attempts=1800 ;;
+  esac
+  [ "$attempts" -gt 0 ] || attempts=1800
+  printf '%s' "$attempts"
+}
+
+# fm_backend_herdr_presentation_lock_acquire_wait: poll for the session
+# presentation lock within the shared budget. An explicit <attempts> is for an
+# acquirer whose own deadline is deliberately tighter than the contention
+# budget, such as an abort cleanup that must not read as a hang.
+fm_backend_herdr_presentation_lock_acquire_wait() {  # <lock-path> [attempts]
+  local lock_path=$1 attempts=${2:-} attempt=0
+  [ -n "$lock_path" ] || return 1
+  [ -n "$attempts" ] || attempts=$(fm_backend_herdr_presentation_lock_wait_attempts)
+  while [ "$attempt" -lt "$attempts" ]; do
+    if fm_lock_try_acquire "$lock_path"; then
+      return 0
+    fi
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
 # fm_backend_herdr_projection_focus_snapshot: print the exact active
 # workspace and tab ids as one tab-separated record.
 # Presentation mutations use this read-only snapshot as their sole focus
@@ -2861,20 +2900,15 @@ fm_backend_herdr_kill_serialized() {  # <session> <pane>
 fm_backend_herdr_kill() {  # <target>
   fm_backend_herdr_target_ready "$1" || return 0
   local session=$FM_BACKEND_HERDR_SESSION pane=$FM_BACKEND_HERDR_PANE
-  local lock_path attempt=0 lock_held=0
+  local lock_path lock_held=0
   if ! declare -F fm_lock_try_acquire >/dev/null 2>&1; then
     # shellcheck source=bin/fm-wake-lib.sh
     . "$FM_BACKEND_HERDR_ROOT/bin/fm-wake-lib.sh"
   fi
   if lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session"); then
-    while [ "$attempt" -lt 50 ]; do
-      if fm_lock_try_acquire "$lock_path"; then
-        lock_held=1
-        break
-      fi
-      sleep 0.1
-      attempt=$((attempt + 1))
-    done
+    if fm_backend_herdr_presentation_lock_acquire_wait "$lock_path"; then
+      lock_held=1
+    fi
   fi
   if [ "$lock_held" = 1 ]; then
     fm_backend_herdr_kill_serialized "$session" "$pane"

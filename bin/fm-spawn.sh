@@ -669,6 +669,8 @@ HERDR_PROJECTION_ABORT_TASK_PANE=
 HERDR_PROJECTION_ABORT_SEEDED_PANE=
 HERDR_PRESENTATION_ORDER_LOCK=
 HERDR_PRESENTATION_ORDER_LOCK_HELD=0
+SPAWN_HERDR_PRESENTATION_ABORT_LOCK_WAIT_ATTEMPTS=50
+SPAWN_HERDR_PRESENTATION_ABORT_LOCK_WAIT_SECONDS=$((SPAWN_HERDR_PRESENTATION_ABORT_LOCK_WAIT_ATTEMPTS / 10))
 SPAWN_TASK_LOCK=
 SPAWN_TASK_LOCK_HELD=0
 SPAWN_CONTROL_LOCK=
@@ -733,9 +735,18 @@ spawn_abort_cleanup() {
   fi
   if [ "$HERDR_PROJECTION_ABORT_CLEANUP" = 1 ] \
      && [ "$HERDR_PRESENTATION_ORDER_LOCK_HELD" != 1 ]; then
-    if ! spawn_herdr_presentation_order_lock_acquire "${HERDR_PROJECTION_ABORT_SESSION:-}"; then
-      echo "warning: herdr presentation focus lock unavailable; retaining the projection journal and refusing concurrent abort cleanup" >&2
-      HERDR_PROJECTION_ABORT_CLEANUP=0
+    # Deliberately far tighter than the contention budget in
+    # bin/backends/herdr.sh: an operator who just interrupted a spawn is
+    # watching this run, and a silent multi-minute wait here reads as a hang.
+    # Losing the race only retains the projection journal for a later recovery.
+    if ! spawn_herdr_presentation_order_lock_acquire "${HERDR_PROJECTION_ABORT_SESSION:-}" 1; then
+      echo "waiting up to ${SPAWN_HERDR_PRESENTATION_ABORT_LOCK_WAIT_SECONDS}s for the herdr presentation focus lock before cleaning up the aborted projection of $ID" >&2
+      if ! spawn_herdr_presentation_order_lock_acquire \
+          "${HERDR_PROJECTION_ABORT_SESSION:-}" \
+          "$SPAWN_HERDR_PRESENTATION_ABORT_LOCK_WAIT_ATTEMPTS"; then
+        echo "warning: herdr presentation focus lock unavailable after ${SPAWN_HERDR_PRESENTATION_ABORT_LOCK_WAIT_SECONDS}s; retaining the projection journal and refusing concurrent abort cleanup" >&2
+        HERDR_PROJECTION_ABORT_CLEANUP=0
+      fi
     fi
   fi
   if [ "$HERDR_PROJECTION_ABORT_CLEANUP" = 1 ]; then
@@ -805,31 +816,25 @@ trap spawn_abort_cleanup EXIT
 # One bounded lock per live Herdr session/socket, shared across all homes.
 # <session> is required so secondmate and primary spawns serialize against the
 # same session without writing any other home's state directory.
-# A projected spawn holds this lock from before its workspace exists until
-# after the harness launch (spawn_herdr_presentation_order_lock_release near
-# the end of this script), and that span CONTAINS the worktree-discovery poll,
-# which is itself allowed a full 60 one-second rounds. So the budget below is
-# derived from the longest legitimate hold rather than picked: a concurrent
-# spawn or recovery has to outlast one entire projected spawn or it refuses
-# work that was only ever going to be slow, which is what a 5s budget did.
-# It stays BOUNDED on purpose - a genuinely wedged holder must still refuse
-# loudly instead of hanging a spawn forever.
-SPAWN_HERDR_PRESENTATION_LOCK_WAIT_ATTEMPTS=1800  # x0.1s = 180s, ~2x the worst legitimate hold
+# The wait budget is NOT defined here: bin/backends/herdr.sh owns the lock path
+# and the one budget derived from the longest legitimate hold, so this spawn,
+# fm-teardown.sh, and the adapter's own pane close cannot drift apart.
+# <attempts> is passed only by an acquirer whose deadline is deliberately
+# tighter than that contention budget.
 spawn_herdr_presentation_order_lock_acquire() {
-  local session=${1:-} attempt lock_path
+  local session=${1:-} attempts=${2:-} lock_path
   [ -n "$session" ] || session=$(fm_backend_herdr_session)
   lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") || return 1
   HERDR_PRESENTATION_ORDER_LOCK="$lock_path"
-  attempt=0
-  while [ "$attempt" -lt "$SPAWN_HERDR_PRESENTATION_LOCK_WAIT_ATTEMPTS" ]; do
-    if fm_lock_try_acquire "$HERDR_PRESENTATION_ORDER_LOCK"; then
-      HERDR_PRESENTATION_ORDER_LOCK_HELD=1
-      return 0
-    fi
-    sleep 0.1
-    attempt=$((attempt + 1))
-  done
-  return 1
+  if [ -n "$attempts" ]; then
+    fm_backend_herdr_presentation_lock_acquire_wait \
+      "$HERDR_PRESENTATION_ORDER_LOCK" "$attempts" || return 1
+  else
+    fm_backend_herdr_presentation_lock_acquire_wait \
+      "$HERDR_PRESENTATION_ORDER_LOCK" || return 1
+  fi
+  HERDR_PRESENTATION_ORDER_LOCK_HELD=1
+  return 0
 }
 
 clear_relaunch_harness_wiring() {
@@ -2560,8 +2565,7 @@ $(fm_busy_muse_matching_logs "$MUSE_SESSIONS_ROOT" "$WT" || true)
 EOF
       )
       printf '%s\n' "$MUSE_SIDECAR" > "$STATE/$ID.muse-session" || {
-        echo "error: cannot write the muse session binding at $STATE/$ID.muse-session" >&2
-        exit 1
+        echo "warning: could not write the muse session binding at $STATE/$ID.muse-session; this task's busy state will classify unknown rather than idle" >&2
       }
       ;;
     cursor*)
@@ -2587,8 +2591,7 @@ EOF
         fi
       )
       printf '%s\n' "$CURSOR_SIDECAR" > "$STATE/$ID.cursor-session" || {
-        echo "error: cannot write the cursor session binding at $STATE/$ID.cursor-session" >&2
-        exit 1
+        echo "warning: could not write the cursor session binding at $STATE/$ID.cursor-session; this task's busy state will classify unknown rather than idle" >&2
       }
       ;;
     kimi*)

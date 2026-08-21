@@ -2104,8 +2104,14 @@ test_kill_focused_workspace_stays_plain_close() {
 }
 
 test_kill_refuses_when_presentation_lock_is_unavailable() {
-  local dir mode out status attempts
+  local dir mode out status attempts expected_attempts
   dir="$TMP_ROOT/kill-lock-refusal"; mkdir -p "$dir"
+  # The bounded wait is the ONE budget bin/backends/herdr.sh derives beside the
+  # lock path, so this asserts the kill honors that shared budget rather than
+  # pinning a private constant that would silently drift from spawn's.
+  expected_attempts=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_presentation_lock_wait_attempts' "$ROOT")
+  [ -n "$expected_attempts" ] && [ "$expected_attempts" -gt 0 ] \
+    || fail "the shared presentation lock budget did not resolve to a positive attempt count"
   for mode in unresolved contended; do
     : > "$dir/cli.log"
     : > "$dir/attempts"
@@ -2134,7 +2140,7 @@ test_kill_refuses_when_presentation_lock_is_unavailable() {
       "$mode presentation lock refusal did not report the deferred close"
     attempts=$(wc -l < "$dir/attempts" | tr -d ' ')
     if [ "$mode" = contended ]; then
-      [ "$attempts" = 50 ] || fail "contended presentation lock did not use the bounded wait: $attempts attempts"
+      [ "$attempts" = "$expected_attempts" ] || fail "contended presentation lock did not use the shared bounded wait: $attempts attempts, expected $expected_attempts"
     else
       [ "$attempts" = 0 ] || fail "unresolved presentation lock path attempted acquisition: $attempts"
     fi

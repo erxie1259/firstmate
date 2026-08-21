@@ -1542,7 +1542,13 @@ SH
   [ -e "$ready" ] || fail "herdr-orphan-refusal: the contending lock holder never started"
 
   rc=0
-  FM_FAKE_HERDR_LOG="$log" FM_FAKE_HERDR_CLOSED="$closed" \
+  # The holder above is a live process, so there is no stale-steal shortcut and
+  # teardown must exhaust its whole acquire budget before it can refuse.
+  # Proving the refusal is the point; paying the production budget in wall
+  # clock is not, so the deadline is shortened through the one override
+  # bin/backends/herdr.sh owns. The contention and the refusal are both real.
+  FM_HERDR_PRESENTATION_LOCK_WAIT_ATTEMPTS=20 \
+    FM_FAKE_HERDR_LOG="$log" FM_FAKE_HERDR_CLOSED="$closed" \
     run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   if [ "$rc" -eq 0 ]; then
     : > "$release"; wait "$holder_pid" 2>/dev/null || true

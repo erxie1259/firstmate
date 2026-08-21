@@ -2765,6 +2765,16 @@ printf '%s\n' "$META_BODY" > "$SPAWN_META_PATH" || {
   echo "error: cannot publish task metadata at $STATE/$ID.meta" >&2
   exit 1
 }
+# `mv` moves its source INTO an existing directory rather than failing, so a
+# metadata path occupied by a directory would quietly land the record at
+# state/<id>.meta/<temporary name> and let the spawn print its success line
+# while no reader can resolve the task. The rename is only atomic over a file
+# or a missing path, so refuse anything else here and let the abort cleanup
+# release the backend's terminal and worktree.
+if [ -d "$STATE/$ID.meta" ]; then
+  echo "error: cannot publish task metadata at $STATE/$ID.meta: Is a directory" >&2
+  exit 1
+fi
 if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_META_PUBLISH_STARTED=1
   mv -f "$SPAWN_META_TMP" "$STATE/$ID.meta"

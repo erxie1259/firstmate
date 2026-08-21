@@ -758,9 +758,12 @@ fm_backend_herdr_presentation_session_lock_path() {  # <session>
 # A projected spawn holds the lock from before its workspace exists until
 # after the harness launch, and that span contains the worktree-discovery
 # poll's full 60 one-second rounds, so the budget is derived from that longest
-# legitimate hold rather than picked: 1800 rounds of 0.1s is 180s, roughly
-# twice the worst case. It stays BOUNDED on purpose, so a genuinely wedged
-# holder still refuses loudly instead of hanging its acquirer forever.
+# legitimate hold rather than picked: 1800 rounds, comfortably past the ~90s
+# worst case. A round is one fm_lock_try_acquire arbitration PLUS the 0.1s
+# sleep, not 0.1s, so measured wall clock runs about 2.6x the nominal round
+# math: 1800 rounds is roughly 470s in practice, not the 180s the round count
+# alone suggests. It stays BOUNDED on purpose, so a genuinely wedged holder
+# still refuses loudly instead of hanging its acquirer forever.
 # The override exists so a contention test can prove the bounded-refusal
 # contract against a real live holder without paying the production budget in
 # wall clock; a malformed or non-positive value falls back to the derived one.
@@ -778,8 +781,11 @@ fm_backend_herdr_presentation_lock_wait_attempts() {
 # contention budget above.
 # A best-effort close on a scheduled sweep or an interrupted spawn's cleanup
 # has nothing to gain from outlasting a legitimate hold - it only makes a
-# periodic sweep or a Ctrl-C read as a hang - so it gives up in 5s and leaves
-# the work to the correctness-critical acquirer that follows.
+# periodic sweep or a Ctrl-C read as a hang - so it gives up after 50 rounds
+# and leaves the work to the correctness-critical acquirer that follows. Each
+# round is a lock arbitration plus the 0.1s sleep, so that measures at roughly
+# 13s of wall clock against a live holder rather than the 5s the round count
+# alone suggests.
 fm_backend_herdr_presentation_lock_best_effort_wait_attempts() {
   printf '%s' 50
 }

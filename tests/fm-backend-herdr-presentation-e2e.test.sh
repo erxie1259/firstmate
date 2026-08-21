@@ -391,7 +391,9 @@ spawn_task() {  # <id> <home> <project>
 # The contention cases below hold the real session presentation lock from a
 # live process, so there is no stale-steal shortcut and the spawn must exhaust
 # its whole acquire budget before it can fall back flat. Exercising the refusal
-# is the point; paying the production 180s budget in wall clock twice is not.
+# is the point; paying the production 1800-round budget - roughly 470s of wall
+# clock, since each round is a lock arbitration plus its 0.1s sleep - twice is
+# not.
 # The budget is injected through the one override the adapter owns, so the
 # contention, the acquire loop, and the flat-fallback assertion are all the
 # real ones - only the deadline is shortened.

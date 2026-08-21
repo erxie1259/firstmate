@@ -3531,8 +3531,11 @@ JS
   # the export resolves without yielding to the macrotask queue, the
   # confirmation is overwritten before any pane capture can observe it. Wait on
   # the artifact Pi actually produced instead; every rendering assertion below
-  # reads that same file, so this stays a real completion gate.
-  wait_for_file_text "$export_file" 'id="session-data"' \
+  # reads that same file, so this stays a real completion gate. Gate on the
+  # trailing </html>, the one token that cannot appear until the whole document
+  # is flushed, so a write observed mid-flush never releases the wait onto a
+  # partial file the parse below would misreport as lost tool data.
+  wait_for_file_text "$export_file" '</html>' \
     || fail "/export did not complete while calm mode was on"
   node - "$export_file" <<'JS' || fail "calm-mode HTML export lost tool data or persisted synthetic provenance"
 const html = require("node:fs").readFileSync(process.argv[2], "utf8");

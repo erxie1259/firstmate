@@ -2648,7 +2648,15 @@ preserve_relaunch_meta() {
     !($1 in owned)
   ' "$RELAUNCH_META"
 }
-{
+if [ "$RELAUNCH" -eq 1 ]; then
+  RELAUNCH_PRESERVED=$(preserve_relaunch_meta) || {
+    echo "error: cannot read existing task metadata at $RELAUNCH_META" >&2
+    exit 1
+  }
+else
+  RELAUNCH_PRESERVED=
+fi
+META_BODY=$(
   echo "window=$META_WINDOW"
   echo "endpoint_task_id=$ID"
   echo "worktree=$WT"
@@ -2690,18 +2698,21 @@ preserve_relaunch_meta() {
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
-  if [ "$RELAUNCH" -eq 1 ]; then
-    preserve_relaunch_meta
-  fi
+  [ -z "$RELAUNCH_PRESERVED" ] || printf '%s\n' "$RELAUNCH_PRESERVED"
   if [ "$SPAWN_CONTROL_PARENT" = 1 ] && [ -n "${FM_CONTROL_RELAUNCH_TX:-}" ]; then
     echo "control_relaunch_tx=$FM_CONTROL_RELAUNCH_TX"
   fi
-} > "$SPAWN_META_PATH" || {
-  # Explicit, because errexit alone does not carry this: stock macOS Bash 3.2
-  # does not treat a failed redirection on a compound command as a fatal
-  # errexit condition, so an unpublishable metadata path let the spawn print a
-  # success line and exit 0 with no record at all, leaking the backend's
-  # terminal and worktree past the abort cleanup this exit restores.
+)
+# The body is assembled in memory first so that publishing it is ONE simple
+# command: stock macOS Bash 3.2 does not treat a failed redirection on a
+# compound command as a fatal errexit condition, nor does it carry errexit into
+# a command substitution, so a `{ ... } > "$path"` block let both an
+# unwritable path and a mid-block write failure publish nothing or a truncated
+# record while the spawn printed its success line and exited 0, leaking the
+# backend's terminal and worktree past the abort cleanup this exit restores.
+# A simple command's redirection failure IS observable through `||` on 3.2, and
+# every failure mode of the assembly above now has its own explicit branch.
+printf '%s\n' "$META_BODY" > "$SPAWN_META_PATH" || {
   echo "error: cannot publish task metadata at $SPAWN_META_PATH" >&2
   exit 1
 }

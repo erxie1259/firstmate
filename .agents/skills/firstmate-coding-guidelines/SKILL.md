@@ -119,7 +119,9 @@ Run `bin/fm-doc-audience-check.sh`; it enforces classification, README setup rou
 - Never add an agent name as a commit co-author.
 - `bin/*.sh` and `bin/backends/*.sh` must pass `shellcheck`.
 - Every `bin/` script and `tests/` script must run on stock macOS Bash 3.2, the shell every Apple Silicon home actually uses.
-- That rules out `\uXXXX` escapes, requires `"${arr[@]+"${arr[@]}"}"` wherever an array can be empty under `set -u`, and requires an explicit failure branch after a `.` or a compound-command redirection, because 3.2 does not carry either through `set -e` the way 4.4+ does.
+- That rules out `\uXXXX` escapes and requires `"${arr[@]+"${arr[@]}"}"` wherever an array can be empty under `set -u`.
+- Under `set -e` on 3.2 a failed `.` kills the shell outright, past `|| true` and past `if !`, so a sourced path must be guaranteed to exist or errexit must be disabled around the source; there is no guard form that catches it.
+- Conversely, 3.2 does not carry `set -e` into a compound-command redirection (`{ ...; } > file`) or into a command substitution, so build such output in memory and publish it with one simple command carrying an explicit failure branch.
 - Run `bin/fm-lint.sh` before treating a script change as done; it is the single owner of the lint definition (file set, config, and pinned shellcheck version) that CI and the no-mistakes pre-push gate both invoke, and it refuses to run under any other shellcheck version.
 - Colocate tests with the existing pattern in `tests/`, name them `<subject>.test.sh`, and extend an existing script rather than inventing a new runner.
 - Tests must exercise behavior through an executable or public interface and must never assert implementation-source bytes, including through parsers, regexes, snapshots, or indirect wrappers.

@@ -383,6 +383,143 @@ fm_backend_herdr_cli() {  # <session> <herdr-subcommand-and-args...>
   HERDR_SESSION="$session" herdr "$@" --session "$session"
 }
 
+# fm_backend_herdr_agent_name_compose: derive Herdr's cosmetic agent name from
+# <task-id> and the resolved <model>. The final slash-delimited model segment
+# is normalized and capped at 12 characters. The remaining room is assigned
+# to the normalized task id; long task ids keep a readable head and up to six
+# characters from their final dash-delimited token. Collision ordinal 1 omits
+# a suffix, while ordinal 2 and above append "-N" and shorten only the task
+# portion. Every successful result is valid under Herdr's 32-character agent
+# name contract.
+fm_backend_herdr_agent_name_slug() {  # <value>
+  printf '%s' "$1" \
+    | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+    | LC_ALL=C sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+}
+
+fm_backend_herdr_agent_name_valid() {  # <name>
+  local name=$1
+  [ -n "$name" ] && [ "${#name}" -le 32 ] || return 1
+  ( LC_ALL=C
+    case "$name" in [a-z]*) ;; *) exit 1 ;; esac
+    case "$name" in *[!a-z0-9_-]*) exit 1 ;; esac
+  )
+}
+
+fm_backend_herdr_agent_name_compose() {  # <task-id> <model> [collision-ordinal]
+  local task model ordinal=${3:-1} suffix="" task_budget tail head_budget head name
+  task=$(fm_backend_herdr_agent_name_slug "$1")
+  model=${2##*/}
+  model=$(fm_backend_herdr_agent_name_slug "$model")
+  [ -n "$task" ] || task=task
+  case "$task" in [a-z]*) : ;; *) task="t-$task" ;; esac
+  [ -n "$model" ] || model=default
+  if [ "${#model}" -gt 12 ]; then
+    model=${model:0:12}
+    model=$(fm_backend_herdr_agent_name_slug "$model")
+    [ -n "$model" ] || model=default
+  fi
+  case "$ordinal" in
+    ''|*[!0-9]*|0) return 1 ;;
+    1) ;;
+    *) suffix="-$ordinal" ;;
+  esac
+  task_budget=$((32 - 1 - ${#model} - ${#suffix}))
+  [ "$task_budget" -ge 1 ] || return 1
+  if [ "${#task}" -gt "$task_budget" ]; then
+    tail=${task##*-}
+    if [ "$tail" = "$task" ] || [ "${#tail}" -gt 6 ]; then
+      tail=${task:$((${#task} - 6)):6}
+    fi
+    head_budget=$((task_budget - ${#tail} - 1))
+    if [ "$head_budget" -ge 1 ]; then
+      head=${task:0:head_budget}
+      head=$(printf '%s' "$head" | sed -E 's/-+$//')
+      if [ -n "$head" ]; then
+        task="$head-$tail"
+      else
+        task=${task:0:task_budget}
+      fi
+    else
+      task=${task:0:task_budget}
+    fi
+  fi
+  name="$task-$model$suffix"
+  fm_backend_herdr_agent_name_valid "$name" || return 1
+  printf '%s' "$name"
+}
+
+# fm_backend_herdr_agent_name_best_effort: wait for the launched agent to
+# register, then set its display name. The wait polls the read-only agent
+# lookup and renames only once an agent actually exists, so a pane that never
+# registers one is left alone instead of being written to. Session name
+# collisions advance through deterministic numeric suffixes. Naming is
+# cosmetic: every failure warns and returns success so it can never abort a
+# spawn.
+#
+# Registration retry limit FM_BACKEND_HERDR_AGENT_RENAME_ATTEMPTS (default 20),
+# inter-attempt delay FM_BACKEND_HERDR_AGENT_RENAME_DELAY (default 0.25s).
+# Each herdr CLI call is bounded with FM_BACKEND_HERDR_AGENT_RENAME_TIMEOUT
+# (default 5s); when timeout(1) is unavailable the call runs unbounded.
+# Run this function detached from the spawn tail so it never blocks spawn
+# completion or task-lock release.
+fm_backend_herdr_agent_name_best_effort() {  # <session> <pane> <task-id> <model>
+  local session=$1 pane=$2 task=$3 model=$4 ordinal=1 name out code detail
+  local registration_attempt=1 registered=0
+  local registration_attempts=${FM_BACKEND_HERDR_AGENT_RENAME_ATTEMPTS:-20}
+  local delay=${FM_BACKEND_HERDR_AGENT_RENAME_DELAY:-0.25}
+  local cli_timeout=${FM_BACKEND_HERDR_AGENT_RENAME_TIMEOUT:-5}
+  case "$registration_attempts" in ''|*[!0-9]*|0) registration_attempts=20 ;; esac
+  local herdr_cli_cmd=(herdr)
+  if command -v timeout >/dev/null 2>&1; then
+    herdr_cli_cmd=(timeout "$cli_timeout" herdr)
+  fi
+  # Registration can lag the pane launch, so poll for it. This stays read-only
+  # on purpose: renaming a pane that has no agent is a write whose meaning is
+  # version-dependent, and a pane that never registers an agent (a plain shell
+  # command, a fixture) must be left exactly as it was found.
+  while :; do
+    if HERDR_SESSION="$session" "${herdr_cli_cmd[@]}" agent get "$pane" \
+        --session "$session" >/dev/null 2>&1; then
+      registered=1
+      break
+    fi
+    [ "$registration_attempt" -lt "$registration_attempts" ] || break
+    registration_attempt=$((registration_attempt + 1))
+    sleep "$delay"
+  done
+  if [ "$registered" -ne 1 ]; then
+    echo "warning: Herdr registered no agent for task $task within the naming wait; leaving the pane unnamed and the crew running" >&2
+    return 0
+  fi
+  while [ "$ordinal" -le 99 ]; do
+    name=$(fm_backend_herdr_agent_name_compose "$task" "$model" "$ordinal") || {
+      echo "warning: could not compose a valid Herdr agent name for task $task; crew remains running" >&2
+      return 0
+    }
+    if ! fm_backend_herdr_agent_name_valid "$name"; then
+      echo "warning: refusing invalid composed Herdr agent name for task $task; crew remains running" >&2
+      return 0
+    fi
+    if out=$(HERDR_SESSION="$session" "${herdr_cli_cmd[@]}" agent rename "$pane" "$name" --session "$session" 2>&1); then
+      return 0
+    fi
+    code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+    case "$code" in
+      agent_name_taken)
+        ordinal=$((ordinal + 1))
+        ;;
+      *)
+        detail=$(printf '%s' "$out" | tr '\n' ' ')
+        echo "warning: Herdr agent naming failed for task $task: ${detail:-unknown error}; crew remains running" >&2
+        return 0
+        ;;
+    esac
+  done
+  echo "warning: Herdr agent naming exhausted collision suffixes for task $task; crew remains running" >&2
+  return 0
+}
+
 # fm_backend_herdr_tool_check: refuse loudly if herdr or jq is missing.
 fm_backend_herdr_tool_check() {
   command -v herdr >/dev/null 2>&1 || { echo "error: backend=herdr selected but the 'herdr' CLI is not installed (https://herdr.dev) (dual-licensed AGPL-3.0-or-later/commercial)" >&2; return 1; }

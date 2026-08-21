@@ -237,11 +237,38 @@ The CLI matrix was checked directly:
 | Keys | `herdr pane send-keys <pane> enter|escape|ctrl+c --session <name>` | Enter and Escape worked; Ctrl-C interrupted foreground work. |
 | Capture | `herdr pane read <pane> --source recent --lines N` | Small N could return empty below viewport height; a 200-line request plus local trim was stable. |
 | Native state | `herdr agent get <pane>` | Working and done transitions were visible; native `busy` remains positive activity evidence, while native `idle` cannot close a turn and the adapter's semantic lifecycle decides worker state. |
+| Agent display name | `herdr agent rename <pane> <name>` | Set `name` while preserving detected `agent`; names were validated and unique within the session. |
 | Restart | guarded named-session stop then start | Workspace, tab, pane, and labels persisted; the agent process and registration did not. |
 | Close | `herdr pane close <pane> --session <name>` | The exact one-pane task tab closed; closing a final tab could remove the workspace. |
 
 All destructive verification used `bin/fm-herdr-lab.sh` with a non-default `fm-lab-` name and a byte-identical default-session tripwire.
 No ambient `herdr server stop` command is a supported test operation.
+
+### Agent display naming
+
+Agent display naming was verified on 2026-07-30 with Herdr 0.7.5 protocol 17 and OpenCode in a guarded non-default lab session.
+
+```sh
+name=$(bash -c '. bin/backends/herdr.sh; fm_backend_herdr_agent_name_compose "$1" "$2"' _ flags-l10n-q7 dsv4pro)
+bin/fm-herdr-lab.sh run "$lab" agent rename "$pane" "$name"
+bin/fm-herdr-lab.sh run "$lab" agent get "$pane"
+bin/fm-herdr-lab.sh run "$lab" agent list
+bin/fm-herdr-lab.sh run "$lab" pane close "$pane"
+bin/fm-herdr-lab.sh run "$lab" agent rename "$replacement_pane" "$name"
+```
+
+Observed bounded output:
+
+```text
+COMPOSED_NAME=flags-l10n-q7-dsv4pro
+AGENT_GET={"pane_id":"w1:p1","agent":"opencode","name":"flags-l10n-q7-dsv4pro","agent_status":"idle"}
+AGENT_LIST={"pane_id":"w1:p1","agent":"opencode","name":"flags-l10n-q7-dsv4pro","agent_status":"idle"}
+REUSED_AFTER_CLOSE={"pane_id":"w2:p1","agent":"opencode","name":"flags-l10n-q7-dsv4pro","agent_status":"idle"}
+```
+
+The first rename proved that `name` and detected `agent` are independent fields.
+The replacement-pane rename proved that closing a pane releases its session-wide name without an explicit clear.
+`tests/fm-backend-herdr.test.sh` covers composition, validation, stable truncation, deterministic collision suffixing, and nonfatal spawn behavior.
 
 ### Prune and respawn
 

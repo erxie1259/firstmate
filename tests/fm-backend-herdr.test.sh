@@ -80,12 +80,14 @@ SH
 # agent_status (set via fake_herdr_set_agent_status, never through a CLI
 # call - mirrors an out-of-band agent registering itself) or an
 # agent_not_found error when none was preset (verified real-herdr behavior for
-# a pane with no registered agent). Every call is logged to $FM_HERDR_LOG in
+# a pane with no registered agent). FM_FAKE_HERDR_AGENT_DEFAULT_STATUS makes
+# every live pane report that status instead, which is the shape a real
+# harness launch leaves behind once its agent has registered. Every call is logged to $FM_HERDR_LOG in
 # the same unit-separated form as make_herdr_fakebin.
 make_herdr_statefake() {  # <dir> -> echoes fakebin dir; seeds an empty state file
   local dir=$1 fb="$1/fakebin"
   mkdir -p "$fb"
-  printf '{"next":1,"workspaces":[],"tabs":[],"agent_status":{}}\n' > "$dir/state.json"
+  printf '{"next":1,"workspaces":[],"tabs":[],"agent_status":{},"agent_name":{}}\n' > "$dir/state.json"
   cat > "$fb/herdr" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -144,13 +146,36 @@ case "$cmd $sub" in
     pane=${3:-}
     jq_state --arg p "$pane" '.tabs |= [.[]|select(.pane_id != $p)]' | save
     ;;
+  "pane get")
+    pane=${3:-}
+    if jq_state -e --arg p "$pane" '.tabs[] | select(.pane_id == $p)' >/dev/null; then
+      printf '{"result":{"pane":{"pane_id":"%s","foreground_cwd":"%s"}}}\n' \
+        "$pane" "${FM_FAKE_PANE_CWD:-/tmp}"
+    else
+      printf '{"error":{"code":"pane_not_found","message":"pane %s not found"}}\n' "$pane"
+    fi
+    ;;
   "tab close")
     tab=${3:-}
     jq_state --arg t "$tab" '.tabs |= [.[]|select(.tab_id != $t)]' | save
     ;;
+  "agent rename")
+    pane=${3:-}
+    name=${4:-}
+    if [ "${FM_FAKE_HERDR_RENAME_FAIL:-0}" = 1 ]; then
+      printf '{"error":{"code":"rename_failed","message":"synthetic spawn rename failure"}}\n' >&2
+      exit 7
+    fi
+    jq_state --arg p "$pane" --arg n "$name" '.agent_name[$p] = $n' | save
+    printf '{"result":{"agent":{"agent":"opencode","name":"%s"}}}\n' "$name"
+    ;;
   "agent get")
     pane=${3:-}
     status=$(jq_state -r --arg p "$pane" '.agent_status[$p] // empty')
+    if [ -z "$status" ] && [ -n "${FM_FAKE_HERDR_AGENT_DEFAULT_STATUS:-}" ] \
+      && jq_state -e --arg p "$pane" '.tabs[] | select(.pane_id == $p)' >/dev/null; then
+      status=$FM_FAKE_HERDR_AGENT_DEFAULT_STATUS
+    fi
     if [ -n "$status" ]; then
       printf '{"result":{"agent":{"agent_status":"%s"}}}\n' "$status"
     else
@@ -288,6 +313,8 @@ test_cli_helper_sets_env_and_appends_trailing_session_flag() {
     "fm_backend_herdr_cli did not append a trailing --session <name> flag (the fix for the env-var-alone routing bug)"
   pass "fm_backend_herdr_cli: sets HERDR_SESSION AND appends a trailing --session flag on every call"
 }
+
+
 
 # --- launcher_identity: the exact workspace a worker must be placed in -------
 #
@@ -495,6 +522,204 @@ test_container_ensure_refuses_an_ambiguous_home_label() {
   assert_contains "$out" "labeled 'firstmate'" "container_ensure buried the specific ambiguity it refused"
   assert_not_contains "$out" "failed to ensure herdr workspace" "container_ensure added a generic message over the specific one"
   pass "fm_backend_herdr_container_ensure: surfaces the exact ambiguous-placement refusal instead of a generic failure"
+}
+
+# --- agent display names ----------------------------------------------------
+
+# make_herdr_rename_fake: a herdr stub for the naming helper. `agent get` is
+# the registration probe the helper reads before it ever writes: mode
+# `registration` reports agent_not_found once and then a live agent, mode
+# `unregistered` never reports one, and every other mode reports one
+# immediately. `agent rename` then models the write outcome for that mode.
+make_herdr_rename_fake() {  # <dir> <collision|registration|failure|unregistered>
+  local dir=$1 mode=$2 fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+LOG="${FM_HERDR_LOG:?}"
+COUNT_FILE="${FM_HERDR_RENAME_COUNT:?}"
+GET_COUNT_FILE="$COUNT_FILE.get"
+{
+  printf 'HERDR_SESSION=%s' "${HERDR_SESSION:-}"
+  for a in "$@"; do printf '\x1f%s' "$a"; done
+  printf '\n'
+} >> "$LOG"
+case "${1:-} ${2:-}" in
+  "agent get")
+    gets=0
+    [ ! -f "$GET_COUNT_FILE" ] || gets=$(cat "$GET_COUNT_FILE")
+    gets=$((gets + 1))
+    printf '%s\n' "$gets" > "$GET_COUNT_FILE"
+    if [ "${FM_HERDR_RENAME_MODE:?}" = unregistered ] \
+      || { [ "$FM_HERDR_RENAME_MODE" = registration ] && [ "$gets" -eq 1 ]; }; then
+      printf '%s\n' '{"error":{"code":"agent_not_found","message":"agent target w1:p2 not found"}}' >&2
+      exit 1
+    fi
+    printf '%s\n' '{"result":{"agent":{"agent":"opencode","agent_status":"idle"}}}'
+    ;;
+  "agent rename")
+    count=0
+    [ ! -f "$COUNT_FILE" ] || count=$(cat "$COUNT_FILE")
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$COUNT_FILE"
+    if [ "${FM_HERDR_RENAME_MODE:?}" = collision ] && [ "$count" -eq 1 ]; then
+      printf '%s\n' '{"error":{"code":"agent_name_taken","message":"name already belongs to w1:p1"}}' >&2
+      exit 1
+    fi
+    if [ "$FM_HERDR_RENAME_MODE" = failure ]; then
+      printf '%s\n' '{"error":{"code":"rename_failed","message":"synthetic rename failure"}}' >&2
+      exit 7
+    fi
+    printf '%s\n' '{"result":{"agent":{"agent":"opencode","name":"renamed"}}}'
+    ;;
+esac
+SH
+  chmod +x "$fb/herdr"
+  printf '%s\n' "$fb"
+}
+
+test_agent_name_composes_readable_task_and_model() {
+  local out
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_name_compose "$1" "$2"' \
+    "$ROOT" flags-l10n-q7 openrouter/deepseek/dsv4pro)
+  [ "$out" = "flags-l10n-q7-dsv4pro" ] \
+    || fail "agent name should expose readable task and final model segment, got '$out'"
+  pass "fm_backend_herdr_agent_name_compose: combines task and resolved model visibly"
+}
+
+test_agent_name_normalizes_and_truncates_stably() {
+  local base collision candidate
+  base=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_name_compose "$1" "$2"' \
+    "$ROOT" '9-THIS_IS_A_VERY_LONG-FLAGS-L10N-TASK-q7' 'vendor/DeepSeek V4 Pro Preview')
+  collision=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_name_compose "$1" "$2" 2' \
+    "$ROOT" '9-THIS_IS_A_VERY_LONG-FLAGS-L10N-TASK-q7' 'vendor/DeepSeek V4 Pro Preview')
+  [ "$base" = "t-9-this-is-a-ver-q7-deepseek-v4" ] \
+    || fail "base truncation contract changed, got '$base'"
+  [ "$collision" = "t-9-this-is-a-v-q7-deepseek-v4-2" ] \
+    || fail "collision truncation contract changed, got '$collision'"
+  for candidate in "$base" "$collision"; do
+    [ "${#candidate}" -le 32 ] || fail "agent name exceeds 32 characters: '$candidate'"
+    case "$candidate" in
+      [a-z]*)
+        case "$candidate" in *[!a-z0-9_-]*) fail "agent name contains invalid characters: '$candidate'" ;; esac
+        ;;
+      *) fail "agent name does not start with a lowercase letter: '$candidate'" ;;
+    esac
+  done
+  if bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_name_valid "$1"' "$ROOT" '9bad'; then
+    fail "agent-name validator accepted a digit-leading name"
+  fi
+  if bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_name_valid "$1"' "$ROOT" 'Uppercase'; then
+    fail "agent-name validator accepted uppercase characters"
+  fi
+  if bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_name_valid "$1"' "$ROOT" 'abcdefghijklmnopqrstuvwxyz1234567'; then
+    fail "agent-name validator accepted more than 32 characters"
+  fi
+  pass "fm_backend_herdr_agent_name_compose: normalizes, preserves task tail, and stays within Herdr validation rules"
+}
+
+test_agent_name_collision_uses_deterministic_suffix() {
+  local dir log count fb out status calls
+  dir="$TMP_ROOT/agent-name-collision"; mkdir -p "$dir"; log="$dir/log"; count="$dir/count"; : > "$log"
+  fb=$(make_herdr_rename_fake "$dir" collision)
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RENAME_COUNT="$count" \
+    FM_HERDR_RENAME_MODE=collision FM_BACKEND_HERDR_AGENT_RENAME_DELAY=0 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_name_best_effort sess w1:p2 flags-l10n-q7 dsv4pro' "$ROOT" 2>&1)
+  status=$?
+  expect_code 0 "$status" "a recoverable name collision must remain cosmetic"
+  calls=$(cat "$log")
+  assert_contains "$calls" $'\x1f''agent'$'\x1f''rename'$'\x1f''w1:p2'$'\x1f''flags-l10n-q7-dsv4pro'$'\x1f''--session'$'\x1f''sess' \
+    "first rename did not attempt the deterministic base name"
+  assert_contains "$calls" $'\x1f''agent'$'\x1f''rename'$'\x1f''w1:p2'$'\x1f''flags-l10n-q7-dsv4pro-2'$'\x1f''--session'$'\x1f''sess' \
+    "collision did not retry with deterministic numeric suffix"
+  [ -z "$out" ] || fail "resolved collision should not warn, got '$out'"
+  pass "fm_backend_herdr_agent_name_best_effort: resolves session uniqueness collisions deterministically"
+}
+
+test_agent_name_waits_for_registration() {
+  local dir log count fb out status
+  dir="$TMP_ROOT/agent-name-registration"; mkdir -p "$dir"; log="$dir/log"; count="$dir/count"; : > "$log"
+  fb=$(make_herdr_rename_fake "$dir" registration)
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RENAME_COUNT="$count" \
+    FM_HERDR_RENAME_MODE=registration FM_BACKEND_HERDR_AGENT_RENAME_DELAY=0 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_name_best_effort sess w1:p2 flags-l10n-q7 dsv4pro' "$ROOT" 2>&1)
+  status=$?
+  expect_code 0 "$status" "an agent registration race must remain cosmetic"
+  [ "$(cat "$count.get")" = 2 ] || fail "agent naming did not re-probe once registration became available"
+  [ "$(cat "$count")" = 1 ] || fail "agent naming should rename exactly once after registration appears"
+  [ -z "$out" ] || fail "a resolved registration race should not warn, got '$out'"
+  pass "fm_backend_herdr_agent_name_best_effort: waits through a transient agent registration race"
+}
+
+# A pane that never registers an agent - a plain shell command, a fixture - must
+# be left exactly as found. Renaming it is a write whose meaning varies by Herdr
+# release, so the helper probes first and never issues the write at all.
+test_agent_name_never_renames_an_unregistered_pane() {
+  local dir log count fb out status
+  dir="$TMP_ROOT/agent-name-unregistered"; mkdir -p "$dir"; log="$dir/log"; count="$dir/count"; : > "$log"
+  fb=$(make_herdr_rename_fake "$dir" unregistered)
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RENAME_COUNT="$count" \
+    FM_HERDR_RENAME_MODE=unregistered FM_BACKEND_HERDR_AGENT_RENAME_DELAY=0 \
+    FM_BACKEND_HERDR_AGENT_RENAME_ATTEMPTS=3 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_name_best_effort sess w1:p2 flags-l10n-q7 dsv4pro' "$ROOT" 2>&1)
+  status=$?
+  expect_code 0 "$status" "an unregistered pane must remain cosmetic, not a failure"
+  [ ! -f "$count" ] || fail "the helper renamed a pane that never registered an agent"
+  assert_not_contains "$(cat "$log")" $'\x1f''agent'$'\x1f''rename' \
+    "the helper must not write a rename to a pane with no registered agent"
+  [ "$(cat "$count.get")" = 3 ] || fail "the helper did not exhaust its bounded registration probe budget"
+  assert_contains "$out" "registered no agent" "an unregistered pane should say so plainly"
+  pass "fm_backend_herdr_agent_name_best_effort: never renames a pane that registers no agent"
+}
+
+test_agent_name_rename_failure_is_nonfatal() {
+  local dir log count fb out status
+  dir="$TMP_ROOT/agent-name-failure"; mkdir -p "$dir"; log="$dir/log"; count="$dir/count"; : > "$log"
+  fb=$(make_herdr_rename_fake "$dir" failure)
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RENAME_COUNT="$count" \
+    FM_HERDR_RENAME_MODE=failure FM_BACKEND_HERDR_AGENT_RENAME_DELAY=0 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_name_best_effort sess w1:p2 flags-l10n-q7 dsv4pro' "$ROOT" 2>&1)
+  status=$?
+  expect_code 0 "$status" "rename failure must never propagate as spawn failure"
+  assert_contains "$out" "warning:" "rename failure should warn"
+  assert_contains "$out" "synthetic rename failure" "rename warning should preserve Herdr failure evidence"
+  pass "fm_backend_herdr_agent_name_best_effort: warns and returns success when Herdr rename fails"
+}
+
+test_spawn_survives_agent_rename_failure() {
+  local dir home proj wt fakebin log state id out status
+  dir="$TMP_ROOT/spawn-agent-name-failure"
+  home="$dir/home"
+  proj="$dir/project"
+  wt="$dir/worktree"
+  fakebin=$(make_herdr_statefake "$dir")
+  log="$dir/log"
+  state="$dir/state.json"
+  id=flags-l10n-q7
+  : > "$log"
+  mkdir -p "$home/data/$id" "$home/state" "$home/config" "$home/projects"
+  printf 'brief\n' > "$home/data/$id/brief.md"
+  touch "$home/state/.last-watcher-beat"
+  fm_git_worktree "$proj" "$wt" spawn-agent-name
+  fm_fake_exit0 "$fakebin" treehouse
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$home/state" \
+    FM_DATA_OVERRIDE="$home/data" FM_PROJECTS_OVERRIDE="$home/projects" \
+    FM_CONFIG_OVERRIDE="$home/config" FM_SPAWN_NO_GUARD=1 HERDR_SESSION=fmtest \
+    FM_HERDR_LOG="$log" FM_FAKE_HERDR_STATE="$state" FM_FAKE_PANE_CWD="$wt" \
+    FM_FAKE_HERDR_RENAME_FAIL=1 FM_BACKEND_HERDR_AGENT_RENAME_DELAY=0 \
+    FM_FAKE_HERDR_AGENT_DEFAULT_STATUS=idle \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" "sh -c 'echo launched'" \
+      --mode no-mistakes --yolo off --backend herdr --model dsv4pro 2>&1)
+  status=$?
+  expect_code 0 "$status" "fm-spawn must succeed when cosmetic Herdr rename fails"
+  assert_contains "$out" "spawned $id" "spawn did not reach successful completion after rename failure"
+  assert_contains "$out" "synthetic spawn rename failure" "spawn did not surface cosmetic rename warning"
+  assert_present "$home/state/$id.meta" "spawn did not publish metadata after rename failure"
+  assert_contains "$(cat "$log")" $'\x1f''agent'$'\x1f''rename' \
+    "spawn never attempted the Herdr agent rename"
+  pass "fm-spawn: Herdr rename failure warns but preserves launch and metadata"
 }
 
 # --- container_ensure / create_task ------------------------------------------
@@ -4479,7 +4704,6 @@ test_workspace_label_secondmate_marker_trims_whitespace
 test_workspace_label_empty_marker_falls_back_to_primary
 test_workspace_label_different_secondmates_get_different_labels
 test_cli_helper_sets_env_and_appends_trailing_session_flag
-test_launcher_identity_absent_without_a_herdr_pane
 test_launcher_identity_absent_when_herdr_env_alone_is_set
 test_launcher_identity_resolves_the_exact_pane_tab_and_workspace
 test_launcher_identity_refuses_a_pane_from_another_session_name
@@ -4492,6 +4716,13 @@ test_workspace_ensure_prefers_the_launcher_over_the_first_label_match
 test_workspace_ensure_refuses_an_ambiguous_label_with_no_launcher
 test_workspace_ensure_other_home_ignores_the_launcher_identity
 test_container_ensure_refuses_an_ambiguous_home_label
+test_agent_name_composes_readable_task_and_model
+test_agent_name_normalizes_and_truncates_stably
+test_agent_name_collision_uses_deterministic_suffix
+test_agent_name_waits_for_registration
+test_agent_name_never_renames_an_unregistered_pane
+test_agent_name_rename_failure_is_nonfatal
+test_spawn_survives_agent_rename_failure
 test_container_ensure_starts_server_and_workspace
 test_container_ensure_reuses_existing_workspace
 test_container_ensure_creates_with_no_focus_flag

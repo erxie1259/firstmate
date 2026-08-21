@@ -1377,6 +1377,26 @@ fm_backend_herdr_pid_is_bare_shell() {  # <ps-bin> <pid>
   return 1
 }
 
+# fm_backend_herdr_pane_shell_pid: the pid of the shell hosting <target>, with
+# no claim at all about what that shell is doing. It is the raw endpoint identity
+# fm_backend_pane_shell_pid dispatches to, and is deliberately NOT the idle-shell
+# proof below: a caller asking "what is running on this pane" needs the anchor
+# precisely when the pane is busy, which is the case that proof refuses.
+# The pane id in the response must match the pane asked about, so a reply about
+# some other pane can never be mistaken for this one's shell.
+fm_backend_herdr_pane_shell_pid() {  # <target>
+  local info
+  fm_backend_herdr_target_ready "$1" || return 1
+  info=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane process-info \
+    --pane "$FM_BACKEND_HERDR_PANE" 2>/dev/null) || return 1
+  printf '%s' "$info" | jq -e --arg pane "$FM_BACKEND_HERDR_PANE" '
+    .result.type == "pane_process_info"
+    and .result.process_info.pane_id == $pane
+  ' >/dev/null 2>&1 || return 1
+  printf '%s' "$info" | jq -er \
+    '.result.process_info.shell_pid | select(type == "number" and . > 1) | floor' 2>/dev/null
+}
+
 # fm_backend_herdr_pane_idle_shell_pid: print the shell pid of <pane-id> only
 # when the exact pane provably holds one lone idle recognized shell: pane
 # process-info agrees on the pane id, the shell pid is both the foreground

@@ -797,6 +797,33 @@ fm_backend_busy_state() {  # <backend> <target>
   esac
 }
 
+# fm_backend_pane_shell_pid: the operating-system pid of the shell hosting
+# <target>, for callers that must ask a question about that terminal's own
+# processes rather than its rendered text. Only backends that expose a real pid
+# answer: tmux (#{pane_pid}) and herdr (pane process-info). cmux and zellij
+# publish no per-pane pid at all - the same gap that forced their current-path
+# reads to be active pwd probes (bin/backends/zellij.sh) - so they report
+# nothing and every caller must treat an empty answer as "cannot anchor here",
+# never as "no process".
+fm_backend_pane_shell_pid() {  # <backend> <target> [expected-label]
+  local backend=$1 pid
+  shift
+  case "$backend" in
+    tmux) pid=$(tmux display-message -p -t "$1" '#{pane_pid}' 2>/dev/null) || return 1 ;;
+    herdr)
+      fm_backend_source herdr || return 1
+      pid=$(fm_backend_herdr_pane_shell_pid "$@") || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  pid=$(printf '%s' "$pid" | tr -d '[:space:]')
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$pid" -gt 1 ] || return 1
+  printf '%s\n' "$pid"
+}
+
 # fm_backend_composer_state: classify the composer/input area of <target> as
 # empty|pending|pending-unproven|unknown for callers that need a pre-submit
 # input guard, a submit acknowledgement, or a launch-readiness check. It is

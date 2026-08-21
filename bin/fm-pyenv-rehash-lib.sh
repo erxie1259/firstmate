@@ -32,11 +32,13 @@
 # bin/fm-spawn.sh (stalled-terminal diagnosis). Both source this file; neither
 # restates the rules above.
 
-# Seconds after which a still-present lock is treated as abandoned regardless of
-# which rehash processes are alive. The default sits above pyenv's own
-# PYENV_REHASH_TIMEOUT (60s), which is how long a rehash queues for the lock
-# before giving up and exiting, so an ordinary rehash cycle is long finished by
-# then and is never mistaken for a stale one. Overridable for tests only.
+# Seconds after which a still-present lock is treated as abandoned - but only
+# once the process table has been consulted and nothing could be its holder, or
+# the table could not be read at all. This threshold never overrides a provable
+# holder, however long that rehash has been running; fm_pyenv_shim_lock_state
+# owns that ordering. The default sits above pyenv's own PYENV_REHASH_TIMEOUT
+# (60s), which is how long a rehash queues for the lock before giving up and
+# exiting. Overridable for tests only.
 FM_PYENV_REHASH_STALE_SECS=${FM_PYENV_REHASH_STALE_SECS:-90}
 
 # Slack, in seconds, allowed when comparing a rehash process's start time against
@@ -274,31 +276,47 @@ fm_pyenv_pid_has_ancestor() {  # <pid> <ancestor> [rows]
 #   unknown  - the process table could not be read, so nothing may be concluded
 # On `live` it also prints the deciding holder pid as a second field.
 #
-# The rule, in one place: a lock older than FM_PYENV_REHASH_STALE_SECS is
-# orphaned no matter which rehash processes are alive, since an ordinary rehash
-# cycle finishes far inside that. Age alone settles that case, so it is decided
-# before any process is looked at and an unreadable process table cannot turn
-# the fault this tool exists for into `unknown`. A younger lock is live only
-# while a process that could actually be its holder exists, which
-# fm_pyenv_rehash_live_pids decides from the lock's own mtime; when none does,
-# the young lock is re-sampled once after a short settle before being called
-# orphaned, so a rehash that started between the two reads is not stepped on.
+# The rule, in one place. A process that could actually be holding this lock is
+# decisive and is looked at FIRST: while fm_pyenv_rehash_live_pids can name one,
+# the lock is `live` at any age. Age never overrides a provable holder, because
+# an ordinary rehash cycle finishing quickly is a usual case and not a guarantee -
+# a cold cache with several versions can keep the shim-writing body running well
+# past any threshold, and clearing that rehash's own lock is exactly the corruption
+# this tool exists to avoid.
+#
+# Age settles only what the process table cannot. When no process could be the
+# holder, a lock past FM_PYENV_REHASH_STALE_SECS is orphaned outright, and a
+# younger one is re-sampled once after a short settle first, so a rehash that
+# started between the two reads is not stepped on. When the process table cannot
+# be read at all, nothing is provably alive: an old lock is still orphaned, so an
+# unreadable table cannot turn the fault this tool exists for into `unknown`,
+# while a young one stays `unknown` rather than being cleared on a guess.
 fm_pyenv_shim_lock_state() {  # <lock-path>
   local lock=$1 age pids
   [ -e "$lock" ] || { printf 'absent\n'; return 0; }
   age=$(fm_pyenv_shim_lock_age_seconds "$lock") || { printf 'unknown\n'; return 0; }
-  if [ "$age" -ge "$FM_PYENV_REHASH_STALE_SECS" ]; then
-    printf 'orphaned\n'
+  if ! pids=$(fm_pyenv_rehash_live_pids "$lock"); then
+    if [ "$age" -ge "$FM_PYENV_REHASH_STALE_SECS" ]; then
+      printf 'orphaned\n'
+    else
+      printf 'unknown\n'
+    fi
     return 0
   fi
-  pids=$(fm_pyenv_rehash_live_pids "$lock") || { printf 'unknown\n'; return 0; }
   if [ -n "$pids" ]; then
     printf 'live %s\n' "$(printf '%s\n' "$pids" | head -1)"
     return 0
   fi
+  if [ "$age" -ge "$FM_PYENV_REHASH_STALE_SECS" ]; then
+    printf 'orphaned\n'
+    return 0
+  fi
   sleep 0.5
   [ -e "$lock" ] || { printf 'absent\n'; return 0; }
-  pids=$(fm_pyenv_rehash_live_pids "$lock") || { printf 'unknown\n'; return 0; }
+  if ! pids=$(fm_pyenv_rehash_live_pids "$lock"); then
+    printf 'unknown\n'
+    return 0
+  fi
   if [ -n "$pids" ]; then
     printf 'live %s\n' "$(printf '%s\n' "$pids" | head -1)"
     return 0

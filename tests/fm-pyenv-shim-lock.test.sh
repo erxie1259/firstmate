@@ -32,7 +32,7 @@ TMP_ROOT=$(fm_test_tmproot fm-pyenv-shim-lock)
 BG_PIDS=""
 # Only the regression case below sets this, and only to prove that pyenv's own
 # timeout has no say in who holds the lock. Empty everywhere else.
-CASE_REHASH_TIMEOUT=""
+CASE_STALE_SECS=""
 
 stop_background() {
   local p
@@ -86,7 +86,7 @@ EOF
 
 run_clear() {
   PYENV_ROOT="$PYROOT" FM_PYENV_PS_BIN="$PS_WRAPPER" \
-    PYENV_REHASH_TIMEOUT="$CASE_REHASH_TIMEOUT" \
+    FM_PYENV_REHASH_STALE_SECS="$CASE_STALE_SECS" \
     FM_TEST_FIXTURE_ROOT="$TMP_ROOT" "$CLEAR" "$@" 2>&1
 }
 
@@ -284,10 +284,8 @@ test_a_rehash_older_than_its_lock_is_refused_however_long_it_runs() {
   start_rehash
   sleep 4
   write_lock 'body'
-  CASE_REHASH_TIMEOUT=1
   out=$(run_clear)
   status=$?
-  CASE_REHASH_TIMEOUT=""
   expect_code 3 "$status" "a rehash predating its lock must be refused whatever its run length"
   assert_contains "$out" "refused: a pyenv rehash is in progress" \
     "the refusal did not name the reason"
@@ -361,7 +359,34 @@ test_a_live_rehash_is_refused
 test_a_command_line_mention_is_not_a_holder
 test_a_stale_lock_is_cleared_even_while_waiters_run
 test_a_young_lock_with_a_waiting_rehash_is_cleared
+# The false clear that the age threshold used to allow. A rehash whose body runs
+# past FM_PYENV_REHASH_STALE_SECS still owns its lock, and clearing it lets a
+# second rehash write into shims/ underneath the first. Age may only settle what
+# the process table cannot, so a provable holder must win at any lock age.
+# The threshold is lowered rather than waiting out the real 90s; the relationship
+# being asserted - a holder that started before its lock, and a lock older than
+# the threshold - is exactly what happens on a slow real rehash.
+test_a_holder_is_refused_even_past_the_stale_threshold() {
+  local out status
+  read_case "$(make_case holder-past-threshold)"
+  start_rehash
+  sleep 2
+  write_lock 'body'
+  sleep 3
+  CASE_STALE_SECS=2
+  out=$(run_clear)
+  status=$?
+  CASE_STALE_SECS=""
+  expect_code 3 "$status" "a lock past the stale threshold was cleared out from under its live holder"
+  assert_contains "$out" "refused: a pyenv rehash is in progress" \
+    "the refusal did not name the reason"
+  assert_present "$LOCK" "a running rehash's own lock was moved aside once it aged past the threshold"
+  stop_background
+  pass "a provable holder is refused at any lock age, including past the stale threshold"
+}
+
 test_a_rehash_older_than_its_lock_is_refused_however_long_it_runs
+test_a_holder_is_refused_even_past_the_stale_threshold
 test_an_unreadable_process_table_still_clears_a_stale_lock
 test_arguments_are_refused
 test_an_unexpected_file_type_is_refused

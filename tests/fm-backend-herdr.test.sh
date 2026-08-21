@@ -3949,6 +3949,95 @@ test_send_text_submit_unknown_on_capture_failure() {
   pass "fm_backend_herdr_send_text_submit: reports 'unknown' when the post-Enter agent-get read fails (never retries past an unreadable target)"
 }
 
+# --- fm_backend_herdr_pane_shell_pid: the pane anchor -------------------------
+#
+# The pane-shell-pid read is the anchor fm-spawn's pyenv-rehash stall diagnosis
+# hangs on: it must answer for a BUSY pane (the idle-shell proof refuses exactly
+# there) and must never hand back a pid belonging to some other pane.
+
+herdr_pane_shell_pid_read() {  # <dir-name> <process-info-json> [target] -> prints pid, returns the read's status
+  local dir log resp fb target=${3:-fmtest:w1:p2}
+  dir="$TMP_ROOT/$1"; mkdir -p "$dir/responses"
+  log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '%s\n' "$2" > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_shell_pid "$1"' "$ROOT" "$target" 2>/dev/null
+}
+
+test_pane_shell_pid_answers_the_hosting_shell() {
+  local out status
+  out=$(herdr_pane_shell_pid_read pane-shell-pid-ok \
+    '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":4242,"foreground_process_group_id":4242,"foreground_processes":[{"pid":4242,"name":"zsh","argv0":"zsh"}]}}}')
+  status=$?
+  [ "$status" -eq 0 ] || fail "fm_backend_herdr_pane_shell_pid should succeed on a matching pane process-info reply, got status $status"
+  [ "$out" = 4242 ] || fail "fm_backend_herdr_pane_shell_pid should print the pane's shell pid, got '$out'"
+  assert_contains "$(cat "$TMP_ROOT/pane-shell-pid-ok/log")" $'pane\x1fprocess-info' \
+    "the pane-shell-pid read never asked herdr for pane process-info"
+  pass "fm_backend_herdr_pane_shell_pid: answers the hosting shell's pid from the pane's own process-info"
+}
+
+test_pane_shell_pid_answers_a_busy_pane() {
+  # The observed pyenv-rehash stall shape: the pane hosts a foreground
+  # rehash plus its sleep, so the idle-shell proof refuses. The anchor must
+  # still answer, because a busy pane is precisely the case fm-spawn diagnoses.
+  local out status
+  out=$(herdr_pane_shell_pid_read pane-shell-pid-busy \
+    '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":4242,"foreground_process_group_id":4343,"foreground_processes":[{"pid":4343,"name":"bash","argv":["bash","/opt/pyenv/libexec/pyenv-rehash"]},{"pid":4344,"name":"sleep","argv":["sleep","0.1"]}]}}}')
+  status=$?
+  [ "$status" -eq 0 ] || fail "the pane anchor must answer for a BUSY pane, got status $status"
+  [ "$out" = 4242 ] || fail "the pane anchor should report the pane's shell pid even while a foreground job runs, got '$out'"
+  pass "fm_backend_herdr_pane_shell_pid: still answers while the pane is busy, unlike the idle-shell proof"
+}
+
+test_pane_shell_pid_refuses_a_reply_about_another_pane() {
+  local out status
+  out=$(herdr_pane_shell_pid_read pane-shell-pid-wrong-pane \
+    '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w9:p9","shell_pid":4242,"foreground_process_group_id":4242,"foreground_processes":[{"pid":4242,"name":"zsh","argv0":"zsh"}]}}}')
+  status=$?
+  [ "$status" -ne 0 ] || fail "a process-info reply about a DIFFERENT pane must not be accepted as this pane's shell"
+  [ -z "$out" ] || fail "a mismatched-pane reply must print nothing, got '$out'"
+  pass "fm_backend_herdr_pane_shell_pid: refuses a reply naming another pane, so no other pane's shell is ever returned"
+}
+
+test_pane_shell_pid_refuses_an_unusable_shell_pid() {
+  local out status
+  out=$(herdr_pane_shell_pid_read pane-shell-pid-string \
+    '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":"4242","foreground_process_group_id":4242,"foreground_processes":[]}}}')
+  status=$?
+  [ "$status" -ne 0 ] || fail "a non-numeric shell_pid must be refused, not string-coerced into a pid"
+  [ -z "$out" ] || fail "a non-numeric shell_pid must print nothing, got '$out'"
+  out=$(herdr_pane_shell_pid_read pane-shell-pid-init \
+    '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":1,"foreground_process_group_id":1,"foreground_processes":[]}}}')
+  status=$?
+  [ "$status" -ne 0 ] || fail "shell_pid 1 is never a pane's shell and must be refused"
+  [ -z "$out" ] || fail "shell_pid 1 must print nothing, got '$out'"
+  out=$(herdr_pane_shell_pid_read pane-shell-pid-error \
+    '{"error":{"code":"pane_not_found"}}')
+  status=$?
+  [ "$status" -ne 0 ] || fail "an error reply carrying no process_info must be refused"
+  [ -z "$out" ] || fail "an error reply must print nothing, got '$out'"
+  pass "fm_backend_herdr_pane_shell_pid: refuses a non-numeric pid, pid 1, and an error reply rather than inventing an anchor"
+}
+
+test_pane_shell_pid_dispatches_to_herdr() {
+  local dir log resp fb out status
+  dir="$TMP_ROOT/pane-shell-pid-dispatch"; mkdir -p "$dir/responses"
+  log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '%s\n' '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":5150,"foreground_process_group_id":5150,"foreground_processes":[{"pid":5150,"name":"zsh","argv0":"zsh"}]}}}' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/fm-backend.sh"; fm_backend_pane_shell_pid herdr fmtest:w1:p2' "$ROOT" 2>/dev/null )
+  status=$?
+  [ "$status" -eq 0 ] || fail "fm_backend_pane_shell_pid should route herdr targets to the herdr reader, got status $status"
+  [ "$out" = 5150 ] || fail "the dispatcher should print the herdr pane's shell pid, got '$out'"
+  out=$( bash -c '. "$0/bin/fm-backend.sh"; fm_backend_pane_shell_pid zellij sess:7' "$ROOT" 2>/dev/null )
+  status=$?
+  [ "$status" -ne 0 ] || fail "backends publishing no per-pane pid must report nothing rather than a guess"
+  [ -z "$out" ] || fail "a backend with no per-pane pid must print nothing, got '$out'"
+  pass "fm_backend_pane_shell_pid: routes herdr to its pane reader and reports nothing for a backend with no per-pane pid"
+}
+
 # --- fm-backend.sh dispatch wiring -------------------------------------------
 
 test_dispatch_routes_herdr_backend() {
@@ -4882,3 +4971,8 @@ test_events_capable_missing_subscribe_is_incapable
 test_events_capable_missing_status_event_is_incapable
 test_events_capable_tokens_are_fixed_strings
 test_events_capable_force_override_short_circuits
+test_pane_shell_pid_answers_the_hosting_shell
+test_pane_shell_pid_answers_a_busy_pane
+test_pane_shell_pid_refuses_a_reply_about_another_pane
+test_pane_shell_pid_refuses_an_unusable_shell_pid
+test_pane_shell_pid_dispatches_to_herdr

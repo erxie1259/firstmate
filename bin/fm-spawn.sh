@@ -669,8 +669,6 @@ HERDR_PROJECTION_ABORT_TASK_PANE=
 HERDR_PROJECTION_ABORT_SEEDED_PANE=
 HERDR_PRESENTATION_ORDER_LOCK=
 HERDR_PRESENTATION_ORDER_LOCK_HELD=0
-SPAWN_HERDR_PRESENTATION_ABORT_LOCK_WAIT_ATTEMPTS=50
-SPAWN_HERDR_PRESENTATION_ABORT_LOCK_WAIT_SECONDS=$((SPAWN_HERDR_PRESENTATION_ABORT_LOCK_WAIT_ATTEMPTS / 10))
 SPAWN_TASK_LOCK=
 SPAWN_TASK_LOCK_HELD=0
 SPAWN_CONTROL_LOCK=
@@ -708,7 +706,7 @@ parse_orca_worktree_result() {
 }
 
 spawn_abort_cleanup() {
-  local status=$?
+  local status=$? spawn_abort_lock_rc
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] \
      && [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] \
      && [ -n "$SPAWN_META_TMP" ] \
@@ -735,18 +733,21 @@ spawn_abort_cleanup() {
   fi
   if [ "$HERDR_PROJECTION_ABORT_CLEANUP" = 1 ] \
      && [ "$HERDR_PRESENTATION_ORDER_LOCK_HELD" != 1 ]; then
-    # Deliberately far tighter than the contention budget in
-    # bin/backends/herdr.sh: an operator who just interrupted a spawn is
-    # watching this run, and a silent multi-minute wait here reads as a hang.
-    # Losing the race only retains the projection journal for a later recovery.
-    if ! spawn_herdr_presentation_order_lock_acquire "${HERDR_PROJECTION_ABORT_SESSION:-}" 1; then
-      echo "waiting up to ${SPAWN_HERDR_PRESENTATION_ABORT_LOCK_WAIT_SECONDS}s for the herdr presentation focus lock before cleaning up the aborted projection of $ID" >&2
-      if ! spawn_herdr_presentation_order_lock_acquire \
-          "${HERDR_PROJECTION_ABORT_SESSION:-}" \
-          "$SPAWN_HERDR_PRESENTATION_ABORT_LOCK_WAIT_ATTEMPTS"; then
-        echo "warning: herdr presentation focus lock unavailable after ${SPAWN_HERDR_PRESENTATION_ABORT_LOCK_WAIT_SECONDS}s; retaining the projection journal and refusing concurrent abort cleanup" >&2
-        HERDR_PROJECTION_ABORT_CLEANUP=0
-      fi
+    # Best-effort, so it takes the adapter's short deadline rather than the
+    # contention budget: an operator who just interrupted a spawn is watching
+    # this run, and a multi-minute wait here reads as a hang. Losing the race
+    # only retains the projection journal for a later recovery.
+    spawn_abort_lock_rc=0
+    spawn_herdr_presentation_order_lock_acquire \
+      "${HERDR_PROJECTION_ABORT_SESSION:-}" \
+      "$(fm_backend_herdr_presentation_lock_best_effort_wait_attempts)" \
+      "before cleaning up the aborted projection of $ID" || spawn_abort_lock_rc=$?
+    if [ "$spawn_abort_lock_rc" -eq 2 ]; then
+      echo "warning: herdr presentation focus lock path could not be resolved; retaining the projection journal and refusing concurrent abort cleanup" >&2
+      HERDR_PROJECTION_ABORT_CLEANUP=0
+    elif [ "$spawn_abort_lock_rc" -ne 0 ]; then
+      echo "warning: herdr presentation focus lock unavailable; retaining the projection journal and refusing concurrent abort cleanup" >&2
+      HERDR_PROJECTION_ABORT_CLEANUP=0
     fi
   fi
   if [ "$HERDR_PROJECTION_ABORT_CLEANUP" = 1 ]; then
@@ -821,18 +822,17 @@ trap spawn_abort_cleanup EXIT
 # fm-teardown.sh, and the adapter's own pane close cannot drift apart.
 # <attempts> is passed only by an acquirer whose deadline is deliberately
 # tighter than that contention budget.
+# Returns 2 when the lock PATH could not be resolved at all and 1 when the
+# lock itself stayed contended, so a caller reporting the refusal names the one
+# that actually happened rather than blaming contention for an unreachable
+# session or an unwritable namespace.
 spawn_herdr_presentation_order_lock_acquire() {
-  local session=${1:-} attempts=${2:-} lock_path
+  local session=${1:-} attempts=${2:-} waiting_for=${3:-} lock_path
   [ -n "$session" ] || session=$(fm_backend_herdr_session)
-  lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") || return 1
+  lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") || return 2
   HERDR_PRESENTATION_ORDER_LOCK="$lock_path"
-  if [ -n "$attempts" ]; then
-    fm_backend_herdr_presentation_lock_acquire_wait \
-      "$HERDR_PRESENTATION_ORDER_LOCK" "$attempts" || return 1
-  else
-    fm_backend_herdr_presentation_lock_acquire_wait \
-      "$HERDR_PRESENTATION_ORDER_LOCK" || return 1
-  fi
+  fm_backend_herdr_presentation_lock_acquire_wait \
+    "$HERDR_PRESENTATION_ORDER_LOCK" "$attempts" "$waiting_for" || return 1
   HERDR_PRESENTATION_ORDER_LOCK_HELD=1
   return 0
 }
@@ -1936,7 +1936,8 @@ case "$BACKEND" in
           echo "error: herdr presentation recovery could not ensure its exact named session" >&2
           exit 1
         }
-        spawn_herdr_presentation_order_lock_acquire "$HERDR_SES" || {
+        spawn_herdr_presentation_order_lock_acquire "$HERDR_SES" "" \
+            "before resuming the interrupted presentation recovery of $ID" || {
           echo "error: herdr presentation recovery could not acquire its session lock; refusing a concurrent resume" >&2
           exit 1
         }
@@ -1981,7 +1982,8 @@ case "$BACKEND" in
         elif [ "${FM_BACKEND_HERDR_PRESENTATION_PREFERENCE:-default}" = default ] \
           && ! fm_backend_herdr_presentation_default_supported "$STATE" "$HERDR_SES"; then
           :
-        elif spawn_herdr_presentation_order_lock_acquire "$HERDR_SES"; then
+        elif spawn_herdr_presentation_order_lock_acquire "$HERDR_SES" "" \
+          "before projecting $ID into its parent workspace"; then
           # The projected child is placed and bound UNDER this launcher's exact
           # parent workspace. Its own herdr pane identity names that workspace
           # directly; the label lookup is only the fallback for a launcher with

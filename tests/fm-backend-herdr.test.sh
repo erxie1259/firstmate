@@ -2104,14 +2104,19 @@ test_kill_focused_workspace_stays_plain_close() {
 }
 
 test_kill_refuses_when_presentation_lock_is_unavailable() {
-  local dir mode out status attempts expected_attempts
+  local dir mode out status attempts expected_attempts contention_attempts
   dir="$TMP_ROOT/kill-lock-refusal"; mkdir -p "$dir"
-  # The bounded wait is the ONE budget bin/backends/herdr.sh derives beside the
-  # lock path, so this asserts the kill honors that shared budget rather than
-  # pinning a private constant that would silently drift from spawn's.
-  expected_attempts=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_presentation_lock_wait_attempts' "$ROOT")
+  # This kill is best-effort and every caller discards its result, so it must
+  # take the adapter's SHORT deadline, not the contention budget a correctness
+  # critical acquirer waits out. Both come from bin/backends/herdr.sh, so this
+  # asserts the kill picked the right one rather than pinning a private
+  # constant that would silently drift.
+  expected_attempts=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_presentation_lock_best_effort_wait_attempts' "$ROOT")
   [ -n "$expected_attempts" ] && [ "$expected_attempts" -gt 0 ] \
-    || fail "the shared presentation lock budget did not resolve to a positive attempt count"
+    || fail "the best-effort presentation lock budget did not resolve to a positive attempt count"
+  contention_attempts=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_presentation_lock_wait_attempts' "$ROOT")
+  [ "$expected_attempts" -lt "$contention_attempts" ] \
+    || fail "the best-effort budget ($expected_attempts) is not shorter than the contention budget ($contention_attempts)"
   for mode in unresolved contended; do
     : > "$dir/cli.log"
     : > "$dir/attempts"
@@ -2140,7 +2145,7 @@ test_kill_refuses_when_presentation_lock_is_unavailable() {
       "$mode presentation lock refusal did not report the deferred close"
     attempts=$(wc -l < "$dir/attempts" | tr -d ' ')
     if [ "$mode" = contended ]; then
-      [ "$attempts" = "$expected_attempts" ] || fail "contended presentation lock did not use the shared bounded wait: $attempts attempts, expected $expected_attempts"
+      [ "$attempts" = "$expected_attempts" ] || fail "contended presentation lock did not use the shared best-effort wait: $attempts attempts, expected $expected_attempts"
     else
       [ "$attempts" = 0 ] || fail "unresolved presentation lock path attempted acquisition: $attempts"
     fi

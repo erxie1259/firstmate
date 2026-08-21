@@ -773,17 +773,35 @@ fm_backend_herdr_presentation_lock_wait_attempts() {
   printf '%s' "$attempts"
 }
 
+# fm_backend_herdr_presentation_lock_best_effort_wait_attempts: the deadline
+# for an acquirer whose result is discarded, so it must not inherit the
+# contention budget above.
+# A best-effort close on a scheduled sweep or an interrupted spawn's cleanup
+# has nothing to gain from outlasting a legitimate hold - it only makes a
+# periodic sweep or a Ctrl-C read as a hang - so it gives up in 5s and leaves
+# the work to the correctness-critical acquirer that follows.
+fm_backend_herdr_presentation_lock_best_effort_wait_attempts() {
+  printf '%s' 50
+}
+
 # fm_backend_herdr_presentation_lock_acquire_wait: poll for the session
 # presentation lock within the shared budget. An explicit <attempts> is for an
 # acquirer whose own deadline is deliberately tighter than the contention
-# budget, such as an abort cleanup that must not read as a hang.
-fm_backend_herdr_presentation_lock_acquire_wait() {  # <lock-path> [attempts]
-  local lock_path=$1 attempts=${2:-} attempt=0
+# budget, such as a discarded best-effort close.
+# <waiting-for> makes a long wait legible: the notice is emitted once, and
+# only after the first try has actually failed, so an uncontended acquire stays
+# silent and a caller that never reaches the poll never announces a wait that
+# did not happen.
+fm_backend_herdr_presentation_lock_acquire_wait() {  # <lock-path> [attempts] [waiting-for]
+  local lock_path=$1 attempts=${2:-} waiting_for=${3:-} attempt=0
   [ -n "$lock_path" ] || return 1
   [ -n "$attempts" ] || attempts=$(fm_backend_herdr_presentation_lock_wait_attempts)
   while [ "$attempt" -lt "$attempts" ]; do
     if fm_lock_try_acquire "$lock_path"; then
       return 0
+    fi
+    if [ "$attempt" -eq 0 ] && [ -n "$waiting_for" ]; then
+      echo "waiting up to $((attempts / 10))s for the contended herdr session presentation lock $waiting_for" >&2
     fi
     sleep 0.1
     attempt=$((attempt + 1))
@@ -2906,7 +2924,12 @@ fm_backend_herdr_kill() {  # <target>
     . "$FM_BACKEND_HERDR_ROOT/bin/fm-wake-lib.sh"
   fi
   if lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session"); then
-    if fm_backend_herdr_presentation_lock_acquire_wait "$lock_path"; then
+    # Best-effort: every caller discards this function's result, and
+    # bin/fm-bootstrap.sh reaches it once per dead secondmate endpoint on a
+    # scheduled sweep, so it must not pay the full contention budget.
+    if fm_backend_herdr_presentation_lock_acquire_wait "$lock_path" \
+        "$(fm_backend_herdr_presentation_lock_best_effort_wait_attempts)" \
+        "before closing the task pane of $session"; then
       lock_held=1
     fi
   fi

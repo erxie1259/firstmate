@@ -2079,7 +2079,8 @@ teardown_herdr_require_prerequisites() {  # <task-id>
     fm_backend_herdr_workspace_presence_state \
     fm_backend_herdr_endpoint_confirmed_gone \
     fm_backend_herdr_explicit_close_pane_confirmed \
-    fm_backend_herdr_presentation_session_lock_path; do
+    fm_backend_herdr_presentation_session_lock_path \
+    fm_backend_herdr_presentation_lock_acquire_wait; do
     if ! declare -F "$prerequisite" >/dev/null 2>&1; then
       echo "error: herdr teardown prerequisites are unavailable for $task_id; nothing was changed - restore the adapter and rerun teardown" >&2
       return 1
@@ -2133,7 +2134,8 @@ FMEOF
   # The wait budget is the one bin/backends/herdr.sh derives beside the lock
   # path, so a teardown outlasts exactly the same longest legitimate hold a
   # concurrent spawn does instead of refusing work that was only ever slow.
-  if fm_backend_herdr_presentation_lock_acquire_wait "$lock_path"; then
+  if fm_backend_herdr_presentation_lock_acquire_wait "$lock_path" "" \
+      "before tearing down $task_id"; then
     if ! verified_lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") \
       || [ "$verified_lock_path" != "$lock_path" ]; then
       fm_lock_release "$lock_path" || true

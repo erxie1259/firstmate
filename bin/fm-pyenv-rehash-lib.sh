@@ -176,9 +176,12 @@ fm_pyenv_ancestry() {  # <pid> <rows>
 # started; it is empty when `ps` gave no readable time for that process.
 # Status 1 means the process table could not be read at all, which is a refusal
 # to guess rather than an answer of "none".
-fm_pyenv_rehash_scan() {
-  local rows exclude pid etime argv0 argv1 elapsed
-  rows=$(fm_pyenv_process_rows) || return 1
+# An already-taken snapshot may be passed in so a caller that also walks ancestry
+# answers every question from the one read this file's contract promises; omit it
+# and a fresh snapshot is taken here.
+fm_pyenv_rehash_scan() {  # [rows]
+  local rows=${1:-} exclude pid etime argv0 argv1 elapsed
+  [ -n "$rows" ] || rows=$(fm_pyenv_process_rows) || return 1
   exclude=$(fm_pyenv_ancestry "$$" "$rows")
   # Field 2 is the parent pid, needed by the ancestry walks that share these
   # rows but not here, so it is read into the throwaway and left unnamed.
@@ -200,9 +203,10 @@ EOF
 # fm_pyenv_rehash_pids: pids of every genuine live pyenv-rehash process, whether
 # it holds the lock or is only waiting for it. This is the raw "a real rehash is
 # running here" question, which is what a blocked terminal's diagnosis asks.
-fm_pyenv_rehash_pids() {
+# Takes the same optional already-read snapshot as fm_pyenv_rehash_scan.
+fm_pyenv_rehash_pids() {  # [rows]
   local scanned
-  scanned=$(fm_pyenv_rehash_scan) || return 1
+  scanned=$(fm_pyenv_rehash_scan "${1:-}") || return 1
   printf '%s' "$scanned" | awk -F '\t' 'NF { print $1 }'
 }
 

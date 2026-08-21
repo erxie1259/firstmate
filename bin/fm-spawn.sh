@@ -2250,7 +2250,11 @@ spawn_pyenv_rehash_stall_signature() {
   local lock pids pane_pid rows holder=""
   lock=$(fm_pyenv_shim_lock_path) || return 0
   [ -e "$lock" ] || return 0
-  pids=$(fm_pyenv_rehash_pids) || return 0
+  # One process-table read answers both halves below, per this file's contract:
+  # a rehash that exits between two snapshots would otherwise be in the pid list
+  # but missing from the ancestry rows, and the pane would look unaffected.
+  rows=$(fm_pyenv_process_rows) || return 0
+  pids=$(fm_pyenv_rehash_pids "$rows") || return 0
   [ -n "$pids" ] || return 0
   pane_pid=$(fm_backend_pane_shell_pid "$BACKEND" "$WT_TARGET" "$W" 2>/dev/null) || pane_pid=""
   if [ -z "$pane_pid" ]; then
@@ -2258,7 +2262,6 @@ spawn_pyenv_rehash_stall_signature() {
       "$(printf '%s\n' "$pids" | head -1)" "$lock"
     return 0
   fi
-  rows=$(fm_pyenv_process_rows) || return 0
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     if fm_pyenv_pid_has_ancestor "$pid" "$pane_pid" "$rows"; then

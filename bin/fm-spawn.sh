@@ -2567,6 +2567,7 @@ $(fm_busy_muse_matching_logs "$MUSE_SESSIONS_ROOT" "$WT" || true)
 EOF
       )
       printf '%s\n' "$MUSE_SIDECAR" > "$STATE/$ID.muse-session" || {
+        rm -f "$STATE/$ID.muse-session"
         echo "warning: could not write the muse session binding at $STATE/$ID.muse-session; this task's busy state will classify unknown rather than idle" >&2
       }
       ;;
@@ -2593,6 +2594,7 @@ EOF
         fi
       )
       printf '%s\n' "$CURSOR_SIDECAR" > "$STATE/$ID.cursor-session" || {
+        rm -f "$STATE/$ID.cursor-session"
         echo "warning: could not write the cursor session binding at $STATE/$ID.cursor-session; this task's busy state will classify unknown rather than idle" >&2
       }
       ;;

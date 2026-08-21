@@ -797,7 +797,9 @@ fm_backend_herdr_presentation_lock_best_effort_wait_attempts() {
 # <waiting-for> makes a long wait legible: the notice is emitted once, and
 # only after the first try has actually failed, so an uncontended acquire stays
 # silent and a caller that never reaches the poll never announces a wait that
-# did not happen.
+# did not happen. The seconds it announces are measured wall clock, about 2.6x
+# the nominal round math, so the operator-visible number matches the wait the
+# budgets above document rather than understating it.
 fm_backend_herdr_presentation_lock_acquire_wait() {  # <lock-path> [attempts] [waiting-for]
   local lock_path=$1 attempts=${2:-} waiting_for=${3:-} attempt=0
   [ -n "$lock_path" ] || return 1
@@ -807,7 +809,7 @@ fm_backend_herdr_presentation_lock_acquire_wait() {  # <lock-path> [attempts] [w
       return 0
     fi
     if [ "$attempt" -eq 0 ] && [ -n "$waiting_for" ]; then
-      echo "waiting up to $((attempts / 10))s for the contended herdr session presentation lock $waiting_for" >&2
+      echo "waiting up to $((attempts * 26 / 100))s for the contended herdr session presentation lock $waiting_for" >&2
     fi
     sleep 0.1
     attempt=$((attempt + 1))

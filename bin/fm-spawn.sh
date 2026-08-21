@@ -399,7 +399,7 @@ fi
 spawn_remote_secondmate() {
   local id=$1 remote host root home harness positional model effort backend out rc meta tmp
   local remote_backend remote_target remote_harness remote_herdr_session registry_lock remote_lock remote_generation
-  local remote_traceparent remote_recorded_traceparent
+  local remote_traceparent remote_recorded_traceparent meta_body
   local -a launch_args
   id=${POS[0]:-}
   fm_task_id_creation_valid "$id" || { echo "error: invalid task id" >&2; return 2; }
@@ -607,7 +607,7 @@ spawn_remote_secondmate() {
   remote_recorded_traceparent=$(printf '%s\n' "$out" | sed -n 's/^traceparent=//p' | tail -1)
   fm_trace_context_valid "$remote_recorded_traceparent" || remote_recorded_traceparent=
   tmp="$meta.tmp.$$"
-  {
+  meta_body=$(
     echo "window=remote:$id"
     echo "endpoint_task_id=$id"
     echo "worktree=$home"
@@ -627,8 +627,23 @@ spawn_remote_secondmate() {
     echo "remote_herdr_session=$remote_herdr_session"
     echo "remote_target=$remote_target"
     [ -z "$remote_recorded_traceparent" ] || echo "traceparent=$remote_recorded_traceparent"
-  } > "$tmp"
-  mv -f -- "$tmp" "$meta"
+  )
+  if ! printf '%s\n' "$meta_body" > "$tmp"; then
+    rm -f -- "$tmp"
+    fm_lock_release "$remote_lock" || true
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: remote secondmate $id launched, but its endpoint metadata could not be staged at $tmp; preserving the remote route for reconciliation" >&2
+    return 1
+  fi
+  if ! mv -f -- "$tmp" "$meta"; then
+    rm -f -- "$tmp"
+    fm_lock_release "$remote_lock" || true
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: remote secondmate $id launched, but its endpoint metadata could not be published at $meta; preserving the remote route for reconciliation" >&2
+    return 1
+  fi
   if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
     SPAWN_TASK_SET_LOCK_HELD=0
     fm_lock_release "$SPAWN_TASK_SET_LOCK"
@@ -2532,16 +2547,22 @@ EOF
       MUSE_SESSIONS_ROOT="${MUSE_DATA_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}}/muse/sessions"
       MUSE_BINDING_ID="$$.$RANDOM.$(date +%s)"
       rm -f "$STATE/$ID.muse-session-current"
-      {
+      MUSE_SIDECAR=$(
         printf 'sessions_root=%s\n' "$MUSE_SESSIONS_ROOT"
         printf 'workspace_root=%s\n' "$WT"
         printf 'binding_id=%s\n' "$MUSE_BINDING_ID"
         while IFS= read -r MUSE_PRIOR_LOG; do
-          [ -n "$MUSE_PRIOR_LOG" ] && printf 'prior_log=%s\n' "$MUSE_PRIOR_LOG"
+          if [ -n "$MUSE_PRIOR_LOG" ]; then
+            printf 'prior_log=%s\n' "$MUSE_PRIOR_LOG"
+          fi
         done <<EOF
 $(fm_busy_muse_matching_logs "$MUSE_SESSIONS_ROOT" "$WT" || true)
 EOF
-      } > "$STATE/$ID.muse-session"
+      )
+      printf '%s\n' "$MUSE_SIDECAR" > "$STATE/$ID.muse-session" || {
+        echo "error: cannot write the muse session binding at $STATE/$ID.muse-session" >&2
+        exit 1
+      }
       ;;
     cursor*)
       # Cursor's turn lifecycle is neither a hook nor a launch flag: it writes
@@ -2555,7 +2576,7 @@ EOF
       # conversation instead of its predecessor's. The classifier then accepts
       # only one remaining conversation and never guesses between incarnations.
       CURSOR_PROJECTS_ROOT="${CURSOR_PROJECTS_ROOT_OVERRIDE:-$HOME/.cursor/projects}"
-      {
+      CURSOR_SIDECAR=$(
         printf 'projects_root=%s\n' "$CURSOR_PROJECTS_ROOT"
         printf 'workspace_root=%s\n' "$WT"
         if CURSOR_PRIOR_PROJECT=$(fm_busy_cursor_project_dir "$CURSOR_PROJECTS_ROOT" "$WT" 2>/dev/null); then
@@ -2564,7 +2585,11 @@ EOF
             printf 'prior_conversation=%s\n' "$(basename -- "${CURSOR_PRIOR_DIR%/}")"
           done
         fi
-      } > "$STATE/$ID.cursor-session"
+      )
+      printf '%s\n' "$CURSOR_SIDECAR" > "$STATE/$ID.cursor-session" || {
+        echo "error: cannot write the cursor session binding at $STATE/$ID.cursor-session" >&2
+        exit 1
+      }
       ;;
     kimi*)
       # Kimi's Stop hook is global, but it is inert unless cwd contains this

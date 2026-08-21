@@ -12,6 +12,15 @@
 # transient-then-settled pane_current_path sequence with a fake tmux and
 # asserts the recorded worktree resolves to the real, settled worktree, never
 # the stale first read.
+#
+# The same file also owns the publication that CONSUMES that settled worktree,
+# because a worktree the spawn detected correctly is worth nothing if the task
+# record naming it never reaches disk. Stock macOS Bash 3.2 does not treat a
+# failed redirection on a compound command as a fatal errexit condition, so the
+# original `{ ... } > "$STATE/<id>.meta"` block published an empty record and
+# still printed its success line and exited 0 whenever that path could not be
+# opened for writing. The cases below drive a complete spawn against exactly
+# that path and assert the record either lands whole or the spawn refuses.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -141,7 +150,71 @@ test_already_settled_pane_costs_one_confirm_sleep() {
   pass "an already-settled pane confirms via the existing inter-poll sleep, not an extra full cycle"
 }
 
+# An existing task record that cannot be opened for writing is the failure the
+# atomic publication was introduced for: the redirection that used to write the
+# record in place silently produced nothing under Bash 3.2, leaving a live task
+# whose worktree= a reader resolves as empty while the spawn claimed success.
+# Publishing through a private temporary and renaming needs only directory
+# write permission, so the settled worktree this file already asserts must now
+# actually be readable back out of the published record.
+test_publication_survives_an_unwritable_existing_record() {
+  local rec id out status meta
+  id=settle-unwritable-record-z3
+  rec=$(make_settle_case settle-unwritable-record "$id" 0)
+  read_settle_record "$rec"
+  meta="$HOME_DIR/state/$id.meta"
+  : > "$meta"
+  chmod 000 "$meta"
+
+  out=$(run_settle_spawn "$id")
+  status=$?
+  chmod 644 "$meta" 2>/dev/null || true
+  expect_code 0 "$status" "spawn should succeed when the record path is only unwritable in place"
+  assert_contains "$out" "spawned $id" "spawn did not report success"
+  [ -s "$meta" ] || fail "the task record was published empty, so every reader resolves its worktree as nothing"
+  assert_grep "worktree=$WT_DIR" "$meta" \
+    "the published record did not carry the settled worktree"
+  assert_grep "window=" "$meta" "the published record is missing its endpoint window"
+  pass "an unwritable existing task record is replaced whole rather than published empty"
+}
+
+# The other half of the same contract: when publication genuinely cannot
+# complete, the spawn must say so and exit non-zero instead of printing its
+# success line over a backend terminal and worktree nothing will ever reclaim.
+# The rename is faulted for this task's record only, standing in for the
+# read-only filesystem, quota, and EIO cases that reach the same branch.
+test_failed_publication_refuses_to_report_success() {
+  local rec id out status
+  id=settle-publish-fault-z4
+  rec=$(make_settle_case settle-publish-fault "$id" 0)
+  read_settle_record "$rec"
+  cat > "$FAKEBIN_DIR/mv" <<SH
+#!/usr/bin/env bash
+set -u
+for arg in "\$@"; do
+  case "\$arg" in
+    *"/$id.meta") exit 1 ;;
+  esac
+done
+exec /bin/mv "\$@"
+SH
+  chmod +x "$FAKEBIN_DIR/mv"
+
+  out=$(run_settle_spawn "$id")
+  status=$?
+  [ "$status" -ne 0 ] || fail "a spawn whose task record could not be published exited 0: $out"
+  assert_contains "$out" "cannot publish task metadata" \
+    "the spawn did not say the task record could not be published"
+  assert_not_contains "$out" "spawned $id" \
+    "the spawn reported success even though its task record never landed"
+  assert_absent "$HOME_DIR/state/$id.meta" \
+    "an unpublished spawn still left a task record behind"
+  pass "a task record that cannot be published fails the spawn loudly instead of leaking a live endpoint"
+}
+
 test_single_stale_first_read_is_not_accepted
 test_already_settled_pane_costs_one_confirm_sleep
+test_publication_survives_an_unwritable_existing_record
+test_failed_publication_refuses_to_report_success
 
 echo "# all fm-spawn-worktree-settle tests passed"

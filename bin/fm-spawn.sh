@@ -98,6 +98,13 @@
 #   even when they select different backends. A fresh spawn first takes the
 #   per-home task-set lock and refuses rather than waits when forced teardown owns
 #   it; relaunch is exempt because the existing task's control lock covers it.
+#   Every spawn, fresh or relaunch, publishes state/<id>.meta by renaming a
+#   private temporary into place, so a truncated or unwritable record never
+#   becomes a live task: a failed publication aborts the spawn through the
+#   normal abort cleanup instead of printing the success line. A remote
+#   secondmate whose endpoint metadata cannot be staged or published fails the
+#   same way but leaves the remote route in place for reconciliation, because
+#   its agent is already running on the remote host.
 #   With no harness arg, a crewmate/scout spawn resolves the CREW harness only when
 #   config/crew-dispatch.json is absent. When that file exists, crewmate/scout
 #   spawns require an explicit harness so firstmate cannot silently skip dispatch
@@ -176,6 +183,9 @@
 # resolver because `cursor` is not the CLI name. A cursor SECONDMATE instead runs
 # the tracked project-scope .cursor/hooks.json in its own home, whose stop-hook
 # park owns that home's supervision (docs/supervision-protocols/cursor.md).
+# Either binding is an optional busy-detection sidecar, so a binding that cannot
+# be written warns loudly and leaves the spawn healthy; that task's busy state
+# then classifies unknown rather than idle.
 # On success prints: spawned <id> harness=<name> kind=<ship|scout|secondmate> [mode=<mode> yolo=<on|off>] window=<backend-target> worktree=<path>
 # A ship task records the explicit mode/yolo it was passed; a secondmate spawn records
 # mode=secondmate, yolo=off, home=, and projects=; a scout records neither, and both the

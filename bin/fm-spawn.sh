@@ -2228,11 +2228,12 @@ spawn_wait_for_worktree() {
 # signature; print nothing for a timeout with any other cause.
 #
 # The signature is: pyenv's rehash lock exists AND a genuine rehash process is
-# alive, holder or waiter (bin/fm-pyenv-rehash-lib.sh owns that identity, and why
-# a command-line pattern match must never be used for it). A waiter counts here
-# because a shell blocked waiting on the lock is exactly the observed fault;
-# whether that rehash could still be holding the lock is the cleaner's question,
-# not this diagnosis's. Where the backend can name the
+# alive (bin/fm-pyenv-rehash-lib.sh owns that identity, and why a command-line
+# pattern match must never be used for it). This asks only "is a real rehash
+# running here", not "could it be the lock's holder": a shell queued behind an
+# orphaned lock is exactly the observed fault, and which of them could actually
+# own the lock is the cleaner's question, not this diagnosis's.
+# Where the backend can name the
 # terminal's own shell, the rehash must additionally descend from that shell,
 # which is the observed shape - `bash .../libexec/pyenv-rehash` running as the
 # stalled pane's foreground child while the shell is still starting up. cmux and

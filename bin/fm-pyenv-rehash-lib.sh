@@ -33,12 +33,18 @@
 # restates the rules above.
 
 # Seconds after which a still-present lock is treated as abandoned regardless of
-# who is alive. pyenv's own waiters give up after PYENV_REHASH_TIMEOUT (60s), so
-# a lock older than that is one no rehash can still be usefully holding, and any
-# live rehash process at that point is a WAITER, not the holder. The default sits
-# above pyenv's timeout so a genuinely slow rehash is never mistaken for a stale
-# one. Overridable for tests only.
+# which rehash processes are alive. The default sits above pyenv's own
+# PYENV_REHASH_TIMEOUT (60s), which is how long a rehash queues for the lock
+# before giving up and exiting, so an ordinary rehash cycle is long finished by
+# then and is never mistaken for a stale one. Overridable for tests only.
 FM_PYENV_REHASH_STALE_SECS=${FM_PYENV_REHASH_STALE_SECS:-90}
+
+# Slack, in seconds, allowed when comparing a rehash process's start time against
+# the lock's mtime. `ps` reports elapsed time in whole seconds and the two values
+# are read a moment apart, so a difference inside this window proves nothing and
+# the process is KEPT in the holder set. Every ambiguity here resolves toward
+# refusing to clear.
+FM_PYENV_REHASH_START_SLACK_SECS=${FM_PYENV_REHASH_START_SLACK_SECS:-2}
 
 # fm_pyenv_shim_lock_path: the one path this fleet's cleaner is allowed to touch,
 # derived from pyenv's own root convention (PYENV_ROOT, else ~/.pyenv - the same
@@ -128,18 +134,6 @@ fm_pyenv_etime_seconds() {  # <etime>
   printf '%s\n' "$(( ((10#$days * 24 + 10#$h) * 60 + 10#$m) * 60 + 10#$s ))"
 }
 
-# fm_pyenv_rehash_timeout_secs: pyenv's own PYENV_REHASH_TIMEOUT, which is how
-# long a rehash waits for the lock before giving up. Defaults to pyenv's own
-# default of 60; an unusable value falls back to it rather than being trusted.
-fm_pyenv_rehash_timeout_secs() {
-  local t=${PYENV_REHASH_TIMEOUT:-60}
-  case "$t" in
-    ''|*[!0-9]*) t=60 ;;
-  esac
-  [ "$t" -gt 0 ] || t=60
-  printf '%s\n' "$t"
-}
-
 # fm_pyenv_is_shell_argv0: <argv0> names a recognized interactive-or-script shell.
 # BSD ps reports argv0, so a login shell arrives as "-zsh"; strip that dash the
 # same way bin/backends/herdr.sh's idle-shell proof does.
@@ -176,9 +170,10 @@ fm_pyenv_ancestry() {  # <pid> <rows>
 
 # fm_pyenv_rehash_scan: one `pid<TAB>elapsed-seconds` row for every genuine live
 # pyenv-rehash process, holder or waiter, excluding this process and its
-# ancestors. The elapsed field is empty when `ps` gave no readable time for that
-# process. Status 1 means the process table could not be read at all, which is a
-# refusal to guess rather than an answer of "none".
+# ancestors. Elapsed time is carried so a caller can derive when each process
+# started; it is empty when `ps` gave no readable time for that process.
+# Status 1 means the process table could not be read at all, which is a refusal
+# to guess rather than an answer of "none".
 fm_pyenv_rehash_scan() {
   local rows exclude pid etime argv0 argv1 elapsed
   rows=$(fm_pyenv_process_rows) || return 1
@@ -210,24 +205,41 @@ fm_pyenv_rehash_pids() {
 }
 
 # fm_pyenv_rehash_live_pids: pids of every genuine live pyenv-rehash process that
-# could still be HOLDING the lock. This is the holder set, and it is the only
-# place that knows the waiter rule; every consumer inherits it from here.
+# could still be HOLDING <lock-path>. This is the holder set, and it is the only
+# place that knows how a holder is told from a mere waiter; every consumer
+# inherits that rule by calling here.
 #
-# Why long-lived rehash processes are dropped, which SHARPENS this identity
-# rather than loosening it: pyenv's own acquire loop gives up after
-# PYENV_REHASH_TIMEOUT, so a rehash process that has itself been running longer
-# than that has by pyenv's own contract already stopped trying to take the lock -
-# it is a waiter, and it can never be the holder. A rehash that genuinely just
-# started still blocks any clear, exactly as before. An unreadable elapsed time
-# proves nothing, so such a process stays in the holder set and clearing is
-# refused, which is the safe direction.
-fm_pyenv_rehash_live_pids() {
-  local scanned timeout
+# The rule is start time against the lock's own mtime, not run length. pyenv's
+# holder is the process that created the lock in acquire_lock and then rewrote it
+# in create_prototype_shim, so the lock's mtime is always at or after the holder's
+# own start. A rehash that started AFTER the lock already existed therefore cannot
+# be the process that made it: it is queued behind the lock, and dropping it is
+# what lets a freshly orphaned lock be cleared while a blocked shell waits on it.
+#
+# Deliberately NOT run length: pyenv's acquire loop runs only until
+# start + PYENV_REHASH_TIMEOUT and the waiter then exits, so a rehash still alive
+# past that timeout has already acquired the lock and is inside the shim-writing
+# body, which on a cold cache legitimately takes tens of seconds. Excluding
+# long-running processes would drop exactly the real holders. That is also why
+# nothing here reads PYENV_REHASH_TIMEOUT: this process's own environment says
+# nothing about the shell that actually holds the lock.
+#
+# Every unprovable case keeps the process in the set so the caller refuses: an
+# unreadable elapsed time, an unreadable lock mtime, and any difference inside
+# FM_PYENV_REHASH_START_SLACK_SECS.
+fm_pyenv_rehash_live_pids() {  # <lock-path>
+  local scanned mtime now
   scanned=$(fm_pyenv_rehash_scan) || return 1
-  timeout=$(fm_pyenv_rehash_timeout_secs)
-  printf '%s' "$scanned" | awk -F '\t' -v t="$timeout" '
+  mtime=$(fm_pyenv_mtime "${1:-}") || mtime=""
+  now=$(date +%s) || now=""
+  if [ -z "$mtime" ] || [ -z "$now" ]; then
+    printf '%s' "$scanned" | awk -F '\t' 'NF { print $1 }'
+    return 0
+  fi
+  printf '%s' "$scanned" \
+    | awk -F '\t' -v mtime="$mtime" -v now="$now" -v slack="$FM_PYENV_REHASH_START_SLACK_SECS" '
     NF {
-      if ($2 != "" && $2 + 0 > t + 0) next
+      if ($2 != "" && now - $2 > mtime + slack) next
       print $1
     }
   '
@@ -258,16 +270,17 @@ fm_pyenv_pid_has_ancestor() {  # <pid> <ancestor> [rows]
 # On `live` it also prints the deciding holder pid as a second field.
 #
 # The rule, in one place: a lock older than FM_PYENV_REHASH_STALE_SECS is
-# orphaned no matter who is running, because every live rehash by then is a
-# waiter that pyenv itself would have given up on. A younger lock is live only
-# while a genuine rehash process exists; when none does, the young lock is
-# re-sampled once after a short settle before being called orphaned, so a rehash
-# that started between the two reads is not stepped on.
+# orphaned no matter which rehash processes are alive, since an ordinary rehash
+# cycle finishes far inside that. A younger lock is live only while a process
+# that could actually be its holder exists, which fm_pyenv_rehash_live_pids
+# decides from the lock's own mtime; when none does, the young lock is re-sampled
+# once after a short settle before being called orphaned, so a rehash that
+# started between the two reads is not stepped on.
 fm_pyenv_shim_lock_state() {  # <lock-path>
   local lock=$1 age pids
   [ -e "$lock" ] || { printf 'absent\n'; return 0; }
   age=$(fm_pyenv_shim_lock_age_seconds "$lock") || { printf 'unknown\n'; return 0; }
-  pids=$(fm_pyenv_rehash_live_pids) || { printf 'unknown\n'; return 0; }
+  pids=$(fm_pyenv_rehash_live_pids "$lock") || { printf 'unknown\n'; return 0; }
   if [ "$age" -ge "$FM_PYENV_REHASH_STALE_SECS" ]; then
     printf 'orphaned\n'
     return 0
@@ -278,7 +291,7 @@ fm_pyenv_shim_lock_state() {  # <lock-path>
   fi
   sleep 0.5
   [ -e "$lock" ] || { printf 'absent\n'; return 0; }
-  pids=$(fm_pyenv_rehash_live_pids) || { printf 'unknown\n'; return 0; }
+  pids=$(fm_pyenv_rehash_live_pids "$lock") || { printf 'unknown\n'; return 0; }
   if [ -n "$pids" ]; then
     printf 'live %s\n' "$(printf '%s\n' "$pids" | head -1)"
     return 0

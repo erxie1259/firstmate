@@ -30,8 +30,8 @@ CLEAR="$ROOT/bin/fm-pyenv-shim-lock-clear.sh"
 TMP_ROOT=$(fm_test_tmproot fm-pyenv-shim-lock)
 
 BG_PIDS=""
-# Empty means "let the library use pyenv's own default"; a case that needs a
-# waiter without waiting a real minute lowers it for the duration of that case.
+# Only the regression case below sets this, and only to prove that pyenv's own
+# timeout has no say in who holds the lock. Empty everywhere else.
 CASE_REHASH_TIMEOUT=""
 
 stop_background() {
@@ -174,14 +174,14 @@ test_a_second_run_is_a_silent_no_op() {
   pass "running the cleaner twice clears once and then says nothing"
 }
 
-# A rehash that has only just started is still inside pyenv's own acquire window,
-# so it may genuinely own this lock; taking it away would let a second rehash
-# write shims underneath the first.
+# A rehash that was already running when the lock appeared is the process that
+# could have created it; taking the lock away would let a second rehash write
+# shims underneath the first.
 test_a_live_rehash_is_refused() {
   local out status
   read_case "$(make_case live)"
-  write_lock 'body'
   start_rehash
+  write_lock 'body'
   out=$(run_clear)
   status=$?
   expect_code 3 "$status" "a live rehash must be refused with its own exit status"
@@ -229,9 +229,9 @@ test_a_command_line_mention_is_not_a_holder() {
 }
 
 # The observed fault: the lock is long orphaned and every new shell is stuck
-# WAITING on it, so live rehash processes exist and none of them is the holder.
-# pyenv's own waiters give up after PYENV_REHASH_TIMEOUT, so a lock older than
-# that cannot still be held.
+# WAITING on it, so live rehash processes exist and none of them created this
+# lock - each started long after the file was already there. The lock is also
+# older than the staleness threshold, so it is clearable on either ground.
 test_a_stale_lock_is_cleared_even_while_waiters_run() {
   local out status
   read_case "$(make_case waiters)"
@@ -248,28 +248,52 @@ test_a_stale_lock_is_cleared_even_while_waiters_run() {
 }
 
 # The routine window: the lock was orphaned moments ago, so it is far younger
-# than the staleness threshold, and the only rehash alive has already been
-# waiting longer than pyenv's own acquire timeout. pyenv's contract makes that
-# process a waiter, never the holder, so the lock is clearable.
+# than the staleness threshold, and the only rehash alive started AFTER the lock
+# already existed. A process that was not running when the file appeared cannot
+# be the process that created it, so it is queued behind the lock, not holding
+# it, and the lock is clearable.
 test_a_young_lock_with_a_waiting_rehash_is_cleared() {
   local out status
   read_case "$(make_case young-waiter)"
-  # No backdating: this lock is young, so only the waiter rule can clear it.
+  # No backdating: this lock is young, so only the start-time rule can clear it.
   write_lock 'body'
+  # Enough separation that the rehash provably starts after the lock's mtime,
+  # beyond the whole-second granularity `ps` reports.
+  sleep 4
   start_rehash
-  # Outlive pyenv's acquire timeout, lowered for the case so this costs seconds
-  # rather than a real minute.
-  sleep 2
+  out=$(run_clear)
+  status=$?
+  expect_code 0 "$status" "a young lock whose only rehash started after it must be cleared"
+  assert_contains "$out" "cleared orphaned pyenv rehash lock" \
+    "a rehash that only started after the lock existed was treated as its holder"
+  assert_absent "$LOCK" "the young orphaned lock survived"
+  stop_background
+  pass "a young lock is cleared when its only rehash started after the lock already existed"
+}
+
+# The regression that matters: a rehash which was running before the lock
+# appeared is a candidate holder no matter how long its body has been going.
+# pyenv's own acquire loop ends at PYENV_REHASH_TIMEOUT and the waiter exits,
+# so a still-running rehash past that point has ACQUIRED the lock and is writing
+# shims - the one process that must never be cleared out from under. The timeout
+# is set to one second here precisely to prove it has no say: the cleaner sees it
+# in its own environment, the shell that owns the lock never did.
+test_a_rehash_older_than_its_lock_is_refused_however_long_it_runs() {
+  local out status
+  read_case "$(make_case long-holder)"
+  start_rehash
+  sleep 4
+  write_lock 'body'
   CASE_REHASH_TIMEOUT=1
   out=$(run_clear)
   status=$?
   CASE_REHASH_TIMEOUT=""
-  expect_code 0 "$status" "a young lock whose only rehash has given up waiting must be cleared"
-  assert_contains "$out" "cleared orphaned pyenv rehash lock" \
-    "a rehash that had already outwaited pyenv's timeout was treated as the holder"
-  assert_absent "$LOCK" "the young orphaned lock survived"
+  expect_code 3 "$status" "a rehash predating its lock must be refused whatever its run length"
+  assert_contains "$out" "refused: a pyenv rehash is in progress" \
+    "the refusal did not name the reason"
+  assert_present "$LOCK" "a running rehash's own lock was moved aside"
   stop_background
-  pass "a young lock is cleared when its only rehash has already outwaited pyenv's own timeout"
+  pass "a rehash that predates its lock keeps holding it however long it has been running"
 }
 
 # The narrow surface is the reason this command can be allowlisted at all: it
@@ -309,6 +333,7 @@ test_a_live_rehash_is_refused
 test_a_command_line_mention_is_not_a_holder
 test_a_stale_lock_is_cleared_even_while_waiters_run
 test_a_young_lock_with_a_waiting_rehash_is_cleared
+test_a_rehash_older_than_its_lock_is_refused_however_long_it_runs
 test_arguments_are_refused
 test_an_unexpected_file_type_is_refused
 

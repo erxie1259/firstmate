@@ -238,9 +238,6 @@ SH
 # get` already sitting in its input.
 
 STALL_BG_PIDS=""
-# Empty means "let the library use pyenv's own default"; a case that needs a
-# waiter without waiting a real minute lowers it for the duration of that case.
-STALL_REHASH_TIMEOUT=""
 
 stop_stall_background() {
   local p
@@ -379,7 +376,6 @@ run_stall_spawn() {
     FM_FAKE_PANE_PATH="$STALL_WT" FM_FAKE_PROJ_PATH="$STALL_PROJ" \
     FM_FAKE_STALL_MARKER="$STALL_MARKER" FM_FAKE_PANE_PID_FILE="$STALL_PIDFILE" \
     PYENV_ROOT="$STALL_PYROOT" FM_PYENV_PS_BIN="$STALL_PS" \
-    PYENV_REHASH_TIMEOUT="$STALL_REHASH_TIMEOUT" \
     FM_TEST_FIXTURE_ROOT="$TMP_ROOT" \
     PATH="$STALL_FAKEBIN:$PATH" \
     "$SPAWN" "$id" "$STALL_PROJ" --mode no-mistakes --yolo off 2>&1
@@ -434,16 +430,16 @@ test_an_orphaned_lock_stall_recovers_and_says_so() {
   pass "a stall on an orphaned pyenv rehash lock is cleared once, retried once, and reported"
 }
 
-# A rehash that has only just started is still inside pyenv's own acquire window,
-# so it may genuinely hold the lock and the cleaner must refuse. That refusal is
-# the real diagnosis; reporting a bare timeout here would send the operator
-# hunting the wrong fault.
+# A rehash that was already running when the lock appeared could be the process
+# that created it, so the cleaner must refuse. That refusal is the real
+# diagnosis; reporting a bare timeout here would send the operator hunting the
+# wrong fault.
 test_a_live_rehash_stall_surfaces_the_refusal() {
   local id out status
   id=stall-refused-z7
   make_stall_case stall-refused "$id"
-  printf 'body' > "$STALL_LOCK"
   start_pane_shell "$STALL_REHASH" 300
+  printf 'body' > "$STALL_LOCK"
   out=$(run_stall_spawn "$id")
   status=$?
   [ "$status" -ne 0 ] || fail "a spawn whose lock could not be cleared exited 0: $out"
@@ -457,36 +453,34 @@ test_a_live_rehash_stall_surfaces_the_refusal() {
 }
 
 # The routine window the recovery exists to cover: the lock was orphaned only
-# moments ago, so it is younger than the staleness threshold, and the only rehash
-# alive is the pane's own - which has already been waiting longer than pyenv's
-# acquire timeout and therefore cannot be holding anything. The spawn must clear
-# it and recover rather than refuse and hand the operator the unblock button.
+# moments ago, so it is younger than the staleness threshold, and the pane's own
+# rehash started AFTER the lock already existed - it is queued behind it, not
+# holding it. The spawn must clear it and recover rather than refuse and hand the
+# operator the unblock button.
 test_a_young_orphan_with_a_waiting_rehash_recovers() {
   local id out status
   id=stall-young-orphan-z9
   make_stall_case stall-young-orphan "$id"
-  # No backdating: this lock is young, so only the waiter rule can clear it.
+  # No backdating: this lock is young, so only the start-time rule can clear it.
   printf 'body' > "$STALL_LOCK"
+  # Enough separation that the pane's rehash provably starts after the lock's
+  # mtime, beyond the whole-second granularity `ps` reports.
+  sleep 4
   start_pane_shell "$STALL_REHASH" 300
-  # Outlive pyenv's acquire timeout, lowered for the case so this costs seconds
-  # rather than a real minute.
-  sleep 2
-  STALL_REHASH_TIMEOUT=1
   out=$(run_stall_spawn "$id")
   status=$?
-  STALL_REHASH_TIMEOUT=""
-  expect_code 0 "$status" "a young orphaned lock with only a waiting rehash did not recover: $out"
+  expect_code 0 "$status" "a young orphaned lock with only a queued rehash did not recover: $out"
   assert_contains "$out" "stalled because a pyenv rehash" \
     "the recovery did not report what it diagnosed"
   assert_contains "$out" "cleared orphaned pyenv rehash lock" \
-    "a rehash that had already given up waiting was treated as the lock's holder"
+    "a rehash that only started after the lock existed was treated as its holder"
   assert_contains "$out" "recovered after clearing the orphaned pyenv rehash lock" \
     "the recovery healed silently instead of reporting itself"
   assert_absent "$STALL_LOCK" "the young orphaned lock was left in place"
   assert_grep "worktree=$STALL_WT" "$STALL_HOME/state/$id.meta" \
     "the recovered spawn did not record the worktree it finally entered"
   stop_stall_background
-  pass "a young orphaned lock whose only rehash has outwaited pyenv's timeout is cleared and recovered"
+  pass "a young orphaned lock whose only rehash started after it is cleared and recovered"
 }
 
 # The trap, at the spawn's own level: a process on this pane that merely quotes

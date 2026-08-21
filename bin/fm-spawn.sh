@@ -790,13 +790,23 @@ trap spawn_abort_cleanup EXIT
 # One bounded lock per live Herdr session/socket, shared across all homes.
 # <session> is required so secondmate and primary spawns serialize against the
 # same session without writing any other home's state directory.
+# A projected spawn holds this lock from before its workspace exists until
+# after the harness launch (spawn_herdr_presentation_order_lock_release near
+# the end of this script), and that span CONTAINS the worktree-discovery poll,
+# which is itself allowed a full 60 one-second rounds. So the budget below is
+# derived from the longest legitimate hold rather than picked: a concurrent
+# spawn or recovery has to outlast one entire projected spawn or it refuses
+# work that was only ever going to be slow, which is what a 5s budget did.
+# It stays BOUNDED on purpose - a genuinely wedged holder must still refuse
+# loudly instead of hanging a spawn forever.
+SPAWN_HERDR_PRESENTATION_LOCK_WAIT_ATTEMPTS=1800  # x0.1s = 180s, ~2x the worst legitimate hold
 spawn_herdr_presentation_order_lock_acquire() {
   local session=${1:-} attempt lock_path
   [ -n "$session" ] || session=$(fm_backend_herdr_session)
   lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") || return 1
   HERDR_PRESENTATION_ORDER_LOCK="$lock_path"
   attempt=0
-  while [ "$attempt" -lt 50 ]; do
+  while [ "$attempt" -lt "$SPAWN_HERDR_PRESENTATION_LOCK_WAIT_ATTEMPTS" ]; do
     if fm_lock_try_acquire "$HERDR_PRESENTATION_ORDER_LOCK"; then
       HERDR_PRESENTATION_ORDER_LOCK_HELD=1
       return 0

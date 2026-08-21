@@ -668,7 +668,7 @@ test_spawn_survives_agent_rename_failure() {
     FM_FAKE_HERDR_RENAME_FAIL=1 FM_BACKEND_HERDR_AGENT_RENAME_DELAY=0 \
     PATH="$fakebin:$PATH" \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" "sh -c 'echo launched'" \
-      --backend herdr --model dsv4pro 2>&1)
+      --mode no-mistakes --yolo off --backend herdr --model dsv4pro 2>&1)
   status=$?
   expect_code 0 "$status" "fm-spawn must succeed when cosmetic Herdr rename fails"
   assert_contains "$out" "spawned $id" "spawn did not reach successful completion after rename failure"

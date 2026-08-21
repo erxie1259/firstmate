@@ -86,12 +86,13 @@ The normal case of multiple crews on one model remains distinct because task ide
 Renaming an OpenCode agent leaves `agent=opencode`, so native identity branches such as Pi composer handling continue to use the unchanged detected type.
 The task tab remains exactly `fm-<task-id>` because task lookup depends on that label.
 
-Agent registration can lag behind pane launch, so Firstmate retries a not-yet-registered rename up to 20 times at 0.25 second intervals before giving up.
-The retry limit and delay are configurable via `FM_BACKEND_HERDR_AGENT_RENAME_ATTEMPTS` and `FM_BACKEND_HERDR_AGENT_RENAME_DELAY`.
+Agent registration can lag behind pane launch, so Firstmate polls the read-only agent lookup up to 20 times at 0.25 second intervals and issues the rename only once an agent is actually registered in that pane.
+A pane that never registers one - a plain shell command, a test fixture - is left exactly as it was found, because renaming an agentless pane is a write whose meaning varies between Herdr releases.
+The probe limit and delay are configurable via `FM_BACKEND_HERDR_AGENT_RENAME_ATTEMPTS` and `FM_BACKEND_HERDR_AGENT_RENAME_DELAY`.
 There is no event-driven background watcher that picks up late registrations after the attempt window ends.
 Each individual herdr CLI call is bounded by a 5 second timeout (configurable via `FM_BACKEND_HERDR_AGENT_RENAME_TIMEOUT`).
 The entire rename runs detached from the spawn tail with stdin closed, so it never blocks spawn completion, task-lock release, or metadata publication.
-Any other rename failure warns and lets spawn, metadata publication, and supervision continue unchanged.
+Any rename failure warns and lets spawn, metadata publication, and supervision continue unchanged.
 Naming is presentation only and never task or endpoint authority.
 
 `herdr agent rename <pane> --clear` can clear a live name manually.

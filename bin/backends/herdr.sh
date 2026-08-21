@@ -449,10 +449,13 @@ fm_backend_herdr_agent_name_compose() {  # <task-id> <model> [collision-ordinal]
   printf '%s' "$name"
 }
 
-# fm_backend_herdr_agent_name_best_effort: wait briefly for the launched agent
-# registration, then set its display name. Session name collisions advance
-# through deterministic numeric suffixes. Naming is cosmetic: every failure
-# warns and returns success so it can never abort a spawn.
+# fm_backend_herdr_agent_name_best_effort: wait for the launched agent to
+# register, then set its display name. The wait polls the read-only agent
+# lookup and renames only once an agent actually exists, so a pane that never
+# registers one is left alone instead of being written to. Session name
+# collisions advance through deterministic numeric suffixes. Naming is
+# cosmetic: every failure warns and returns success so it can never abort a
+# spawn.
 #
 # Registration retry limit FM_BACKEND_HERDR_AGENT_RENAME_ATTEMPTS (default 20),
 # inter-attempt delay FM_BACKEND_HERDR_AGENT_RENAME_DELAY (default 0.25s).
@@ -462,7 +465,7 @@ fm_backend_herdr_agent_name_compose() {  # <task-id> <model> [collision-ordinal]
 # completion or task-lock release.
 fm_backend_herdr_agent_name_best_effort() {  # <session> <pane> <task-id> <model>
   local session=$1 pane=$2 task=$3 model=$4 ordinal=1 name out code detail
-  local registration_attempt=1
+  local registration_attempt=1 registered=0
   local registration_attempts=${FM_BACKEND_HERDR_AGENT_RENAME_ATTEMPTS:-20}
   local delay=${FM_BACKEND_HERDR_AGENT_RENAME_DELAY:-0.25}
   local cli_timeout=${FM_BACKEND_HERDR_AGENT_RENAME_TIMEOUT:-5}
@@ -470,6 +473,24 @@ fm_backend_herdr_agent_name_best_effort() {  # <session> <pane> <task-id> <model
   local herdr_cli_cmd=(herdr)
   if command -v timeout >/dev/null 2>&1; then
     herdr_cli_cmd=(timeout "$cli_timeout" herdr)
+  fi
+  # Registration can lag the pane launch, so poll for it. This stays read-only
+  # on purpose: renaming a pane that has no agent is a write whose meaning is
+  # version-dependent, and a pane that never registers an agent (a plain shell
+  # command, a fixture) must be left exactly as it was found.
+  while :; do
+    if HERDR_SESSION="$session" "${herdr_cli_cmd[@]}" agent get "$pane" \
+        --session "$session" >/dev/null 2>&1; then
+      registered=1
+      break
+    fi
+    [ "$registration_attempt" -lt "$registration_attempts" ] || break
+    registration_attempt=$((registration_attempt + 1))
+    sleep "$delay"
+  done
+  if [ "$registered" -ne 1 ]; then
+    echo "warning: Herdr registered no agent for task $task within the naming wait; leaving the pane unnamed and the crew running" >&2
+    return 0
   fi
   while [ "$ordinal" -le 99 ]; do
     name=$(fm_backend_herdr_agent_name_compose "$task" "$model" "$ordinal") || {
@@ -487,16 +508,6 @@ fm_backend_herdr_agent_name_best_effort() {  # <session> <pane> <task-id> <model
     case "$code" in
       agent_name_taken)
         ordinal=$((ordinal + 1))
-        ;;
-      agent_not_found)
-        if [ "$registration_attempt" -lt "$registration_attempts" ]; then
-          registration_attempt=$((registration_attempt + 1))
-          sleep "$delay"
-        else
-          detail=$(printf '%s' "$out" | tr '\n' ' ')
-          echo "warning: Herdr agent naming failed for task $task after registration wait: ${detail:-unknown error}; crew remains running" >&2
-          return 0
-        fi
         ;;
       *)
         detail=$(printf '%s' "$out" | tr '\n' ' ')

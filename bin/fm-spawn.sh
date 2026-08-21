@@ -94,7 +94,8 @@
 #   only that exact tab id; an ambiguous pre-operation snapshot refuses the
 #   focus-sensitive presentation mutation.
 #   After launch, Herdr spawns make one detached best-effort cosmetic agent
-#   rename from the normalized task id and resolved model. The rename runs in a
+#   rename from the normalized task id and resolved model, and only once an
+#   agent has actually registered in that pane. The rename runs in a
 #   background subshell with stdin detached, so it never blocks spawn completion
 #   or task-lock release. The adapter owns the exact truncation, collision,
 #   validity, timeout, and warning behavior. Naming never changes the fm-<id>

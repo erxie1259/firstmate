@@ -152,6 +152,13 @@
 #   origin, resolves the current remote default branch, and resets to its tip.
 #   An unreachable origin, unresolved default branch, or non-clean worktree
 #   refuses the spawn rather than risking a PR based on stale history.
+#   When `treehouse get` never enters a worktree in time, the spawn diagnoses the
+#   stalled terminal and recovers from exactly one known cause: an orphaned pyenv
+#   rehash lock blocking the pane shell's startup. On that signature alone it runs
+#   bin/fm-pyenv-shim-lock-clear.sh once, waits once more, and says on stderr what
+#   it did; it never loops, and a refused clear or a failed retry is reported as
+#   itself instead of as a bare timeout. A timeout with any other cause fails
+#   exactly as before.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only

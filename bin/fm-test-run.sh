@@ -143,6 +143,7 @@ family_for_basename() {
     fm-kimi-harness.test.sh|fm-memory-mcp.test.sh|fm-memory-pointers.test.sh|\
     fm-muse-harness.test.sh|fm-herdr-lab.test.sh|fm-lint.test.sh|\
     fm-operational-input.test.sh|fm-pi-primary-types.test.sh|\
+    fm-pyenv-shim-lock.test.sh|\
     fm-send-popup-settle.test.sh|fm-send-settle.test.sh|\
     fm-subagent-pretool-check.test.sh|\
     fm-supervision-instructions.test.sh|fm-task-delivery.test.sh|\
@@ -952,6 +953,13 @@ families_for_changed_path() {
     bin/fm-peek.sh|bin/fm-composer*)
       printf '%s\n' backend-dispatch
       printf '%s\n' pure-contract-unit
+      ;;
+    bin/fm-pyenv-rehash-lib.sh|bin/fm-pyenv-shim-lock-clear.sh)
+      # The cleaner owns its own contract (pure-contract-unit); fm-spawn's
+      # stalled-terminal recovery is the only consumer and lives in
+      # backend-dispatch.
+      printf '%s\n' pure-contract-unit
+      printf '%s\n' backend-dispatch
       ;;
     bin/fm-bearings-snapshot.sh|bin/fm-fleet-snapshot.sh|bin/fm-fleet-view.sh)
       printf '%s\n' snapshot-bearings

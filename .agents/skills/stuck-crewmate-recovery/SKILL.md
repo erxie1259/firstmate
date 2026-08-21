@@ -18,6 +18,16 @@ That plane covers workers running in this home; a remotely placed secondmate is 
 Load `harness-adapters` before a resume command or a harness-specific skill invocation, and whenever the adapter's own quirks matter.
 The target window's harness is recorded as `harness=` in `state/<id>.meta`.
 
+## A worker that never started
+
+A `treehouse get did not enter a worktree` failure is a launch that never happened, not a stuck worker, so nothing above applies to it.
+`bin/fm-spawn.sh` already recovers the one diagnosed cause on its own - an orphaned pyenv rehash lock that blocks every new shell's startup for a full minute - by clearing it once and waiting once more, and it says in its own output when it did.
+Two outcomes need you rather than the spawn.
+When it reports that clearing was refused because a rehash is genuinely running, that is a real external wait: let it finish and dispatch again, rather than forcing anything.
+When it reports the ordinary timeout with no pyenv diagnosis, the cause is something else entirely - treat it as a launch failure and investigate the project, the runtime, or `treehouse` itself.
+`bin/fm-pyenv-shim-lock-clear.sh` is the same guarded cleaner, runnable by hand and safe to run when nothing is wrong; it takes no arguments, refuses while a rehash is live, and moves the lock aside rather than deleting it.
+Reach for it when the captain reports every new terminal hanging for about a minute.
+
 ## Session-start reconciliation for a dead ordinary direct report
 
 This procedure covers ordinary `kind=ship` and `kind=scout` direct reports.

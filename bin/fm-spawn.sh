@@ -277,6 +277,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-trace-context-lib.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
+# shellcheck source=bin/fm-pyenv-rehash-lib.sh
+. "$SCRIPT_DIR/fm-pyenv-rehash-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -2166,6 +2168,131 @@ spawn_current_path() {  # <target>
     cmux) fm_backend_cmux_current_path "$1" "$W" ;;
   esac
 }
+
+# How many one-second polls the worktree wait spends before giving up. The
+# default is the 60s this wait has always used; it is a knob only so the
+# regression tests can drive a real timeout without spending a real minute.
+SPAWN_WT_POLLS=${FM_SPAWN_WORKTREE_POLLS:-60}
+case "$SPAWN_WT_POLLS" in
+  ''|*[!0-9]*|0) SPAWN_WT_POLLS=60 ;;
+esac
+
+# spawn_wait_for_worktree: poll until the pane's cwd settles somewhere other
+# than the project, then set WT to that path. Leaves WT empty on timeout.
+#
+# Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
+# Target the stable window id, not the name: if the name is ever lost (e.g. an
+# automatic-rename slips through), display-message -t <bad-name> falls back to the
+# active client's window, which would misread firstmate's OWN pane path as the
+# worktree and tangle a hook into the primary checkout. The window id never lies.
+# Compare against PROJ_ABS_REAL (physical), not PROJ_ABS: a symlinked project
+# prefix would otherwise make the pane's OS-level cwd read differ from
+# PROJ_ABS on the very first poll, before the pane has actually moved.
+#
+# A single read that already differs from PROJ_ABS_REAL is not proof the pane
+# settled there: on some tmux/WSL setups a brand-new window's pane_current_path
+# transiently reports an unrelated stale path (seen live as another real git
+# checkout entirely) before the shell catches up with treehouse get's cd. That
+# stale path still passes the PROJ_ABS_REAL comparison and validate_spawn_worktree
+# (it resolves to a real, distinct worktree top-level too), so accepting it
+# on one read alone silently records the wrong worktree= in state/<id>.meta. Require
+# two consecutive reads to agree on the same non-project path before accepting it;
+# a mismatch just becomes the new candidate rather than resetting the wait, so a
+# pane that is already settled by the first real read only costs the one existing
+# inter-poll sleep as confirmation, not a whole extra cycle on top.
+spawn_wait_for_worktree() {
+  local candidate="" p p_real
+  for _ in $(seq 1 "$SPAWN_WT_POLLS"); do
+    p=$(spawn_current_path "$WT_TARGET" || true)
+    if [ -n "$p" ]; then
+      p_real=$(real_path_or_raw "$p")
+      if [ "$p_real" != "$PROJ_ABS_REAL" ]; then
+        if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
+          WT="$p"
+          return 0
+        fi
+        candidate="$p_real"
+      else
+        candidate=""
+      fi
+    else
+      candidate=""
+    fi
+    sleep 1
+  done
+  return 0
+}
+
+# spawn_pyenv_rehash_stall_signature: print a one-line diagnosis when, and only
+# when, this stalled terminal carries the known orphaned-pyenv-rehash-lock
+# signature; print nothing for a timeout with any other cause.
+#
+# The signature is: pyenv's rehash lock exists AND a genuine rehash process is
+# alive (bin/fm-pyenv-rehash-lib.sh owns that identity, and why a command-line
+# pattern match must never be used for it). Where the backend can name the
+# terminal's own shell, the rehash must additionally descend from that shell,
+# which is the observed shape - `bash .../libexec/pyenv-rehash` running as the
+# stalled pane's foreground child while the shell is still starting up. cmux and
+# zellij publish no per-pane pid, so there the unanchored evidence stands alone
+# and the printed line says so rather than overclaiming.
+spawn_pyenv_rehash_stall_signature() {
+  local lock pids pane_pid rows holder=""
+  lock=$(fm_pyenv_shim_lock_path) || return 0
+  [ -e "$lock" ] || return 0
+  pids=$(fm_pyenv_rehash_live_pids) || return 0
+  [ -n "$pids" ] || return 0
+  pane_pid=$(fm_backend_pane_shell_pid "$BACKEND" "$WT_TARGET" "$W" 2>/dev/null) || pane_pid=""
+  if [ -z "$pane_pid" ]; then
+    printf 'a pyenv rehash (pid %s) is running and its lock %s is present; this terminal exposes no process of its own to confirm against\n' \
+      "$(printf '%s\n' "$pids" | head -1)" "$lock"
+    return 0
+  fi
+  rows=$(fm_pyenv_process_rows) || return 0
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    if fm_pyenv_pid_has_ancestor "$pid" "$pane_pid" "$rows"; then
+      holder=$pid
+      break
+    fi
+  done <<EOF
+$pids
+EOF
+  [ -n "$holder" ] || return 0
+  printf 'a pyenv rehash (pid %s) is running on this terminal and its lock %s is present\n' \
+    "$holder" "$lock"
+}
+
+# spawn_recover_stalled_worktree: the single automatic recovery for the one
+# diagnosed cause of a worktree-acquisition timeout. It clears the lock once and
+# waits once more; it never loops, never retries twice, and never turns a cleaner
+# refusal into a generic timeout. Any timeout without the signature returns
+# immediately with WT still empty, so every other cause behaves exactly as before.
+#
+# The retry deliberately does NOT resend `treehouse get`. The command was already
+# written into this terminal's input, where it sits buffered until the shell
+# finishes the startup the lock was blocking; resending would run it a second time
+# and acquire a second worktree.
+spawn_recover_stalled_worktree() {
+  local signature cleared
+  signature=$(spawn_pyenv_rehash_stall_signature) || return 0
+  [ -n "$signature" ] || return 0
+  echo "notice: treehouse get stalled because $signature; clearing that lock once and waiting again" >&2
+  if ! cleared=$("$SCRIPT_DIR/fm-pyenv-shim-lock-clear.sh" 2>&1); then
+    echo "error: treehouse get stalled on pyenv's rehash lock and it could not be cleared: ${cleared:-no detail}; inspect window $T" >&2
+    exit 1
+  fi
+  if [ -n "$cleared" ]; then
+    echo "notice: $cleared" >&2
+  else
+    echo "notice: the pyenv rehash lock was already gone by the time it was cleared" >&2
+  fi
+  spawn_wait_for_worktree
+  if [ -z "$WT" ]; then
+    echo "error: the orphaned pyenv rehash lock was cleared but treehouse get still did not enter a worktree within another ${SPAWN_WT_POLLS}s; inspect window $T" >&2
+    exit 1
+  fi
+  echo "notice: worktree acquisition recovered after clearing the orphaned pyenv rehash lock - this fault is recurring and its cause is still unfixed" >&2
+}
 spawn_send_literal() {  # <target> <text>
   case "$BACKEND" in
     tmux) fm_backend_tmux_send_literal "$1" "$2" ;;
@@ -2263,47 +2390,14 @@ if [ "$RELAUNCH" -eq 1 ]; then
 elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   spawn_send_text_line "$WT_TARGET" 'treehouse get'
 
-  # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
-  # Target the stable window id, not the name: if the name is ever lost (e.g. an
-  # automatic-rename slips through), display-message -t <bad-name> falls back to the
-  # active client's window, which would misread firstmate's OWN pane path as the
-  # worktree and tangle a hook into the primary checkout. The window id never lies.
-  # Compare against PROJ_ABS_REAL (physical), not PROJ_ABS: a symlinked project
-  # prefix would otherwise make the pane's OS-level cwd read differ from
-  # PROJ_ABS on the very first poll, before the pane has actually moved.
-  #
-  # A single read that already differs from PROJ_ABS_REAL is not proof the pane
-  # settled there: on some tmux/WSL setups a brand-new window's pane_current_path
-  # transiently reports an unrelated stale path (seen live as another real git
-  # checkout entirely) before the shell catches up with treehouse get's cd. That
-  # stale path still passes the PROJ_ABS_REAL comparison and validate_spawn_worktree
-  # below (it resolves to a real, distinct worktree top-level too), so accepting it
-  # on one read alone silently records the wrong worktree= in state/<id>.meta. Require
-  # two consecutive reads to agree on the same non-project path before accepting it;
-  # a mismatch just becomes the new candidate rather than resetting the wait, so a
-  # pane that is already settled by the first real read only costs the one existing
-  # inter-poll sleep as confirmation, not a whole extra cycle on top.
-  candidate=""
-  for _ in $(seq 1 60); do
-    p=$(spawn_current_path "$WT_TARGET" || true)
-    if [ -n "$p" ]; then
-      p_real=$(real_path_or_raw "$p")
-      if [ "$p_real" != "$PROJ_ABS_REAL" ]; then
-        if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
-          WT="$p"
-          break
-        fi
-        candidate="$p_real"
-      else
-        candidate=""
-      fi
-    else
-      candidate=""
-    fi
-    sleep 1
-  done
+  spawn_wait_for_worktree
+
   if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
+    spawn_recover_stalled_worktree
+  fi
+
+  if [ -z "$WT" ]; then
+    echo "error: treehouse get did not enter a worktree within ${SPAWN_WT_POLLS}s; inspect window $T" >&2
     exit 1
   fi
 

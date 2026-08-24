@@ -1,0 +1,1706 @@
+#!/usr/bin/env python3
+"""fm-memory-migrate - mirror Claude Code's auto-memory files into the lane banks.
+
+Claude Code keys its per-project memory by filesystem path, so one project
+accumulates several mutually invisible memory directories and lane-wide facts
+get copy-pasted between projects. This copies those files into the Mnemosyne
+lane banks, canonicalising the fragments into one project identity per project,
+without touching a single source file.
+
+MIRROR, NOT MOVE (captain decision D3, 2026-08-20)
+  The markdown files stay canonical and are never read-write opened, moved,
+  rewritten, or deleted. Every run records a manifest of every source file's
+  size and SHA-256 before and after its writes and refuses to report success if
+  any of them changed. The cutover that would make the store canonical is a
+  separate, later decision.
+
+CREDENTIALS NEVER ENTER THE STORE (captain decision D2, 2026-08-20)
+  The store is served by a local dashboard, so a secret written into it is a
+  secret published. A file whose text is secret-bearing is therefore never
+  copied. It is indexed as a POINTER that names where the file lives and what
+  it is for, and carries none of its content. Detection is deliberately
+  over-inclusive - a false positive costs one pointer instead of one copy, a
+  false negative publishes a credential - and every flag is reported with the
+  rule and the redacted evidence that fired it, so the judgement is inspectable
+  rather than opaque.
+
+Usage:
+  fm-memory-migrate plan   [--source S] [--home H] [--data-dir D] [--json]
+      Derive the whole migration and print it. Opens no store, writes nothing.
+  fm-memory-migrate write  [--source S] [--home H] [--data-dir D] [--json]
+      Write every routed memory through fm-memory-mcp and report the counts.
+  fm-memory-migrate verify [--source S] [--home H] [--data-dir D] [--json]
+      Run the integrity checklist against the banks and report each check.
+  fm-memory-migrate --help
+
+ROUTING
+  source dir -> project   the directory name is the source path with every
+                          non-alphanumeric run collapsed to '-', which is
+                          lossy, so a project is resolved by matching the
+                          LONGEST registered project name that ends the
+                          directory name on a '-' boundary. Every fragment of
+                          one project therefore lands on that one project:
+                          the four EquiMe directories become one 'EquiMe'.
+  project -> lane         bin/fm-project-mode.sh --lane, which owns the
+                          registry line format. A directory that matches no
+                          registered project, and a registered project with no
+                          lane token, are reported UNROUTED and nothing is
+                          written for them. Guessing a lane is the cross-lane
+                          leak the lane model exists to prevent.
+  MEMORY.md               never migrated; it is a rendering of the other files'
+                          descriptions and is reconstructible from them.
+
+TWO FRONTMATTER DIALECTS
+  Newer files carry `metadata.type` under a `metadata:` block; older ones carry
+  a top-level `type:`. Both are parsed, and a file with neither is migrated as
+  untyped session context rather than dropped.
+
+DEDUPE (report section 5.4)
+  1. Exact. SHA-256 of the normalized body - frontmatter stripped, whitespace
+     collapsed, case folded. One group becomes ONE memory: under its project
+     when every copy is that project's, and under the lane-wide '_lane' channel
+     when copies span projects inside one lane, which is what the duplicated
+     build-and-release files actually are. A group spanning two LANES is
+     written once in each, flagged `cross_lane_duplicate`, because a cross-lane
+     write is never allowed and picking one lane would delete the other's copy.
+  2. Near. Not merged here. Cosine similarity is computed by `verify` from the
+     embeddings the store itself wrote, and pairs at or above the threshold are
+     REPORTED for review. Auto-merging near-duplicates across projects is how a
+     lane-local fact silently becomes another project's.
+  3. Pointer collision. A body whose normalized text a canonical firstmate file
+     already states is dropped in favour of the pointer bin/fm-memory-pointers
+     wrote; the canonical file always wins. Only an exact normalized match
+     drops a memory. A partial overlap is reported instead, because dropping on
+     a fuzzy signal loses content that nothing else holds.
+
+IDEMPOTENCE
+  Re-running writes no new rows. Content is derived deterministically, so an
+  unchanged file produces the exact text already stored and the store's own
+  dedupe returns the same row: reported `created: false` and counted skipped.
+  A ledger beside each bank records each memory's id and content digest, so a
+  file that actually CHANGED is written as a supersession of the recorded row
+  rather than as a second live memory claiming the same thing.
+  The ledger is derived, never authoritative: if it is lost, or the row it
+  names is gone or already retired, the memory is written fresh instead.
+
+WHAT THIS DELIBERATELY DOES NOT DO
+  It never retires a memory whose source file disappeared. Under mirror mode a
+  missing file is as likely to be a renamed or unmounted directory as a
+  deletion, and mass-retiring a lane on that reading is unrecoverable. Such
+  ledger keys are reported as `orphaned` so the loss of the link is visible,
+  and retiring them stays a deliberate act.
+  It writes no graph_edges for `[[wikilinks]]`: every write goes through the
+  bridge, the bridge exposes no edge tool, and reaching around it into sqlite
+  is exactly the direct-store access this whole design refuses. Link targets
+  are preserved in `metadata.links` and in the body text itself.
+
+THE BRIDGE IS THE ONLY WRITER
+  Nothing here opens a store read-write. Every write is a tools/call on a
+  `fm-memory-mcp serve` process, so the pin against the 24h trim, the global
+  scope, the lane binding, and every typed refusal are the bridge's and are not
+  reimplemented. `verify` opens banks read-only, in mode=ro, to prove what
+  actually landed rather than trusting what was reported.
+  The stdio client below is deliberately its own small class rather than one
+  shared with bin/fm-memory-pointers: the bridge's stdio JSON-RPC is a
+  published interface, and the two tools' failure isolation has to stay
+  independent of each other.
+
+FAILURE ISOLATION
+  A lane whose bridge refuses to start costs that lane's memories and no
+  others. The run continues and reports exactly which memories did not land,
+  because stopping at the first bad bank leaves how much of the fleet is
+  indexed unknowable.
+
+COUNTS
+  written, skipped_duplicate, updated, credential_pointers, unrouted, refused,
+  dropped_for_pointer.
+
+EXIT STATUS
+  0 everything routed is durable in the store and no source file changed;
+  1 anything was refused, unrouted, or a check failed; 2 usage.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+
+BRIDGE = Path(__file__).resolve().parent / "fm-memory-mcp"
+PROJECT_MODE = Path(__file__).resolve().parent / "fm-project-mode.sh"
+LEDGER_FILENAME = "fm-memory-migrate.json"
+SESSION = "fm:memory-migrate"
+SOURCE = "claude-automemory"
+POINTER_SOURCE = "claude-automemory-pointer"
+LANE_CHANNEL = "_lane"
+DEFAULT_SOURCE_ROOT = Path.home() / ".claude" / "projects"
+DEFAULT_DATA_DIR = Path.home() / ".hermes" / "mnemosyne" / "data"
+HERMES_BANK = "default"
+NEAR_DUPLICATE_COSINE = 0.92
+
+# `- <name> [<annotation>] - <description> (added <date>)`; bin/fm-project-mode.sh
+# owns what is inside the annotation, and is asked for the lane rather than parsed.
+PROJECT_LINE_RE = re.compile(r"^-\s+(\S+)\s*(\[[^\]]*\])?\s*-?\s*(.*)$")
+
+# How an auto-memory file's declared type becomes a stored memory. Report
+# section 5.1 fixes the memory_type; section 3.5 fixes what importance and
+# veracity mean. These files are the captain's own curated statements, so they
+# are 'stated' - measured, dated fleet evidence is what 'tool' is for.
+TYPE_MAP: Dict[str, Tuple[str, float, str]] = {
+    "project": ("instruction", 0.7, "stated"),
+    "feedback": ("preference", 0.85, "stated"),
+    "user": ("preference", 0.85, "stated"),
+    "reference": ("fact", 0.6, "stated"),
+}
+UNTYPED = ("context", 0.3, "unknown")
+
+
+class MigrateError(Exception):
+    """A refusal that must never be reported as a successful run."""
+
+
+# --- credential detection ----------------------------------------------------
+#
+# Two independent rule classes, either of which keeps a file out of the store.
+# They are separate so a later captain decision can loosen one without touching
+# the other, and so every flag can say which one fired.
+
+# A literal that is a secret on sight, wherever it appears. The last two carry
+# a second test, because their shape alone also fits ordinary text: a long run
+# of letters is usually a path or an identifier, not a key.
+SECRET_VALUE_RULES: Sequence[Tuple[str, str, Optional[str]]] = (
+    ("private_key_block", r"-----BEGIN [A-Z ]*PRIVATE KEY-----", None),
+    ("github_token", r"\bgh[pousr]_[A-Za-z0-9]{16,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b", None),
+    ("aws_access_key", r"\bAKIA[0-9A-Z]{16}\b", None),
+    ("openai_style_key", r"\bsk-[A-Za-z0-9_-]{16,}\b", None),
+    ("slack_token", r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", None),
+    ("jwt", r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b", None),
+    ("vendor_token", r"\bmpat_[A-Za-z0-9]{8,}\b", None),
+    ("apple_auth_key_file", r"\bAuthKey_[A-Z0-9]{6,}\b", None),
+    ("hex_digest_or_key", r"(?<![A-Za-z0-9])[0-9a-f]{32,}(?![A-Za-z0-9])", None),
+    ("high_entropy_literal",
+     r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{24,}={0,2}(?![A-Za-z0-9+/=])", "high_entropy"),
+)
+MIN_SECRET_ENTROPY_BITS = 3.6
+
+
+def shannon_bits(text: str) -> float:
+    """Bits of entropy per character - how unlike written language a run is."""
+    if not text:
+        return 0.0
+    counts: Dict[str, int] = {}
+    for char in text:
+        counts[char] = counts.get(char, 0) + 1
+    total = float(len(text))
+    return -sum((n / total) * math.log2(n / total) for n in counts.values())
+
+
+def high_entropy(token: str) -> bool:
+    """A run of characters that no one wrote by hand.
+
+    A path, a camelCase identifier, and a long word all match the shape of a
+    base64 key, so shape alone is not enough. A generated secret mixes cases
+    and digits AND spreads its characters far more evenly than any of them,
+    and requiring both is what separates the two without a word list.
+    """
+    core = token.rstrip("=")
+    if len(core) < 24:
+        return False
+    if not (any(c.isupper() for c in core) and any(c.islower() for c in core)
+            and any(c.isdigit() for c in core)):
+        return False
+    return shannon_bits(core) >= MIN_SECRET_ENTROPY_BITS
+
+
+SECRET_VALUE_VALIDATORS = {"high_entropy": high_entropy}
+
+# Vocabulary that names a credential. On its own this is prose; next to a
+# literal-shaped value it is a credential written down.
+CREDENTIAL_TERMS = (
+    "password", "passwd", "passphrase", "secret", "token", "api key", "api_key",
+    "api-key", "apikey", "credential", "private key", "auth key", "authkey",
+    "access key", "access-token", "access_token", "client secret", "bearer",
+    "keychain", "issuer id", "team id", "key id", "keystore", "service account",
+    "oauth", "app-specific password", "app specific password",
+)
+# Delimited on both sides, so `linkWithCredential` and "chibi tokens" are the
+# ordinary prose they are rather than a credential this file writes down.
+TERM_RE = re.compile(
+    "(?<![A-Za-z0-9])(?:" + "|".join(re.escape(t) for t in CREDENTIAL_TERMS) + ")(?![A-Za-z0-9])",
+    re.IGNORECASE)
+ADJACENCY_CHARS = 80
+# A run that looks like a written-down value rather than a word: it carries a
+# digit, is an address, or is an all-caps identifier.
+LITERAL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+/=:-]{5,}")
+
+# A file that says on its face that it holds credentials, whatever its body
+# happens to contain today. Matched against the file name and the declared
+# title, as separated words, so 'automation' never reads as 'auth'.
+DECLARED_CREDENTIAL_WORDS = frozenset(
+    """credential credentials secret secrets password passwords passphrase token
+    tokens auth apikey pat keychain privatekey signing""".split()
+)
+
+
+def looks_like_value(text: str) -> Optional[str]:
+    for match in LITERAL_RE.finditer(text):
+        token = match.group(0)
+        if "@" in token:
+            return token
+        if any(ch.isdigit() for ch in token) and any(ch.isalpha() for ch in token):
+            return token
+        if token.isupper() and len(token) >= 6:
+            return token
+    return None
+
+
+def redact(token: str) -> str:
+    """Enough of a literal to recognise it, never enough to use it."""
+    if len(token) <= 4:
+        return "*" * len(token)
+    return f"{token[:2]}{'*' * (len(token) - 4)}{token[-2:]}"
+
+
+def words_of(text: str) -> Iterable[str]:
+    return (w for w in re.split(r"[^A-Za-z0-9]+", text.lower()) if w)
+
+
+def credential_findings(path_name: str, title: str, body: str) -> List[Dict[str, str]]:
+    """Every reason this file must stay out of the store, with its evidence.
+
+    The declared rule reads the file name and title; the value and adjacency
+    rules read the title AND the body, because a hand-written summary can name
+    a secret exactly as easily as the text it summarises.
+    """
+    findings: List[Dict[str, str]] = []
+    body = f"{title}\n{body}" if title else body
+    declared = sorted(set(words_of(f"{path_name} {title}")) & DECLARED_CREDENTIAL_WORDS)
+    for word in declared:
+        findings.append({
+            "rule": "declared_credential_file",
+            "detail": f"the name or title says {word!r}",
+            "evidence": word,
+        })
+    for name, pattern, validator in SECRET_VALUE_RULES:
+        check_value = SECRET_VALUE_VALIDATORS.get(validator or "")
+        for match in re.finditer(pattern, body):
+            if check_value and not check_value(match.group(0)):
+                continue
+            findings.append({
+                "rule": f"secret_value:{name}",
+                "detail": "a literal that is a secret on sight",
+                "evidence": redact(match.group(0)),
+            })
+            break
+    for match in TERM_RE.finditer(body):
+        start = max(0, match.start() - ADJACENCY_CHARS)
+        window = body[start:match.end() + ADJACENCY_CHARS]
+        # The term itself is prose; a value beside it is the credential.
+        value = looks_like_value(window.replace(match.group(0), " "))
+        if value:
+            findings.append({
+                "rule": "credential_term_beside_value",
+                "detail": f"{match.group(0).lower()!r} sits beside a written-down value",
+                "evidence": redact(value),
+            })
+            break
+    return findings
+
+
+# --- parsing -----------------------------------------------------------------
+
+
+class Parsed(NamedTuple):
+    name: str
+    description: str
+    declared_type: Optional[str]
+    modified: Optional[str]
+    origin_session: Optional[str]
+    body: str
+
+
+def parse_scalar(raw: str) -> str:
+    """One YAML scalar, in the shape Claude Code actually writes them."""
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def parse_memory_file(path: Path) -> Parsed:
+    """Both frontmatter dialects, and a file that carries neither.
+
+    The newer generation nests the type under `metadata:`; the older one puts
+    it at the top level. Nothing else about them differs, so both are read into
+    the same shape rather than branching downstream on which one it was.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    front: Dict[str, str] = {}
+    body = text
+    if text.startswith("---\n"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            block = text[4:end]
+            body = text[end + 4:]
+            if body.startswith("\n"):
+                body = body[1:]
+            in_metadata = False
+            for line in block.splitlines():
+                if not line.strip():
+                    continue
+                indented = line[:1].isspace()
+                stripped = line.strip()
+                if ":" not in stripped:
+                    continue
+                key, _, raw = stripped.partition(":")
+                key = key.strip().lower()
+                if not indented:
+                    in_metadata = key == "metadata"
+                    if in_metadata:
+                        continue
+                    front[key] = parse_scalar(raw)
+                elif in_metadata:
+                    front[f"metadata.{key}"] = parse_scalar(raw)
+    declared = front.get("metadata.type") or front.get("type")
+    return Parsed(
+        name=front.get("name") or path.stem,
+        description=front.get("description", ""),
+        declared_type=(declared or None),
+        modified=front.get("metadata.modified") or front.get("modified") or None,
+        origin_session=front.get("metadata.originsessionid") or front.get("originsessionid") or None,
+        body=body.strip(),
+    )
+
+
+def normalize(text: str) -> str:
+    """The text two copies of one memory have in common.
+
+    Case and whitespace are the only differences a hand-copied duplicate
+    reliably picks up, so they are the only ones folded away. Anything more
+    aggressive would start merging memories that genuinely differ.
+    """
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def content_digest(text: str) -> str:
+    return hashlib.sha256(normalize(text).encode("utf-8")).hexdigest()
+
+
+WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
+
+
+def wikilinks(body: str) -> List[str]:
+    return sorted({m.group(1).strip() for m in WIKILINK_RE.finditer(body)})
+
+
+# --- routing -----------------------------------------------------------------
+
+
+def registered_projects(home: Path) -> List[str]:
+    try:
+        lines = (home / "data" / "projects.md").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        match = PROJECT_LINE_RE.match(line)
+        if match and not line.startswith("- ["):
+            out.append(match.group(1))
+    return out
+
+
+def slug_of(name: str) -> str:
+    """A project name as it appears inside a Claude Code directory name."""
+    return re.sub(r"[^A-Za-z0-9]+", "-", name)
+
+
+def project_for_dir(dir_name: str, projects: Sequence[str]) -> Optional[str]:
+    """The registered project a memory directory belongs to, or None.
+
+    The directory name is the working directory with every non-alphanumeric run
+    collapsed to '-', so it cannot be decoded back into a path: '-Coding-apps-
+    tcg-ops' is both `Coding/apps/tcg-ops` and `Coding/apps-tcg-ops`. What it
+    can do is END with the project's own name, and the LONGEST such name is the
+    right one - '-Coding-suctrya-business-books' belongs to
+    'suctrya-business-books', never to 'suctrya'. The boundary check is what
+    keeps a name from matching the tail of a longer word.
+    """
+    best: Optional[str] = None
+    for project in projects:
+        suffix = slug_of(project)
+        if not dir_name.endswith(suffix):
+            continue
+        head = dir_name[: -len(suffix)]
+        if head and not head.endswith("-"):
+            continue
+        if best is None or len(suffix) > len(slug_of(best)):
+            best = project
+    return best
+
+
+def project_lane(home: Path, project: str) -> Optional[str]:
+    """The project's lane, from the script that owns the registry line format."""
+    result = subprocess.run(  # noqa: S603
+        [str(PROJECT_MODE), "--lane", project],
+        env=dict(os.environ, FM_HOME=str(home)),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    lane = result.stdout.strip()
+    return lane if result.returncode == 0 and lane else None
+
+
+# --- canonical-file collision ------------------------------------------------
+
+
+def canonical_statements(home: Path) -> Dict[str, str]:
+    """Normalized bodies of the sections bin/fm-memory-pointers already indexes.
+
+    A memory whose text a canonical file states verbatim is that file's fact,
+    and the pointer to it is the copy that stays correct when the file changes.
+    """
+    out: Dict[str, str] = {}
+    for relative in ("data/captain.md", "data/learnings.md"):
+        try:
+            lines = (home / relative).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        heading: Optional[str] = None
+        body: List[str] = []
+        for line in lines + ["## "]:
+            if line.startswith("## "):
+                if heading is not None and body:
+                    out[normalize(" ".join(body))] = f"{relative} § {heading}"
+                heading, body = line[3:].strip(), []
+            elif heading is not None:
+                body.append(line)
+    return out
+
+
+# --- the migration plan ------------------------------------------------------
+
+
+class SourceFile(NamedTuple):
+    path: Path
+    dir_name: str
+    project: Optional[str]
+    lane: Optional[str]
+    parsed: Parsed
+    findings: List[Dict[str, str]]
+
+
+def scan_sources(source_root: Path, home: Path) -> Tuple[List[SourceFile], List[Dict[str, str]]]:
+    projects = registered_projects(home)
+    lanes: Dict[str, Optional[str]] = {}
+    files: List[SourceFile] = []
+    problems: List[Dict[str, str]] = []
+    if not source_root.is_dir():
+        raise MigrateError(f"no auto-memory source directory at {source_root}")
+    for directory in sorted(source_root.iterdir()):
+        memory_dir = directory / "memory"
+        if not memory_dir.is_dir():
+            continue
+        project = project_for_dir(directory.name, projects)
+        lane: Optional[str] = None
+        if project is not None:
+            if project not in lanes:
+                lanes[project] = project_lane(home, project)
+            lane = lanes[project]
+        for path in sorted(memory_dir.glob("*.md")):
+            if path.name == "MEMORY.md":
+                continue
+            try:
+                parsed = parse_memory_file(path)
+            except OSError as exc:
+                problems.append({"path": str(path), "problem": f"unreadable: {exc}"})
+                continue
+            findings = credential_findings(path.name, f"{parsed.name} {parsed.description}", parsed.body)
+            files.append(SourceFile(path, directory.name, project, lane, parsed, findings))
+    return (files, problems)
+
+
+class Entry(NamedTuple):
+    key: str
+    lane: str
+    channel_id: str
+    content: str
+    memory_type: str
+    importance: float
+    veracity: str
+    source: str
+    metadata: Dict[str, Any]
+    content_sha: str
+    notes: List[str]
+
+
+def entry_content(parsed: Parsed) -> str:
+    """The stored text: the title first, so recall can match on it."""
+    return f"[{parsed.name}] {parsed.body}".strip()
+
+
+def safe_field(text: str) -> Optional[str]:
+    """A frontmatter field, but only if it is not itself secret-bearing.
+
+    A title and a description are written by hand and can name a value as
+    easily as the body can. Nothing derived from a credential-bearing file
+    reaches the store without passing the same detection its body failed.
+    """
+    if not text or not text.strip():
+        return None
+    return text if not credential_findings("", "", text) else None
+
+
+def credential_pointer_content(parsed: Parsed, paths: Sequence[str]) -> str:
+    """A pointer that can be acted on and carries nothing that must not leave."""
+    where = "; ".join(paths)
+    title = safe_field(parsed.name) or "redacted title"
+    text = (
+        f"[{title}] Credential-bearing memory, kept OUT of the memory store by captain "
+        f"decision D2 (2026-08-20): this store is served by a local dashboard, so its content is "
+        f"never copied here. Read the file itself at {where}."
+    )
+    description = safe_field(parsed.description)
+    if description:
+        text += f" It covers: {description}"
+    return text
+
+
+def build_entries(files: Sequence[SourceFile], home: Path) -> Dict[str, Any]:
+    """Group, dedupe, classify, and route every source file."""
+    routed = [f for f in files if f.lane]
+    unrouted = [f for f in files if not f.lane]
+
+    groups: Dict[str, List[SourceFile]] = {}
+    for source in routed:
+        groups.setdefault(content_digest(source.parsed.body), []).append(source)
+
+    statements = canonical_statements(home)
+    entries: List[Entry] = []
+    dropped: List[Dict[str, str]] = []
+    cross_lane: List[Dict[str, Any]] = []
+
+    for sha, members in sorted(groups.items(), key=lambda kv: kv[1][0].path.as_posix()):
+        primary = members[0]
+        owner = statements.get(normalize(primary.parsed.body))
+        if owner:
+            dropped.append({
+                "name": primary.parsed.name,
+                "paths": ", ".join(str(m.path) for m in members),
+                "owner": owner,
+            })
+            continue
+        by_lane: Dict[str, List[SourceFile]] = {}
+        for member in members:
+            by_lane.setdefault(str(member.lane), []).append(member)
+        if len(by_lane) > 1:
+            cross_lane.append({
+                "name": primary.parsed.name,
+                "lanes": sorted(by_lane),
+                "paths": [str(m.path) for m in members],
+            })
+        for lane, lane_members in sorted(by_lane.items()):
+            entries.append(make_entry(lane, lane_members, sha, len(by_lane) > 1))
+
+    disambiguate(entries)
+    return {
+        "entries": entries,
+        "dropped_for_pointer": dropped,
+        "cross_lane_duplicates": cross_lane,
+        "unrouted": unrouted,
+        "groups": groups,
+    }
+
+
+def make_entry(lane: str, members: Sequence[SourceFile], sha: str, cross_lane: bool) -> Entry:
+    primary = members[0]
+    parsed = primary.parsed
+    projects = sorted({str(m.project) for m in members})
+    paths = [str(m.path) for m in members]
+    # Copies of one fact under several projects of one lane are what the
+    # lane-wide channel is for; that duplication is the reason lanes exist.
+    channel = projects[0] if len(projects) == 1 else LANE_CHANNEL
+    findings = [f for m in members for f in m.findings]
+    notes: List[str] = []
+    if len(members) > 1:
+        notes.append(f"canonicalised {len(members)} copies")
+    if channel == LANE_CHANNEL:
+        notes.append(f"lane-wide across {', '.join(projects)}")
+    if cross_lane:
+        notes.append("also present in another lane")
+
+    metadata: Dict[str, Any] = {
+        "migration": "claude-automemory-phase3",
+        "source": SOURCE,
+        "source_path": paths[0],
+        "source_paths": paths,
+        "source_dirs": sorted({m.dir_name for m in members}),
+        "source_projects": projects,
+        "source_name": parsed.name,
+        "description": parsed.description,
+        "content_sha": sha,
+    }
+    if parsed.declared_type:
+        metadata["source_type"] = parsed.declared_type
+    if parsed.modified:
+        # The bridge exposes no way to set a row's timestamp, and reaching past
+        # it into sqlite is the direct-store access this design refuses. The
+        # file's own modified time is preserved here instead of being lost.
+        metadata["source_modified"] = parsed.modified
+    sessions = sorted({m.parsed.origin_session for m in members if m.parsed.origin_session})
+    if sessions:
+        metadata["origin_session_ids"] = sessions
+    links = wikilinks(parsed.body)
+    if links:
+        metadata["links"] = links
+
+    if findings:
+        metadata["credential_pointer"] = True
+        metadata["credential_findings"] = findings
+        # The provenance fields are copied from the same file the body was
+        # refused from, so they are held to the same test before they land.
+        for field in ("description", "source_name"):
+            if metadata.get(field) and safe_field(str(metadata[field])) is None:
+                metadata[field] = "[redacted: this field is itself credential-bearing]"
+        content = credential_pointer_content(parsed, paths)
+        notes.append("credential-bearing: pointer only, content not copied")
+        return Entry(
+            key=entry_key(lane, channel, primary),
+            lane=lane,
+            channel_id=channel,
+            content=content,
+            memory_type="reference",
+            importance=0.7,
+            veracity="stated",
+            source=POINTER_SOURCE,
+            metadata=metadata,
+            content_sha=content_digest(content),
+            notes=notes,
+        )
+
+    memory_type, importance, veracity = TYPE_MAP.get(parsed.declared_type or "", UNTYPED)
+    content = entry_content(parsed)
+    return Entry(
+        key=entry_key(lane, channel, primary),
+        lane=lane,
+        channel_id=channel,
+        content=content,
+        memory_type=memory_type,
+        importance=importance,
+        veracity=veracity,
+        source=SOURCE,
+        metadata=metadata,
+        content_sha=content_digest(content),
+        notes=notes,
+    )
+
+
+def entry_key(lane: str, channel: str, primary: SourceFile) -> str:
+    """A ledger key stable across the fragmentation this tool collapses.
+
+    Deliberately the memory's own file name under its resolved channel, not a
+    source path: the same file under a second directory of the same project is
+    the SAME memory, and keying by path would make it a second one the moment
+    the captain worked from a different checkout.
+    """
+    return f"{lane}/{channel}/{primary.path.stem}"
+
+
+def disambiguate(entries: List[Entry]) -> None:
+    """Two different memories can share a file name inside one channel."""
+    seen: Dict[str, int] = {}
+    for index, entry in enumerate(entries):
+        count = seen.get(entry.key, 0)
+        seen[entry.key] = count + 1
+        if count:
+            entries[index] = entry._replace(key=f"{entry.key}#{count + 1}")
+
+
+# --- the source manifest (mirror mode's proof) -------------------------------
+
+
+def canonicalised_projects(files: Sequence[SourceFile]) -> List[Dict[str, Any]]:
+    """Which projects were assembled from more than one memory directory."""
+    by_project: Dict[str, List[SourceFile]] = {}
+    for source in files:
+        if source.project:
+            by_project.setdefault(source.project, []).append(source)
+    out = []
+    for project, members in sorted(by_project.items()):
+        directories = sorted({m.dir_name for m in members})
+        if len(directories) > 1:
+            out.append({
+                "project": project,
+                "lane": members[0].lane,
+                "directories": directories,
+                "files": len(members),
+            })
+    return out
+
+
+def unrouted_fragments(files: Sequence[SourceFile]) -> List[Dict[str, Any]]:
+    """Unrouted directories that look like one project split across paths.
+
+    An observation, never a routing decision: these are named so the captain
+    can register the project once instead of discovering the split later. The
+    trailing-segment match has to be long enough that two unrelated
+    directories ending in a short common word are not called one project.
+    """
+    minimum = 5
+    directories = sorted({f.dir_name for f in files if not f.project})
+    groups: Dict[str, List[str]] = {}
+    for index, left in enumerate(directories):
+        for right in directories[index + 1:]:
+            suffix = common_suffix_segments(left, right)
+            if len(suffix) >= minimum:
+                groups.setdefault(suffix, [])
+                for name in (left, right):
+                    if name not in groups[suffix]:
+                        groups[suffix].append(name)
+    out = []
+    for suffix, names in sorted(groups.items()):
+        out.append({
+            "looks_like_project": suffix,
+            "directories": sorted(names),
+            "files": len([f for f in files if f.dir_name in names]),
+        })
+    return out
+
+
+def common_suffix_segments(left: str, right: str) -> str:
+    """The longest trailing run of '-' separated segments the two share."""
+    a, b = left.split("-"), right.split("-")
+    shared: List[str] = []
+    for x, y in zip(reversed(a), reversed(b)):
+        if x != y:
+            break
+        shared.insert(0, x)
+    return "-".join(shared)
+
+
+def source_manifest(files: Sequence[SourceFile]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for source in files:
+        try:
+            raw = source.path.read_bytes()
+        except OSError as exc:
+            out[str(source.path)] = {"error": str(exc)}
+            continue
+        out[str(source.path)] = {
+            "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    return out
+
+
+def manifest_drift(before: Dict[str, Any], after: Dict[str, Any]) -> List[str]:
+    drift = []
+    for path in sorted(set(before) | set(after)):
+        if before.get(path) != after.get(path):
+            drift.append(path)
+    return drift
+
+
+def hermes_record_path(data_dir: Path) -> Path:
+    return data_dir / "fm-memory-migrate-hermes.json"
+
+
+def read_hermes_record(data_dir: Path) -> Optional[Dict[str, Any]]:
+    try:
+        record = json.loads(hermes_record_path(data_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def write_hermes_record(data_dir: Path, before: Dict[str, Any], after: Dict[str, Any]) -> None:
+    """What Hermes's own bank looked like on either side of a migration run.
+
+    Hermes keeps writing to that bank in normal operation, so 'unchanged since
+    the migration' can only be judged across the run itself. Recording both
+    sides is what lets a later `verify` state that fact instead of comparing
+    against a number that has moved for legitimate reasons.
+    """
+    try:
+        hermes_record_path(data_dir).write_text(
+            json.dumps({"before": before, "after": after}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8")
+    except OSError:
+        pass
+
+
+def hermes_snapshot(data_dir: Path) -> Dict[str, Any]:
+    """What must be identical before and after: Hermes's own bank, untouched."""
+    db = data_dir / "banks" / HERMES_BANK / "mnemosyne.db"
+    if not db.is_file():
+        return {"present": False}
+    out: Dict[str, Any] = {"present": True, "mtime_ns": db.stat().st_mtime_ns}
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        out["error"] = str(exc)
+        return out
+    try:
+        for table in ("working_memory", "episodic_memory"):
+            out[table] = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # noqa: S608
+    except sqlite3.Error as exc:
+        out["error"] = str(exc)
+    finally:
+        conn.close()
+    return out
+
+
+# --- the ledger --------------------------------------------------------------
+
+
+def ledger_path(data_dir: Path, lane: str) -> Path:
+    return data_dir / "banks" / f"lane-{lane}" / LEDGER_FILENAME
+
+
+def read_ledger(data_dir: Path, lane: str) -> Dict[str, Any]:
+    try:
+        raw = json.loads(ledger_path(data_dir, lane).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    records = raw.get("memories") if isinstance(raw, dict) else None
+    return records if isinstance(records, dict) else {}
+
+
+def write_ledger(data_dir: Path, lane: str, records: Dict[str, Any]) -> None:
+    path = ledger_path(data_dir, lane)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"version": 1, "memories": records}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        # A ledger that cannot be written costs one duplicate on a later edit,
+        # never a wrong answer, so it must not lose the writes that did land.
+        pass
+
+
+# --- the bridge --------------------------------------------------------------
+
+
+class BridgeSession:
+    """One `fm-memory-mcp serve` process for one lane, over its own stdio."""
+
+    def __init__(self, lane: str, data_dir: Path, home: Path) -> None:
+        self.lane = lane
+        self._next_id = 1
+        self.proc = subprocess.Popen(  # noqa: S603
+            [sys.executable, str(BRIDGE), "serve", "--lane", lane,
+             "--data-dir", str(data_dir), "--session", SESSION],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(os.environ, FM_HOME=str(home)),
+            text=True,
+            bufsize=1,
+        )
+        try:
+            self._call_raw("initialize", {})
+        except BaseException:
+            self.close()
+            raise
+
+    def _call_raw(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        assert self.proc.stdin and self.proc.stdout
+        request = {"jsonrpc": "2.0", "id": self._next_id, "method": method, "params": params}
+        self._next_id += 1
+        try:
+            self.proc.stdin.write(json.dumps(request) + "\n")
+            self.proc.stdin.flush()
+            line = self.proc.stdout.readline()
+        except (BrokenPipeError, ValueError) as exc:
+            raise MigrateError(f"lane {self.lane}: the bridge closed its pipe: {exc}") from exc
+        if not line:
+            stderr = (self.proc.stderr.read() if self.proc.stderr else "").strip()
+            raise MigrateError(f"lane {self.lane}: the bridge answered nothing. {stderr}")
+        try:
+            return json.loads(line)
+        except ValueError as exc:
+            raise MigrateError(f"lane {self.lane}: the bridge answered unparseable JSON: {exc}") from exc
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+        """(ok, payload) - a typed refusal is data, never an exception."""
+        response = self._call_raw("tools/call", {"name": name, "arguments": arguments})
+        if "result" not in response:
+            raise MigrateError(f"lane {self.lane}: {json.dumps(response.get('error'))}")
+        result = response["result"]
+        try:
+            payload = json.loads(result["content"][0]["text"])
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise MigrateError(f"lane {self.lane}: unreadable {name} result: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise MigrateError(
+                f"lane {self.lane}: the bridge answered {name} with "
+                f"{type(payload).__name__}, not an object")
+        return (not result.get("isError", False), payload)
+
+    def close(self) -> None:
+        """Tear the bridge down. Never raises: a dead bridge costs its lane."""
+        try:
+            self._call_raw("shutdown", {})
+        except (MigrateError, ValueError):
+            pass
+        finally:
+            for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                try:
+                    self.proc.wait(timeout=30)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+            except OSError:
+                pass
+
+
+def write_arguments(entry: Entry) -> Dict[str, Any]:
+    args: Dict[str, Any] = {
+        "content": entry.content,
+        "memory_type": entry.memory_type,
+        "importance": entry.importance,
+        "veracity": entry.veracity,
+        "scope": "global",
+        "source": entry.source,
+        "metadata": entry.metadata,
+    }
+    if entry.channel_id != LANE_CHANNEL:
+        args["project"] = entry.channel_id
+    return args
+
+
+def record_floor(data_dir: Path, lane: str, home: Path) -> Optional[str]:
+    """Re-record the lane's row floor, so preflight measures against its new size.
+
+    The floor is what tells a wiped bank from a quiet one. Left at the
+    pre-migration size it would still pass while most of the migration was
+    missing, which is the exact success-shaped emptiness this bridge exists to
+    make impossible.
+    """
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, str(BRIDGE), "record-floor", "--lane", lane, "--data-dir", str(data_dir)],
+        env=dict(os.environ, FM_HOME=str(home)),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return None
+    return (result.stderr.strip() or result.stdout.strip() or "record-floor failed")
+
+
+def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dict[str, Any]:
+    by_lane: Dict[str, List[Entry]] = {}
+    for entry in entries:
+        by_lane.setdefault(entry.lane, []).append(entry)
+
+    counts = {"written": 0, "skipped_duplicate": 0, "updated": 0, "refused": 0}
+    refusals: List[Dict[str, Any]] = []
+    lane_reports: List[Dict[str, Any]] = []
+    orphaned: List[Dict[str, str]] = []
+
+    for lane in sorted(by_lane):
+        lane_entries = by_lane[lane]
+        ledger = read_ledger(data_dir, lane)
+        try:
+            session = BridgeSession(lane, data_dir, home)
+        except (MigrateError, OSError) as exc:
+            counts["refused"] += len(lane_entries)
+            for entry in lane_entries:
+                refusals.append({"key": entry.key, "lane": lane, "code": "lane_unavailable", "message": str(exc)})
+            lane_reports.append({"lane": lane, "state": "unavailable", "detail": str(exc)})
+            continue
+
+        lane_counts = {"written": 0, "skipped_duplicate": 0, "updated": 0, "refused": 0}
+        try:
+            for entry in lane_entries:
+                record = ledger.get(entry.key) or {}
+                previous_id = record.get("memory_id")
+                changed = bool(previous_id) and record.get("content_sha") != entry.content_sha
+                ok = False
+                payload: Dict[str, Any] = {}
+                if changed:
+                    ok, payload = session.call_tool(
+                        "memory_supersede", dict(write_arguments(entry), memory_id=previous_id))
+                    if ok:
+                        lane_counts["updated"] += 1
+                if not ok:
+                    # The ledger is derived, so a supersession it asked for that
+                    # the store refused - the row is gone, or was already
+                    # retired - falls back to writing the memory plainly rather
+                    # than losing it to a record that no longer describes reality.
+                    ok, payload = session.call_tool("memory_remember", write_arguments(entry))
+                    if ok:
+                        if payload.get("created"):
+                            lane_counts["written"] += 1
+                        else:
+                            lane_counts["skipped_duplicate"] += 1
+                if not ok:
+                    lane_counts["refused"] += 1
+                    error = payload.get("error") or {}
+                    refusals.append({
+                        "key": entry.key,
+                        "lane": lane,
+                        "code": error.get("code", "unknown"),
+                        "message": error.get("message", json.dumps(payload)),
+                    })
+                    continue
+                memory_id = payload.get("id")
+                if memory_id:
+                    ledger[entry.key] = {
+                        "memory_id": memory_id,
+                        "content_sha": entry.content_sha,
+                        "source_paths": entry.metadata["source_paths"],
+                    }
+        finally:
+            session.close()
+
+        current = {entry.key for entry in lane_entries}
+        for key in sorted(set(ledger) - current):
+            orphaned.append({"lane": lane, "key": key, "memory_id": (ledger[key] or {}).get("memory_id", "")})
+        write_ledger(data_dir, lane, ledger)
+
+        floor_error = None
+        if lane_counts["written"] or lane_counts["updated"]:
+            floor_error = record_floor(data_dir, lane, home)
+        report = {"lane": lane, "state": "ready", **lane_counts}
+        if floor_error:
+            report["row_floor_error"] = floor_error
+        lane_reports.append(report)
+        for key in lane_counts:
+            counts[key] += lane_counts[key]
+
+    # A lane this run derived nothing for still has a ledger, and its keys are
+    # exactly the ones most likely to have lost their source. Walking only the
+    # lanes with work would leave that invisible, which is the one thing a
+    # deliberately non-retiring tool must not do.
+    for lane in sorted(ledger_lanes(data_dir)):
+        if lane in by_lane:
+            continue
+        for key, record in sorted(read_ledger(data_dir, lane).items()):
+            orphaned.append({"lane": lane, "key": key, "memory_id": (record or {}).get("memory_id", "")})
+
+    return {
+        "counts": counts,
+        "lanes": lane_reports,
+        "refusals": refusals,
+        "orphaned_ledger_keys": orphaned,
+    }
+
+
+def ledger_lanes(data_dir: Path) -> List[str]:
+    """Every lane whose bank carries a ledger this tool wrote."""
+    banks = data_dir / "banks"
+    if not banks.is_dir():
+        return []
+    out = []
+    for path in sorted(banks.iterdir()):
+        if path.name.startswith("lane-") and (path / LEDGER_FILENAME).is_file():
+            out.append(path.name[len("lane-"):])
+    return out
+
+
+# --- verification (report section 5.5) ---------------------------------------
+
+
+MIGRATED_SOURCES = (SOURCE, POINTER_SOURCE)
+
+
+def open_bank(data_dir: Path, lane: str) -> Optional[sqlite3.Connection]:
+    db = data_dir / "banks" / f"lane-{lane}" / "mnemosyne.db"
+    if not db.is_file():
+        return None
+    try:
+        return sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+
+
+def is_retired(row: Dict[str, Any]) -> bool:
+    """Superseded, or already past its shelf life.
+
+    The store's own recall filter is `valid_until IS NULL OR valid_until >
+    now`, compared as text against a local ISO timestamp, so this reads it the
+    same way. An expiry still in the future has not happened yet, and calling
+    such a row retired would report a live memory as lost.
+    """
+    if row["superseded_by"]:
+        return True
+    valid_until = row["valid_until"]
+    return bool(valid_until) and str(valid_until) <= datetime.now().isoformat()
+
+
+def migrated_rows(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    placeholders = ", ".join("?" for _ in MIGRATED_SOURCES)
+    rows = conn.execute(
+        f"SELECT id, content, source, scope, channel_id, consolidated_at, superseded_by, "  # noqa: S608
+        f"valid_until, metadata_json, importance FROM working_memory WHERE source IN ({placeholders})",
+        MIGRATED_SOURCES,
+    ).fetchall()
+    out = []
+    for row in rows:
+        try:
+            metadata = json.loads(row[8]) if row[8] else {}
+        except ValueError:
+            metadata = {}
+        out.append({
+            "id": row[0], "content": row[1], "source": row[2], "scope": row[3],
+            "channel_id": row[4], "consolidated_at": row[5], "superseded_by": row[6],
+            "valid_until": row[7], "metadata": metadata, "importance": row[9],
+        })
+    return out
+
+
+def cosine(a: Sequence[float], b: Sequence[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def near_duplicates(conn: sqlite3.Connection, ids: Sequence[str]) -> List[Dict[str, Any]]:
+    """Pairs the store's own embeddings put at or above the review threshold.
+
+    Computed from what the store wrote rather than from a second embedding
+    model, so this cannot disagree with what recall will actually rank
+    together. Reported for review and never merged.
+    """
+    vectors: Dict[str, List[float]] = {}
+    wanted = set(ids)
+    try:
+        rows = conn.execute("SELECT memory_id, embedding_json FROM memory_embeddings").fetchall()
+    except sqlite3.Error:
+        return []
+    for memory_id, raw in rows:
+        if memory_id not in wanted:
+            continue
+        try:
+            vector = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(vector, list) and vector:
+            vectors[memory_id] = vector
+    out = []
+    keys = sorted(vectors)
+    for i, left in enumerate(keys):
+        for right in keys[i + 1:]:
+            score = cosine(vectors[left], vectors[right])
+            if score >= NEAR_DUPLICATE_COSINE:
+                out.append({"a": left, "b": right, "cosine": round(score, 4)})
+    return out
+
+
+def check(name: str, passed: bool, detail: str) -> Dict[str, Any]:
+    return {"check": name, "pass": passed, "detail": detail}
+
+
+def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path,
+           home: Path) -> Dict[str, Any]:
+    """The integrity checklist, read from the banks rather than from a report."""
+    checks: List[Dict[str, Any]] = []
+    lanes = sorted({entry.lane for entry in entries})
+    rows_by_lane: Dict[str, List[Dict[str, Any]]] = {}
+    unreadable: List[str] = []
+    for lane in lanes:
+        conn = open_bank(data_dir, lane)
+        if conn is None:
+            unreadable.append(lane)
+            continue
+        try:
+            rows_by_lane[lane] = migrated_rows(conn)
+        finally:
+            conn.close()
+
+    all_rows = [row for rows in rows_by_lane.values() for row in rows]
+    # A superseded row is history, not a memory the fleet holds. Every check
+    # about what the store CLAIMS reads the live set; the checks about how
+    # rows were written read every row, retired ones included.
+    live_by_lane = {lane: [r for r in rows if not is_retired(r)] for lane, rows in rows_by_lane.items()}
+    live_rows = [row for rows in live_by_lane.values() for row in rows]
+
+    # 1 count reconciliation, per lane
+    mismatched = []
+    for lane in lanes:
+        expected = len([e for e in entries if e.lane == lane])
+        actual = len(live_by_lane.get(lane, []))
+        if expected != actual:
+            mismatched.append(f"{lane}: derived {expected}, store holds {actual} live")
+    retired_total = len(all_rows) - len(live_rows)
+    checks.append(check(
+        "1 count reconciliation",
+        not mismatched and not unreadable,
+        "; ".join(mismatched + [f"{lane}: bank unreadable" for lane in unreadable]) or
+        f"every lane matches ({len(entries)} live memories across {len(lanes)} lanes"
+        f"{f', plus {retired_total} superseded kept as history' if retired_total else ''})"))
+
+    # 2 provenance completeness
+    recorded = set()
+    for row in live_rows:
+        for path in row["metadata"].get("source_paths") or []:
+            recorded.add(path)
+    routed_paths = {str(f.path) for f in files if f.lane}
+    accounted = {str(f.path) for f in files if not f.lane}
+    missing = sorted(routed_paths - recorded)
+    checks.append(check(
+        "2 provenance completeness",
+        not missing,
+        f"{len(missing)} routed source files are in no memory's provenance: {', '.join(missing[:5])}"
+        if missing else
+        f"all {len(routed_paths)} routed source files appear in a memory's provenance "
+        f"({len(accounted)} unrouted, reported separately)"))
+
+    # 3 no silent loss to the 24h trim
+    unpinned = [row["id"] for row in all_rows if not row["consolidated_at"]]
+    checks.append(check(
+        "3 no silent loss to trim",
+        not unpinned,
+        f"{len(unpinned)} migrated memories are unpinned and would be trimmed" if unpinned
+        else f"all {len(all_rows)} migrated memories are pinned"))
+
+    # 4 scope correctness
+    non_global = [row["id"] for row in all_rows if row["scope"] != "global"]
+    checks.append(check(
+        "4 scope correctness",
+        not non_global,
+        f"{len(non_global)} migrated memories are not global" if non_global
+        else f"all {len(all_rows)} migrated memories are global"))
+
+    # 5 and 6 embedding and FTS parity, per bank
+    parity_problems = []
+    for lane in lanes:
+        conn = open_bank(data_dir, lane)
+        if conn is None:
+            continue
+        try:
+            counts = {}
+            for table in ("working_memory", "episodic_memory", "memory_embeddings", "fts_working"):
+                try:
+                    counts[table] = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # noqa: S608
+                except sqlite3.Error as exc:
+                    parity_problems.append(f"{lane}: cannot count {table}: {exc}")
+                    counts[table] = -1
+        finally:
+            conn.close()
+        expected_embeddings = counts.get("working_memory", 0) + counts.get("episodic_memory", 0)
+        if counts.get("memory_embeddings") != expected_embeddings:
+            parity_problems.append(
+                f"{lane}: {counts.get('memory_embeddings')} embeddings for {expected_embeddings} memories")
+        if counts.get("fts_working") != counts.get("working_memory"):
+            parity_problems.append(
+                f"{lane}: {counts.get('fts_working')} FTS rows for {counts.get('working_memory')} memories")
+    embedding_problems = [p for p in parity_problems if "embedding" in p or "cannot count" in p]
+    fts_problems = [p for p in parity_problems if "FTS" in p]
+    checks.append(check("5 embedding parity", not embedding_problems,
+                        "; ".join(embedding_problems) or "every bank has one embedding per memory"))
+    checks.append(check("6 FTS parity", not fts_problems,
+                        "; ".join(fts_problems) or "every bank has one FTS row per memory"))
+
+    # 7 clean lifecycle slate. A fresh migration retires nothing at all. A
+    # re-run over an edited file supersedes, which is the point of superseding,
+    # so what must hold is not "nothing is retired" but "nothing was retired
+    # without something live taking its place" - the shape a lost memory would
+    # actually have.
+    replaced = {row["metadata"].get("supersedes") for row in live_rows}
+    orphan_retired = [row["id"] for row in all_rows if is_retired(row) and row["id"] not in replaced]
+    retired_count = len(all_rows) - len(live_rows)
+    checks.append(check(
+        "7 clean lifecycle slate",
+        not orphan_retired,
+        f"{len(orphan_retired)} migrated memories are retired with nothing live replacing them: "
+        f"{', '.join(orphan_retired[:5])}" if orphan_retired
+        else (f"{retired_count} superseded, each replaced by a live memory" if retired_count
+              else "no migrated memory is superseded or expired")))
+
+    # 8 recall spot-check: every memory found by its own description, which is
+    # never part of its stored text, so this is a paraphrase and not a substring.
+    checks.append(recall_spot_check(live_by_lane, data_dir, home))
+
+    # 9 lane containment
+    checks.append(lane_containment(live_by_lane, data_dir, home))
+
+    # 10 cross-lane awareness
+    checks.append(awareness_check(live_by_lane, data_dir, home))
+
+    # 11 idempotence is proved by re-running `write`; what verify can prove is
+    # that the store holds no second live row for one source file.
+    duplicated = []
+    seen: Dict[str, str] = {}
+    for row in live_rows:
+        key = row["metadata"].get("source_path") or ""
+        if key and key in seen:
+            duplicated.append(f"{key} is claimed by {seen[key]} and {row['id']}")
+        elif key:
+            seen[key] = row["id"]
+    checks.append(check(
+        "11 no duplicate live rows per source",
+        not duplicated,
+        "; ".join(duplicated[:5]) or f"each of {len(seen)} source files has exactly one live memory"))
+
+    # 13 Hermes untouched. Absent is not a failure - a data dir with no Hermes
+    # bank has nothing for this tool to disturb - and its counts moving since
+    # the migration is not one either, because Hermes writes to it constantly.
+    # What must hold is that the run itself left it identical.
+    snapshot = hermes_snapshot(data_dir)
+    record = read_hermes_record(data_dir)
+    if record is not None:
+        unchanged = record.get("before") == record.get("after")
+        detail = ("the last migration run left the Hermes bank identical: "
+                  f"{json.dumps(record.get('after'))}") if unchanged else (
+                  f"the last migration run CHANGED the Hermes bank: {json.dumps(record)}")
+    elif not snapshot.get("present"):
+        unchanged = True
+        detail = "this data dir has no Hermes bank; there was nothing to disturb"
+    else:
+        unchanged = "error" not in snapshot
+        detail = (f"no migration run recorded here; the Hermes bank is currently "
+                  f"{json.dumps(snapshot)}")
+    checks.append(check("13 Hermes bank untouched by the migration", unchanged, detail))
+
+    # 14 sources intact
+    manifest = source_manifest(files)
+    broken = [path for path, record in manifest.items() if "error" in record]
+    checks.append(check(
+        "14 every source file still readable on disk",
+        not broken,
+        f"{len(broken)} source files could not be read: {', '.join(broken[:5])}" if broken
+        else f"all {len(manifest)} source files are intact and were only ever read"))
+
+    review = []
+    for lane in lanes:
+        conn = open_bank(data_dir, lane)
+        if conn is None:
+            continue
+        try:
+            pairs = near_duplicates(conn, [row["id"] for row in live_by_lane.get(lane, [])])
+        finally:
+            conn.close()
+        for pair in pairs:
+            review.append(dict(pair, lane=lane))
+
+    return {
+        "checks": checks,
+        "near_duplicate_review": review,
+        "hermes": snapshot,
+        "lanes": lanes,
+    }
+
+
+def recall_spot_check(rows_by_lane: Dict[str, List[Dict[str, Any]]], data_dir: Path,
+                      home: Path) -> Dict[str, Any]:
+    hits = 0
+    total = 0
+    misses: List[str] = []
+    for lane, rows in sorted(rows_by_lane.items()):
+        candidates = [r for r in rows if (r["metadata"].get("description") or "").strip()]
+        if not candidates:
+            continue
+        try:
+            session = BridgeSession(lane, data_dir, home)
+        except (MigrateError, OSError) as exc:
+            misses.append(f"{lane}: {exc}")
+            continue
+        try:
+            for row in candidates:
+                total += 1
+                arguments: Dict[str, Any] = {
+                    "query": row["metadata"]["description"],
+                    "top_k": 5,
+                    "include_awareness": False,
+                }
+                if row["channel_id"] != LANE_CHANNEL:
+                    arguments["project"] = row["channel_id"]
+                ok, payload = session.call_tool("memory_recall", arguments)
+                found = ok and any(r.get("id") == row["id"] for r in payload.get("results") or [])
+                if found:
+                    hits += 1
+                else:
+                    misses.append(f"{lane}/{row['id']}: {row['metadata'].get('source_name', '')}")
+        finally:
+            session.close()
+    ratio = (hits / total) if total else 0.0
+    return check(
+        "8 recall spot-check by paraphrase",
+        total > 0 and ratio >= 0.9,
+        f"{hits}/{total} memories returned in the top 5 for their own description"
+        + (f"; missed: {', '.join(misses[:5])}" if misses else ""))
+
+
+def distinctive_terms(rows: Sequence[Dict[str, Any]], other_rows: Sequence[Dict[str, Any]]) -> List[str]:
+    """Words this lane uses that no other lane's migrated text contains."""
+    def tokens(items: Sequence[Dict[str, Any]]) -> set:
+        out = set()
+        for row in items:
+            for word in re.split(r"[^A-Za-z0-9]+", row["content"].lower()):
+                if len(word) >= 8:
+                    out.add(word)
+        return out
+    return sorted(tokens(rows) - tokens(other_rows))[:3]
+
+
+def lane_containment(rows_by_lane: Dict[str, List[Dict[str, Any]]], data_dir: Path,
+                     home: Path) -> Dict[str, Any]:
+    leaks: List[str] = []
+    probes = 0
+    for lane, rows in sorted(rows_by_lane.items()):
+        others = [r for other, rs in rows_by_lane.items() if other != lane for r in rs]
+        terms = distinctive_terms(others, rows)
+        if not terms:
+            continue
+        try:
+            session = BridgeSession(lane, data_dir, home)
+        except (MigrateError, OSError) as exc:
+            leaks.append(f"{lane}: {exc}")
+            continue
+        try:
+            for term in terms:
+                probes += 1
+                ok, payload = session.call_tool(
+                    "memory_recall", {"query": term, "top_k": 10, "include_awareness": False})
+                if not ok:
+                    continue
+                for result in payload.get("results") or []:
+                    if term in (result.get("content") or "").lower():
+                        leaks.append(f"{lane} returned another lane's term {term!r}")
+        finally:
+            session.close()
+    return check(
+        "9 lane containment",
+        not leaks,
+        "; ".join(leaks[:5]) or f"{probes} cross-lane term probes returned nothing from another lane")
+
+
+def awareness_check(rows_by_lane: Dict[str, List[Dict[str, Any]]], data_dir: Path,
+                    home: Path) -> Dict[str, Any]:
+    populated = sorted(lane for lane, rows in rows_by_lane.items() if rows)
+    if len(populated) < 2:
+        return check("10 cross-lane awareness", True, "fewer than two populated lanes; nothing to be aware of")
+    missing: List[str] = []
+    capped = False
+    for lane in populated:
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, str(BRIDGE), "awareness", "--exclude", lane, "--data-dir", str(data_dir)],
+            env=dict(os.environ, FM_HOME=str(home)),
+            capture_output=True, text=True, check=False)
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError:
+            missing.append(f"{lane}: awareness did not answer ({result.stderr.strip()})")
+            continue
+        seen = {title.get("lane") for title in payload.get("titles") or []}
+        if payload.get("count", 0) >= 15:
+            capped = True
+        for other in populated:
+            if other != lane and other not in seen:
+                missing.append(f"from {lane}, lane {other} contributes no title")
+    detail = "; ".join(missing[:5]) or f"every populated lane sees every other ({len(populated)} lanes)"
+    if missing and capped:
+        detail += "; the index is at its 15-title cap, so lower-importance lanes are crowded out"
+    return check("10 cross-lane awareness", not missing, detail)
+
+
+# --- rendering ---------------------------------------------------------------
+
+
+def entry_json(entry: Entry) -> Dict[str, Any]:
+    return {
+        "key": entry.key,
+        "lane": entry.lane,
+        "channel_id": entry.channel_id,
+        "memory_type": entry.memory_type,
+        "importance": entry.importance,
+        "veracity": entry.veracity,
+        "source": entry.source,
+        "content": entry.content,
+        "metadata": entry.metadata,
+        "notes": entry.notes,
+    }
+
+
+def render_plan(plan: Dict[str, Any], files: Sequence[SourceFile], problems: Sequence[Dict[str, str]]) -> None:
+    entries: List[Entry] = plan["entries"]
+    by_lane: Dict[str, List[Entry]] = {}
+    for entry in entries:
+        by_lane.setdefault(entry.lane, []).append(entry)
+    pointers = [e for e in entries if e.source == POINTER_SOURCE]
+    print(f"sources read: {len(files)} files in "
+          f"{len({f.dir_name for f in files})} memory directories")
+    print(f"memories derived: {len(entries)} across {len(by_lane)} lanes "
+          f"({len(pointers)} credential pointers)")
+    for lane in sorted(by_lane):
+        lane_entries = by_lane[lane]
+        print(f"\n{lane} ({len(lane_entries)})")
+        for entry in sorted(lane_entries, key=lambda e: e.key):
+            marker = "POINTER" if entry.source == POINTER_SOURCE else entry.memory_type
+            note = f"  [{'; '.join(entry.notes)}]" if entry.notes else ""
+            print(f"  {entry.channel_id:24s} {marker:12s} {entry.metadata['source_name']}{note}")
+    if pointers:
+        print("\ncredential pointers (content NEVER copied):")
+        for entry in sorted(pointers, key=lambda e: e.key):
+            reasons = "; ".join(
+                f"{f['rule']} ({f['evidence']})" for f in entry.metadata["credential_findings"][:3])
+            print(f"  {entry.metadata['source_path']}\n      {reasons}")
+    if plan["cross_lane_duplicates"]:
+        print("\nidentical content in more than one lane (written once per lane, never merged):")
+        for item in plan["cross_lane_duplicates"]:
+            print(f"  {item['name']}: {', '.join(item['lanes'])}")
+    if plan["dropped_for_pointer"]:
+        print("\ndropped in favour of a canonical-file pointer:")
+        for item in plan["dropped_for_pointer"]:
+            print(f"  {item['name']} -> {item['owner']}")
+    canonicalised = canonicalised_projects(files)
+    if canonicalised:
+        print("\ncanonicalised - one project assembled from several memory directories:")
+        for item in canonicalised:
+            print(f"  {item['project']} ({item['lane']}): {item['files']} files from "
+                  f"{len(item['directories'])} directories: {', '.join(item['directories'])}")
+    unrouted: List[SourceFile] = plan["unrouted"]
+    if unrouted:
+        print(f"\nUNROUTED ({len(unrouted)} files) - nothing is written for these:")
+        for dir_name in sorted({f.dir_name for f in unrouted}):
+            members = [f for f in unrouted if f.dir_name == dir_name]
+            project = members[0].project
+            why = (f"project {project!r} carries no lane in data/projects.md" if project
+                   else "matches no registered project")
+            print(f"  {dir_name} ({len(members)} files): {why}")
+    fragments = unrouted_fragments(files)
+    if fragments:
+        print("\nunrouted directories that look like ONE project - an observation, not a route;")
+        print("registering the project in data/projects.md with a lane is what would migrate them:")
+        for item in fragments:
+            print(f"  {item['looks_like_project']} ({item['files']} files): "
+                  f"{', '.join(item['directories'])}")
+    for problem in problems:
+        print(f"\nUNREADABLE {problem['path']}: {problem['problem']}")
+
+
+def render_checks(result: Dict[str, Any]) -> bool:
+    ok = True
+    for item in result["checks"]:
+        mark = "PASS" if item["pass"] else "FAIL"
+        ok = ok and item["pass"]
+        print(f"{mark}  {item['check']}: {item['detail']}")
+    review = result["near_duplicate_review"]
+    if review:
+        print(f"\nnear-duplicate review ({len(review)} pairs at cosine >= {NEAR_DUPLICATE_COSINE}, "
+              f"never merged automatically):")
+        for pair in review[:20]:
+            print(f"  {pair['lane']}: {pair['a']} ~ {pair['b']} ({pair['cosine']})")
+    return ok
+
+
+# --- CLI ---------------------------------------------------------------------
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="fm-memory-migrate",
+        description="Mirror Claude Code's auto-memory files into the Mnemosyne lane banks.")
+    parser.add_argument("command", choices=["plan", "write", "verify"])
+    parser.add_argument("--source", help=f"auto-memory root (default: {DEFAULT_SOURCE_ROOT})")
+    parser.add_argument("--home", help="firstmate home holding data/projects.md (default: FM_HOME)")
+    parser.add_argument("--data-dir", help=f"Mnemosyne data dir (default: {DEFAULT_DATA_DIR})")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    args = parser.parse_args(argv)
+
+    home = Path(args.home or os.environ.get("FM_HOME") or Path(__file__).resolve().parent.parent)
+    source_root = Path(args.source) if args.source else DEFAULT_SOURCE_ROOT
+    data_dir = Path(args.data_dir) if args.data_dir else Path(
+        os.environ.get("MNEMOSYNE_DATA_DIR") or DEFAULT_DATA_DIR)
+
+    try:
+        files, problems = scan_sources(source_root, home)
+    except MigrateError as exc:
+        print(f"fm-memory-migrate: {exc}", file=sys.stderr)
+        return 1
+    plan = build_entries(files, home)
+    entries: List[Entry] = plan["entries"]
+    unrouted: List[SourceFile] = plan["unrouted"]
+
+    if args.command == "plan":
+        if args.json:
+            print(json.dumps({
+                "sources_read": len(files),
+                "entries": [entry_json(e) for e in entries],
+                "credential_pointers": [entry_json(e) for e in entries if e.source == POINTER_SOURCE],
+                "cross_lane_duplicates": plan["cross_lane_duplicates"],
+                "dropped_for_pointer": plan["dropped_for_pointer"],
+                "unrouted": [{"path": str(f.path), "dir": f.dir_name, "project": f.project} for f in unrouted],
+                "unrouted_fragments": unrouted_fragments(files),
+                "canonicalised_projects": canonicalised_projects(files),
+                "unreadable": list(problems),
+            }, indent=2))
+        else:
+            render_plan(plan, files, problems)
+        return 1 if (unrouted or problems) else 0
+
+    if args.command == "write":
+        before = source_manifest(files)
+        hermes_before = hermes_snapshot(data_dir)
+        result = write_migration(entries, data_dir, home)
+        after = source_manifest(files)
+        hermes_after = hermes_snapshot(data_dir)
+        write_hermes_record(data_dir, hermes_before, hermes_after)
+        drift = manifest_drift(before, after)
+        result["counts"]["credential_pointers"] = len([e for e in entries if e.source == POINTER_SOURCE])
+        result["counts"]["unrouted"] = len(unrouted)
+        result["counts"]["dropped_for_pointer"] = len(plan["dropped_for_pointer"])
+        result["source_drift"] = drift
+        result["hermes_before"] = hermes_before
+        result["hermes_after"] = hermes_after
+        hermes_ok = hermes_before == hermes_after
+        if args.json:
+            print(json.dumps(dict(result, hermes_unchanged=hermes_ok), indent=2))
+        else:
+            counts = result["counts"]
+            print(" ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+            for lane in result["lanes"]:
+                print(f"  {lane['lane']}: {json.dumps(lane)}")
+            for refusal in result["refusals"]:
+                print(f"REFUSED {refusal['key']}: {refusal['code']} - {refusal['message']}")
+            for orphan in result["orphaned_ledger_keys"]:
+                print(f"ORPHANED {orphan['lane']}/{orphan['key']} "
+                      f"(memory {orphan['memory_id']} kept; retiring it is a deliberate act)")
+            print(f"sources unchanged: {'yes' if not drift else 'NO - ' + ', '.join(drift)}")
+            print(f"Hermes bank unchanged: {'yes' if hermes_ok else 'NO'}")
+        if drift:
+            print("fm-memory-migrate: a source file changed during the run; mirror mode is violated",
+                  file=sys.stderr)
+        failed = bool(drift) or not hermes_ok or result["counts"]["refused"] or unrouted
+        return 1 if failed else 0
+
+    result = verify(entries, files, data_dir, home)
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0 if all(c["pass"] for c in result["checks"]) else 1
+    return 0 if render_checks(result) else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except MigrateError as exc:
+        print(f"fm-memory-migrate: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

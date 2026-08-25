@@ -95,15 +95,19 @@ WHAT THIS DELIBERATELY DOES NOT DO
   and retiring them stays a deliberate act. Both `write` and `verify` report
   them, and the count reconciliation reads the store's live rows as this run's
   memories PLUS those kept orphans rather than calling them a mismatch.
-  A fact a second project of the lane takes up moves to the lane-wide channel,
-  and one no longer shared moves back under its project. That is a deliberate
-  re-placement of a memory whose source is present and readable, so it is
-  written as a supersession and the row it replaces stays as history. It is not
-  the never-retire case, which is about a source that has VANISHED and stays
-  reported rather than retired. The store refuses to relocate content it
-  already holds under another channel, so where its dedupe reads the two texts
-  as one the move is reported as a refusal rather than performed - `verify`
-  fails check 15 and names the channel the memory is stuck under.
+  It does not move a memory to another channel of its own lane.
+  A fact a second project of the lane takes up belongs to the lane-wide
+  channel, and one no longer shared belongs back under its project, but that
+  move cannot be expressed through the bridge: its dedupe is keyed on the
+  session and the content and ignores the channel, so identical content under
+  a new channel matches the row that already holds it.
+  `memory_supersede` reads that as superseding a memory by itself and refuses
+  `supersede_noop`; `memory_remember` refuses `duplicate_in_other_project`.
+  So the write is refused, `write` exits nonzero, and `verify` fails check 15
+  naming the memory and both channels - the bound is loud and checked, never
+  silent. Relocation needs a capability at the bridge, which is shipped
+  phase-1 code the dashboard and Hermes also read: follow-up
+  memory-bridge-channel-move-followup-q73 carries that decision.
   A ledger record and a source file are the same memory when their paths
   intersect OR their text is identical: an edit keeps the paths, a rename
   keeps the text. A file that is renamed AND edited between two runs matches
@@ -1258,20 +1262,16 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
                 try:
                     previous_key, record = ledger_record_for(ledger, entry)
                     previous_id = record.get("memory_id")
-                    changed = bool(previous_id) and record.get("content_sha") != entry.content_sha
-                    # A fact a second project of this lane has taken up belongs
-                    # to the lane-wide channel, and one no longer shared belongs
-                    # back under its project. The source is right there and
-                    # readable, so this is a deliberate re-placement of a memory
-                    # that exists, not a guess about one that might be gone: the
-                    # never-retire rule governs vanished sources and is untouched.
-                    moved = (bool(previous_id)
-                             and bool(record.get("channel"))
-                             and record["channel"] != entry.channel_id
-                             and sources_readable(entry))
+                    # Only a memory whose own files are readable right now is
+                    # ever superseded. A source that has vanished stays kept and
+                    # reported, which is the never-retire rule, and nothing here
+                    # may act on that uncertainty.
+                    changed = (bool(previous_id)
+                               and record.get("content_sha") != entry.content_sha
+                               and sources_readable(entry))
                     ok = False
                     payload: Dict[str, Any] = {}
-                    if changed or moved:
+                    if changed:
                         ok, payload = session.call_tool(
                             "memory_supersede", dict(write_arguments(entry), memory_id=previous_id))
                         if ok:
@@ -1304,7 +1304,6 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
                         ledger[entry.key] = {
                             "memory_id": memory_id,
                             "content_sha": entry.content_sha,
-                            "channel": entry.channel_id,
                             "source_paths": entry.metadata["source_paths"],
                         }
                 except (MigrateError, OSError) as exc:

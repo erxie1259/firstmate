@@ -1310,42 +1310,41 @@ test_another_directory_of_one_project_stays_one_memory() {
   pass "fm-memory-migrate: another directory of one project stays one memory"
 }
 
-test_a_fact_a_second_project_takes_up_moves_to_the_lane_channel() {
+test_a_channel_move_is_refused_and_check_15_names_it() {
   skip_without_library "the channel-move test" && return 0
-  local home src data out
+  local home src data out detail
   home=$(make_home chanmove-home)
   src=$(make_sources chanmove-src)
   data=$(make_lanes chanmove-data products fleet-infra)
   fm_migrate "$home" "$src" "$data" write >/dev/null || true
   # A second project of the same lane takes up the same fact, so the memory
-  # belongs to the lane-wide channel rather than to one project.
+  # now belongs to the lane-wide channel. The store's dedupe is keyed on the
+  # session and the content and ignores the channel, so that move cannot be
+  # expressed and the write is refused. This is the documented bound; when
+  # follow-up memory-bridge-channel-move-followup-q73 makes the move land,
+  # this test going red is the signal that it worked.
   mkdir -p "$src/-Users-x-Coding-widgets/memory"
   cp "$src/-Users-x-Coding-flags/memory/shared_fact.md" \
      "$src/-Users-x-Coding-widgets/memory/shared_fact.md"
   out=$(fm_migrate "$home" "$src" "$data" write --json) || true
-  case "$(json_field "$out" "json.dumps(d['refusals'])")" in
-    *duplicate_in_other_project*|*supersede_noop*)
-      # The store refuses to relocate content it already holds under another
-      # channel, so the move is reported rather than performed.
-      ;;
-    *)
-      [ "$(json_field "$out" "d['counts']['updated']")" = "1" ] \
-        || fail "the channel move neither landed as a supersession nor was refused: $out" ;;
-  esac
-  # Either way verify must say so rather than reporting a clean migration.
-  out=$(fm_migrate "$home" "$src" "$data" verify) || true
-  case "$out" in
-    *"PASS  15 every derived memory landed in the store"*) ;;
-    *"FAIL  15 every derived memory landed in the store"*)
-      case "$out" in
-        *"but this run derives it for '_lane'"*) ;;
-        *) fail "check 15 failed without naming the channel the memory is stuck under: $out" ;;
-      esac ;;
-    *) fail "verification did not report whether the derived memory landed: $out" ;;
+  [ "$(json_field "$out" "d['counts']['refused']")" = "1" ] \
+    || fail "the channel move was not refused, so the documented bound no longer holds: $out"
+  [ "$(json_field "$out" "d['counts']['updated']")" = "0" ] \
+    || fail "the channel move landed as a supersession the bridge cannot express: $out"
+  [ "$(json_field "$out" "next(r['code'] for r in d['refusals'])")" = "duplicate_in_other_project" ] \
+    || fail "the refusal is not the store refusing to relocate the content: $out"
+  # The refusal must be reported by verify, not absorbed by another check.
+  out=$(fm_migrate "$home" "$src" "$data" verify --json) || true
+  [ "$(json_field "$out" "next(c['pass'] for c in d['checks'] if c['check'].startswith('15 '))")" \
+    = "False" ] || fail "check 15 did not report the refused channel move: $out"
+  detail=$(json_field "$out" "next(c['detail'] for c in d['checks'] if c['check'].startswith('15 '))")
+  case "$detail" in
+    *"Shared build fact"*"held under channel 'flags'"*"derives it for '_lane'"*) ;;
+    *) fail "check 15 did not name the memory and both channels: $detail" ;;
   esac
   [ "$(bank_text_contains "$data" products 'wall-clock timestamps')" != "0" ] \
-    || fail "the memory was lost while its channel moved"
-  pass "fm-memory-migrate: a fact a second project takes up either moves channel or is reported"
+    || fail "the memory was lost while its channel move was refused"
+  pass "fm-memory-migrate: a channel move is refused and check 15 names the memory and both channels"
 }
 
 test_verify_catches_a_memory_the_store_refused() {
@@ -1553,7 +1552,7 @@ test_a_renamed_source_needs_no_second_migration_to_verify
 test_a_file_created_at_a_renamed_path_never_retires_the_renamed_memory
 test_a_renamed_and_edited_source_is_a_delete_plus_create
 test_another_directory_of_one_project_stays_one_memory
-test_a_fact_a_second_project_takes_up_moves_to_the_lane_channel
+test_a_channel_move_is_refused_and_check_15_names_it
 test_verify_catches_a_memory_the_store_refused
 test_two_successive_edits_verify_as_history_kept
 test_verify_catches_a_memory_that_never_landed

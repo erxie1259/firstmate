@@ -544,6 +544,32 @@ test_verify_does_not_call_a_lane_local_memory_a_leak() {
   pass "fm-memory-migrate: a lane's own memory sharing a word with another lane is not a leak"
 }
 
+test_verify_accepts_a_memory_left_to_a_canonical_pointer() {
+  skip_without_library "the canonical-drop verification test" && return 0
+  local home src data out
+  home=$(make_home dropverify-home)
+  src=$(make_sources dropverify-src)
+  data=$(make_lanes dropverify-data products fleet-infra)
+  cat > "$home/data/captain.md" <<'MD'
+# Captain preferences
+
+## Chat is for outcomes only
+
+Chat carries outcomes only, never routine acknowledgements. Related: [[chat-style]]
+MD
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed on a migration that left a fact to its canonical pointer: $out"
+  case "$out" in
+    *"FAIL  2 provenance completeness"*) fail "a file left to its canonical pointer was reported as missing provenance: $out" ;;
+  esac
+  case "$out" in
+    *"left to a canonical pointer"*) ;;
+    *) fail "provenance completeness did not account for the canonical drop: $out" ;;
+  esac
+  pass "fm-memory-migrate: a fact left to its canonical pointer does not fail verification"
+}
+
 test_verify_passes_a_clean_migration() {
   skip_without_library "the verification test" && return 0
   local home src data out
@@ -668,5 +694,6 @@ test_write_never_touches_a_source_file
 test_write_keeps_the_secret_out_of_the_store
 test_one_unavailable_lane_costs_only_its_own_memories
 test_verify_passes_a_clean_migration
+test_verify_accepts_a_memory_left_to_a_canonical_pointer
 test_verify_catches_a_memory_that_never_landed
 test_rollback_leaves_every_source_intact

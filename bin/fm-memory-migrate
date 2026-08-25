@@ -641,6 +641,7 @@ def build_entries(files: Sequence[SourceFile], home: Path) -> Dict[str, Any]:
             dropped.append({
                 "name": primary.parsed.name,
                 "paths": ", ".join(str(m.path) for m in members),
+                "source_paths": [str(m.path) for m in members],
                 "owner": owner,
             })
             continue
@@ -983,10 +984,13 @@ class BridgeSession:
             self.proc.stdin.write(json.dumps(request) + "\n")
             self.proc.stdin.flush()
             line = self.proc.stdout.readline()
-        except (BrokenPipeError, ValueError) as exc:
+        except (OSError, ValueError) as exc:
             raise MigrateError(f"lane {self.lane}: the bridge closed its pipe: {exc}") from exc
         if not line:
-            stderr = (self.proc.stderr.read() if self.proc.stderr else "").strip()
+            try:
+                stderr = (self.proc.stderr.read() if self.proc.stderr else "").strip()
+            except (OSError, ValueError):
+                stderr = ""
             raise MigrateError(f"lane {self.lane}: the bridge answered nothing. {stderr}")
         try:
             return json.loads(line)
@@ -1013,7 +1017,7 @@ class BridgeSession:
         """Tear the bridge down. Never raises: a dead bridge costs its lane."""
         try:
             self._call_raw("shutdown", {})
-        except (MigrateError, ValueError):
+        except (MigrateError, OSError, ValueError):
             pass
         finally:
             for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
@@ -1297,7 +1301,7 @@ def check(name: str, passed: bool, detail: str) -> Dict[str, Any]:
 
 
 def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path,
-           home: Path) -> Dict[str, Any]:
+           home: Path, dropped: Sequence[Dict[str, Any]] = ()) -> Dict[str, Any]:
     """The integrity checklist, read from the banks rather than from a report."""
     checks: List[Dict[str, Any]] = []
     lanes = sorted({entry.lane for entry in entries})
@@ -1340,8 +1344,12 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
     for row in live_rows:
         for path in row["metadata"].get("source_paths") or []:
             recorded.add(path)
-    routed_paths = {str(f.path) for f in files if f.lane}
-    accounted = {str(f.path) for f in files if not f.lane}
+    # A group whose text a canonical file already states is deliberately left
+    # to that file's pointer, so its files are accounted for by the drop that
+    # names their owner rather than missing from the store.
+    dropped_paths = {path for item in dropped for path in item.get("source_paths") or []}
+    unrouted_paths = {str(f.path) for f in files if not f.lane}
+    routed_paths = {str(f.path) for f in files if f.lane} - dropped_paths
     missing = sorted(routed_paths - recorded)
     checks.append(check(
         "2 provenance completeness",
@@ -1349,7 +1357,8 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
         f"{len(missing)} routed source files are in no memory's provenance: {', '.join(missing[:5])}"
         if missing else
         f"all {len(routed_paths)} routed source files appear in a memory's provenance "
-        f"({len(accounted)} unrouted, reported separately)"))
+        f"({len(unrouted_paths)} unrouted and {len(dropped_paths)} left to a canonical "
+        f"pointer, reported separately)"))
 
     # 3 no silent loss to the 24h trim
     unpinned = [row["id"] for row in all_rows if not row["consolidated_at"]]
@@ -1786,7 +1795,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         failed = bool(drift) or not hermes_ok or result["counts"]["refused"] or unrouted
         return 1 if failed else 0
 
-    result = verify(entries, files, data_dir, home)
+    result = verify(entries, files, data_dir, home, plan["dropped_for_pointer"])
     if args.json:
         print(json.dumps(result, indent=2))
         return 0 if all(c["pass"] for c in result["checks"]) else 1

@@ -211,17 +211,21 @@ PY
 # Write a memory into a lane bank through the real bridge, so the bank holds a
 # memory this migration never wrote - which is what every lane bank actually
 # looks like once phase 2's pointers live in it.
-remember_into_lane() {  # <data-dir> <lane> <content> [project-channel]
+remember_into_lane() {  # <data-dir> <lane> <content> [project-channel] [source] [metadata-json]
   fm_migrate_assert_scratch "$1"
-  python3 - "$MCP" "$1" "$2" "$3" "${4:-}" <<'RPC' >/dev/null
+  python3 - "$MCP" "$1" "$2" "$3" "${4:-}" "${5:-}" "${6:-}" <<'RPC' >/dev/null
 import json, subprocess, sys
-mcp, data_dir, lane, content, project = sys.argv[1:6]
+mcp, data_dir, lane, content, project, source, metadata = sys.argv[1:8]
 proc = subprocess.Popen([sys.executable, mcp, "serve", "--lane", lane, "--data-dir", data_dir],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                         text=True)
 arguments = {"content": content, "memory_type": "context", "importance": 0.5}
 if project:
     arguments["project"] = project
+if source:
+    arguments["source"] = source
+if metadata:
+    arguments["metadata"] = json.loads(metadata)
 requests = [
     {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
     {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
@@ -256,6 +260,49 @@ make_hermes_bank() {  # <data-dir> <lane-to-copy>
   fm_migrate_assert_scratch "$1"
   mkdir -p "$1/banks/default"
   cp "$1/banks/lane-$2/mnemosyne.db" "$1/banks/default/mnemosyne.db"
+}
+
+# The source paths one lane's migrated memory records as its provenance.
+migrated_source_paths() {  # <data-dir> <lane>
+  fm_migrate_assert_scratch "$1"
+  python3 - "$1/banks/lane-$2/mnemosyne.db" <<'PY'
+import json, sqlite3, sys
+row = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True).execute(
+    "SELECT metadata_json FROM working_memory WHERE source LIKE 'claude-automemory%'"
+    " AND superseded_by IS NULL ORDER BY id LIMIT 1").fetchone()
+print(json.dumps(json.loads(row[0])["source_paths"]))
+PY
+}
+
+# Put a memory carrying this migration's provenance into the Hermes bank's
+# episodic table, where a consolidated row lives.
+plant_episodic_hermes_row() {  # <data-dir>
+  fm_migrate_assert_scratch "$1"
+  python3 - "$1/banks/default/mnemosyne.db" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute(
+    "INSERT INTO episodic_memory (id, content, source, scope, channel_id)"
+    " VALUES ('planted-episodic-row', 'A migrated memory the store consolidated.',"
+    " 'claude-automemory', 'global', '_lane')")
+conn.commit()
+conn.close()
+PY
+}
+
+# Drop one migrated memory's embedding, the way a genuinely unindexed memory
+# of ours would look.
+drop_one_embedding() {  # <data-dir> <lane>
+  fm_migrate_assert_scratch "$1"
+  python3 - "$1/banks/lane-$2/mnemosyne.db" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+row = conn.execute(
+    "SELECT id FROM working_memory WHERE source LIKE 'claude-automemory%' ORDER BY id LIMIT 1").fetchone()
+conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (row[0],))
+conn.commit()
+conn.close()
+PY
 }
 
 # How many memories in the Hermes bank carry this migration's own source.
@@ -850,6 +897,94 @@ test_verify_parity_covers_only_the_memories_this_migration_wrote() {
   pass "fm-memory-migrate: index parity is judged over this migration's own memories"
 }
 
+test_verify_reads_a_renamed_source_file_as_one_memory() {
+  skip_without_library "the renamed-source test" && return 0
+  local home src data out
+  home=$(make_home rename-home)
+  src=$(make_sources rename-src)
+  data=$(make_lanes rename-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # The ledger keys a memory by its file name, so renaming the file writes a
+  # second key for the same unchanged memory. That is one memory under a new
+  # name, not a source file that disappeared.
+  mv "$src/-Users-x-Coding-flags/memory/project_release.md" \
+     "$src/-Users-x-Coding-flags/memory/release_lane.md"
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed after a source file was renamed: $out"
+  case "$out" in
+    *"FAIL  1 count reconciliation"*) fail "a renamed source file was double-counted as an orphan: $out" ;;
+  esac
+  case "$out" in
+    *"kept whose source file is gone"*) fail "a renamed source file was reported as a lost source: $out" ;;
+  esac
+  case "$out" in
+    *ORPHANED*) fail "a renamed source file was reported as an orphaned ledger key: $out" ;;
+  esac
+  pass "fm-memory-migrate: a renamed source file reconciles as one memory, not an orphan"
+}
+
+test_verify_catches_a_migration_written_row_in_the_wrong_lane() {
+  skip_without_library "the misrouted-write test" && return 0
+  local home src data leaked paths out
+  home=$(make_home misroute-home)
+  src=$(make_sources misroute-src)
+  data=$(make_lanes misroute-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # A memory this migration wrote into the wrong lane's bank: it carries the
+  # migration's own source and fleet-infra's provenance, but it sits in
+  # products. This is the exact failure the lane model exists to prevent.
+  leaked=$(migrated_content "$data" fleet-infra)
+  paths=$(migrated_source_paths "$data" fleet-infra)
+  remember_into_lane "$data" products "$leaked" firstmate claude-automemory \
+    "{\"source_paths\": $paths, \"migration\": \"claude-automemory-phase3\"}" \
+    || fail "could not seed a misrouted migration row through the bridge"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    && fail "verification passed while a migrated memory sat in the wrong lane: $out"
+  case "$out" in
+    *"FAIL  9 lane containment"*) ;;
+    *) fail "lane containment did not catch a memory this migration wrote to the wrong lane: $out" ;;
+  esac
+  pass "fm-memory-migrate: a migration-written row in the wrong lane fails lane containment"
+}
+
+test_verify_catches_a_consolidated_memory_in_the_hermes_bank() {
+  skip_without_library "the episodic-intrusion test" && return 0
+  local home src data out
+  home=$(make_home episodic-home)
+  src=$(make_sources episodic-src)
+  data=$(make_lanes episodic-data products fleet-infra shared)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  make_hermes_bank "$data" shared
+  # A memory of ours the store consolidated out of working_memory still lives
+  # in the episodic table, and it is just as much a stray write.
+  plant_episodic_hermes_row "$data"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    && fail "verification passed while a consolidated memory of ours sat in the Hermes bank: $out"
+  case "$out" in
+    *"FAIL  13"*) ;;
+    *) fail "check 13 did not read the episodic table of the Hermes bank: $out" ;;
+  esac
+  pass "fm-memory-migrate: a consolidated memory of ours in the Hermes bank fails verification"
+}
+
+test_verify_still_fails_when_our_own_memory_is_unindexed() {
+  skip_without_library "the parity-can-fail test" && return 0
+  local home src data out
+  home=$(make_home unindexed-home)
+  src=$(make_sources unindexed-src)
+  data=$(make_lanes unindexed-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  drop_one_embedding "$data" products
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    && fail "verification passed while one of our own memories had no embedding: $out"
+  case "$out" in
+    *"FAIL  5 embedding parity"*) ;;
+    *) fail "embedding parity did not catch a migrated memory with no embedding: $out" ;;
+  esac
+  pass "fm-memory-migrate: a migrated memory with no embedding still fails parity"
+}
+
 test_verify_passes_a_clean_migration() {
   skip_without_library "the verification test" && return 0
   local home src data out
@@ -984,5 +1119,9 @@ test_verify_accepts_a_cross_lane_duplicate
 test_verify_passes_after_a_re_migration_supersedes
 test_verify_treats_nothing_to_spot_check_as_a_pass
 test_verify_parity_covers_only_the_memories_this_migration_wrote
+test_verify_still_fails_when_our_own_memory_is_unindexed
+test_verify_reads_a_renamed_source_file_as_one_memory
+test_verify_catches_a_migration_written_row_in_the_wrong_lane
+test_verify_catches_a_consolidated_memory_in_the_hermes_bank
 test_verify_catches_a_memory_that_never_landed
 test_rollback_leaves_every_source_intact

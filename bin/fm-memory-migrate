@@ -95,6 +95,14 @@ WHAT THIS DELIBERATELY DOES NOT DO
   and retiring them stays a deliberate act. Both `write` and `verify` report
   them, and the count reconciliation reads the store's live rows as this run's
   memories PLUS those kept orphans rather than calling them a mismatch.
+  A ledger record and a source file are the same memory when their paths
+  intersect OR their text is identical: an edit keeps the paths, a rename
+  keeps the text. A file that is renamed AND edited between two runs matches
+  on neither, and nothing on disk distinguishes that from the file having been
+  deleted and a different one created. This tool does not guess: it treats it
+  as exactly that, so the old memory is kept and reported as an orphan and the
+  new file becomes a new memory. That is an accepted bound of mirror mode, not
+  an oversight - merging them would mean retiring a memory on a guess.
   It writes no graph_edges for `[[wikilinks]]`: every write goes through the
   bridge, the bridge exposes no edge tool, and reaching around it into sqlite
   is exactly the direct-store access this whole design refuses. Link targets
@@ -1117,26 +1125,41 @@ class BridgeSession:
                 pass
 
 
-def ledger_record_for(ledger: Dict[str, Any], entry: Entry) -> Tuple[Optional[str], Dict[str, Any]]:
-    """(key, record) for the row this entry's own source files landed in.
+def same_memory(record: Any, entry: Entry) -> bool:
+    """Whether a ledger record and a derived entry are the same memory.
 
-    Identity is the provenance the record carries, not the key it happens to
-    sit under. A record whose source files are not this entry's belongs to
-    another memory, and superseding it would retire a live memory that this
-    run never derived - which is exactly what the never-retire rule forbids.
+    A source file moves along two axes and identity has to survive both. An
+    edit keeps the file's paths and changes its text; a rename keeps its text
+    and changes its paths. Either match is the same memory, and the union is
+    what makes this stable: matching on paths alone calls a rename a new
+    memory, matching on text alone calls an edit one.
+    A file renamed AND edited in one interval matches on neither, and is
+    genuinely indistinguishable from that file being deleted and another
+    created. It is treated as exactly that, which under the never-retire rule
+    means the old record is reported as a kept orphan and the new file becomes
+    a new memory. That bound is stated in the header, not guessed at here.
+    """
+    record = record or {}
+    if set(entry.metadata.get("source_paths") or []) & set(record.get("source_paths") or []):
+        return True
+    return bool(record.get("content_sha")) and record["content_sha"] == entry.content_sha
+
+
+def ledger_record_for(ledger: Dict[str, Any], entry: Entry) -> Tuple[Optional[str], Dict[str, Any]]:
+    """(key, record) for the row this entry's memory landed in.
+
+    Identity is what the record carries, not the key it happens to sit under,
+    and every caller asks this one question here. A record that is not this
+    memory belongs to another one, and superseding it would retire a live
+    memory this run never derived - exactly what the never-retire rule forbids.
     A record found under a different key is this memory re-keyed: its file was
     renamed, or the digest in its key moved because its text changed.
     """
-    paths = set(entry.metadata.get("source_paths") or [])
-
-    def carries(record: Any) -> bool:
-        return bool(paths & set((record or {}).get("source_paths") or []))
-
     record = ledger.get(entry.key)
-    if record is not None:
-        return (entry.key, dict(record)) if carries(record) else (None, {})
+    if record is not None and same_memory(record, entry):
+        return (entry.key, dict(record))
     for key in sorted(ledger):
-        if carries(ledger[key]):
+        if key != entry.key and same_memory(ledger[key], entry):
             return (key, dict(ledger[key]))
     return (None, {})
 
@@ -1548,7 +1571,8 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
     live_ids = {lane: {row["id"] for row in rows} for lane, rows in live_by_lane.items()}
     renamed = set()
     for entry in entries:
-        memory_id = (ledgers.get(entry.lane, {}).get(entry.key) or {}).get("memory_id")
+        _, record = ledger_record_for(ledgers.get(entry.lane) or {}, entry)
+        memory_id = record.get("memory_id")
         if memory_id and memory_id in live_ids.get(entry.lane, set()):
             renamed.update(path for path in entry.metadata["source_paths"] if path not in recorded)
     routed_paths = {str(f.path) for f in files if f.lane} - dropped_paths - renamed
@@ -1652,17 +1676,31 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
     # rows in the old bank, because this tool never retires them, so one source
     # file legitimately has a live memory in two banks. Two live rows for it in
     # ONE bank is the duplicate this check is looking for.
+    # A row's own metadata records the paths it was written from and is never
+    # rewritten afterwards, so a renamed file leaves a stale path on a live row
+    # while the ledger tracks where that memory is sourced now. The ledger is
+    # therefore what a path is read from; a row the ledger does not know falls
+    # back to its own metadata, which is what a stray duplicate looks like.
+    current_paths: Dict[str, Dict[str, Set[str]]] = {}
+    for lane in lanes:
+        for record in (ledgers.get(lane) or {}).values():
+            memory_id = (record or {}).get("memory_id")
+            if memory_id:
+                current_paths.setdefault(lane, {}).setdefault(memory_id, set()).update(
+                    record.get("source_paths") or [])
     duplicated = []
     seen: Dict[Tuple[str, str], str] = {}
     for lane, rows in sorted(live_by_lane.items()):
         for row in rows:
-            path = row["metadata"].get("source_path") or ""
-            if not path:
-                continue
-            if (lane, path) in seen:
-                duplicated.append(f"{lane}: {path} is claimed by {seen[(lane, path)]} and {row['id']}")
-            else:
-                seen[(lane, path)] = row["id"]
+            paths = current_paths.get(lane, {}).get(row["id"])
+            if paths is None:
+                paths = {p for p in [row["metadata"].get("source_path")] if p}
+            for path in sorted(paths):
+                if (lane, path) in seen:
+                    duplicated.append(
+                        f"{lane}: {path} is claimed by {seen[(lane, path)]} and {row['id']}")
+                else:
+                    seen[(lane, path)] = row["id"]
     checks.append(check(
         "11 no duplicate live rows per source",
         not duplicated,

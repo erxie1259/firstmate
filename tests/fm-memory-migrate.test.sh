@@ -1193,6 +1193,122 @@ MD
   pass "fm-memory-migrate: an edited source is an update, only a vanished one is an orphan"
 }
 
+test_a_renamed_source_needs_no_second_migration_to_verify() {
+  skip_without_library "the rename-then-verify test" && return 0
+  local home src data out
+  home=$(make_home renameverify-home)
+  src=$(make_sources renameverify-src)
+  data=$(make_lanes renameverify-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # The file is renamed but not migrated again. Its text is unchanged, so the
+  # store holds that memory already; only the name it is filed under moved.
+  mv "$src/-Users-x-Coding-flags/memory/project_release.md" \
+     "$src/-Users-x-Coding-flags/memory/release_lane.md"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed after a rename that was not migrated again: $out"
+  case "$out" in
+    *ORPHANED*) fail "a renamed source file was reported as an orphaned ledger key: $out" ;;
+  esac
+  case "$out" in
+    *"FAIL  2 provenance completeness"*) fail "a renamed source file was reported as missing provenance: $out" ;;
+  esac
+  pass "fm-memory-migrate: a rename verifies cleanly without a second migration"
+}
+
+test_a_file_created_at_a_renamed_path_never_retires_the_renamed_memory() {
+  skip_without_library "the renamed-path reuse test" && return 0
+  local home src data out live
+  home=$(make_home reuse-home)
+  src=$(make_sources reuse-src)
+  data=$(make_lanes reuse-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  mv "$src/-Users-x-Coding-flags/memory/project_release.md" \
+     "$src/-Users-x-Coding-flags/memory/release_lane.md"
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  live=$(live_migrated_rows "$data" products)
+  # A different memory later takes the name the renamed file used to have. It
+  # is its own memory and must not be written over the renamed one.
+  cat > "$src/-Users-x-Coding-flags/memory/project_release.md" <<'MD'
+---
+name: Release checklist
+description: what to confirm before a release
+type: reference
+---
+Confirm the changelog, the version bump, and the signing certificate expiry.
+MD
+  out=$(fm_migrate "$home" "$src" "$data" write --json) || true
+  [ "$(json_field "$out" "d['counts']['updated']")" = "0" ] \
+    || fail "a new file at a renamed path superseded the renamed memory: $out"
+  [ "$(json_field "$out" "d['counts']['written']")" = "1" ] \
+    || fail "a new file at a renamed path did not become its own memory: $out"
+  [ "$(live_migrated_rows "$data" products)" = "$((live + 1))" ] \
+    || fail "the renamed memory did not survive a new file taking its old path"
+  [ "$(bank_text_contains "$data" products 'fastlane beta from a clean checkout')" != "0" ] \
+    || fail "the renamed memory was retired when its old path was reused"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed after a renamed path was reused: $out"
+  pass "fm-memory-migrate: reusing a renamed file's path never retires the renamed memory"
+}
+
+test_a_renamed_and_edited_source_is_a_delete_plus_create() {
+  skip_without_library "the rename-plus-edit bound test" && return 0
+  local home src data out orphans
+  home=$(make_home bound-home)
+  src=$(make_sources bound-src)
+  data=$(make_lanes bound-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # Renamed and edited between two runs: nothing on disk says whether this is
+  # the same memory moved or a different file. The tool does not guess.
+  rm "$src/-Users-x-Coding-flags/memory/project_release.md"
+  cat > "$src/-Users-x-Coding-flags/memory/release_lane.md" <<'MD'
+---
+name: Flags release lane
+description: how the flags app reaches TestFlight
+type: project
+---
+The release lane runs fastlane beta from a dedicated worktree on a tagged commit.
+MD
+  out=$(fm_migrate "$home" "$src" "$data" write --json) || true
+  [ "$(json_field "$out" "d['counts']['updated']")" = "0" ] \
+    || fail "a renamed-and-edited source superseded a memory on a guess: $out"
+  [ "$(json_field "$out" "d['counts']['written']")" = "1" ] \
+    || fail "a renamed-and-edited source did not become a new memory: $out"
+  [ "$(json_field "$out" "len(d['orphaned_ledger_keys'])")" = "1" ] \
+    || fail "the memory whose file no longer exists was not reported as an orphan: $out"
+  [ "$(bank_text_contains "$data" products 'fastlane beta from a clean checkout')" != "0" ] \
+    || fail "the old memory was retired rather than kept as an orphan"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed on the rename-plus-edit bound: $out"
+  orphans=$(printf '%s\n' "$out" | grep -c ORPHANED)
+  [ "$orphans" = "1" ] || fail "expected exactly one kept orphan, got $orphans: $out"
+  pass "fm-memory-migrate: a renamed and edited source is a delete plus a create, and keeps both"
+}
+
+test_another_directory_of_one_project_stays_one_memory() {
+  skip_without_library "the canonicalisation-identity test" && return 0
+  local home src data out live
+  home=$(make_home thirdcopy-home)
+  src=$(make_sources thirdcopy-src)
+  data=$(make_lanes thirdcopy-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  live=$(live_migrated_rows "$data" products)
+  # A third checkout of the same project appears, holding the same fact. That
+  # is one memory carrying a third source path, never a second memory.
+  mkdir -p "$src/-Users-x-other-Coding-flags/memory"
+  cp "$src/-Users-x-Coding-flags/memory/shared_fact.md" \
+     "$src/-Users-x-other-Coding-flags/memory/shared_fact.md"
+  out=$(fm_migrate "$home" "$src" "$data" write --json) || true
+  [ "$(json_field "$out" "d['counts']['written']")" = "0" ] \
+    || fail "a third copy of one fact was written as a second memory: $out"
+  [ "$(json_field "$out" "d['counts']['updated']")" = "0" ] \
+    || fail "a third copy of one fact superseded the memory it belongs to: $out"
+  [ "$(live_migrated_rows "$data" products)" = "$live" ] \
+    || fail "a third copy of one fact changed the number of live memories"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed after a third checkout of one project appeared: $out"
+  pass "fm-memory-migrate: another directory of one project stays one memory"
+}
+
 test_verify_passes_a_clean_migration() {
   skip_without_library "the verification test" && return 0
   local home src data out
@@ -1336,5 +1452,9 @@ test_verify_accepts_a_project_that_changed_lane
 test_verify_catches_a_misrouted_row_whose_source_file_is_gone
 test_every_check_still_fails_on_the_defect_it_exists_to_catch
 test_an_edited_source_is_never_reported_as_an_orphan
+test_a_renamed_source_needs_no_second_migration_to_verify
+test_a_file_created_at_a_renamed_path_never_retires_the_renamed_memory
+test_a_renamed_and_edited_source_is_a_delete_plus_create
+test_another_directory_of_one_project_stays_one_memory
 test_verify_catches_a_memory_that_never_landed
 test_rollback_leaves_every_source_intact

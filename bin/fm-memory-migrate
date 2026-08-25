@@ -166,6 +166,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
@@ -1528,6 +1529,38 @@ def orphaned_ledger_keys(entries: Sequence[Entry], lanes: Sequence[str],
     return out
 
 
+def stored_form(text: str) -> str:
+    """The text the store would hold for this content.
+
+    The library rewrites a data: URI, anything over 1 MB, and high-entropy
+    content over 100 KB into a content-addressed stub before it writes, so a
+    row can legitimately hold something other than what it was handed. This is
+    the same sanitizer the bridge keys its own dedupe on, imported rather than
+    restated so the two can never drift apart.
+    Extraction writes the bytes it lifts out to a blob directory. `verify`
+    only reads, so that write is pointed at a directory thrown away here: the
+    stub is derived from the content's own digest and reads the same either
+    way.
+    """
+    try:
+        from mnemosyne.core.content_sanitizer import sanitize_content  # noqa: PLC0415
+    except ImportError:
+        return text
+    previous = os.environ.get("MNEMOSYNE_BLOB_DIR")
+    with tempfile.TemporaryDirectory(prefix="fm-memory-migrate-verify-") as scratch:
+        os.environ["MNEMOSYNE_BLOB_DIR"] = scratch
+        try:
+            sanitized, _blob = sanitize_content(text)
+        except Exception:  # noqa: BLE001 - a sanitizer that cannot run proves nothing
+            sanitized = text
+        finally:
+            if previous is None:
+                os.environ.pop("MNEMOSYNE_BLOB_DIR", None)
+            else:
+                os.environ["MNEMOSYNE_BLOB_DIR"] = previous
+    return sanitized
+
+
 def check(name: str, passed: bool, detail: str) -> Dict[str, Any]:
     return {"check": name, "pass": passed, "detail": detail}
 
@@ -1810,26 +1843,37 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
     # Landed means the bank holds THIS text. A row that merely carries the id
     # the ledger recorded proves only that something once landed for this
     # memory, which is exactly what a refused update leaves behind, so the
-    # answer is read from content and never from identity. Form is compared
-    # loosely, so a store that re-spaces what it was given still counts.
+    # answer is read from content and never from identity - but the text
+    # compared is the form the store would actually hold, because the library
+    # rewrites oversized and encoded content before it writes.
+    # What separates the three ways a memory can be absent is the ledger's own
+    # digest: it recorded this exact text and the store lacks it (the tool
+    # believed a write landed that did not), it recorded different text (the
+    # source has moved on since the last migration), or it recorded nothing
+    # at all (this memory has never been written).
     unwritten = []
     for entry in entries:
         rows = live_by_lane.get(entry.lane) or []
         record = ledger_record_for(ledgers.get(entry.lane) or {}, entry)[1]
-        wanted = normalize(entry.content)
-        landed = [row for row in rows if normalize(row["content"]) == wanted]
         name = entry.metadata.get("source_name") or entry.key
+        landed = [row for row in rows if normalize(row["content"]) == normalize(entry.content)]
+        if not landed:
+            held = normalize(stored_form(entry.content))
+            landed = [row for row in rows if normalize(row["content"]) == held]
         if landed:
             if not any(row["channel_id"] == entry.channel_id for row in landed):
                 unwritten.append(
                     f"{entry.lane}: {name} is held under channel {landed[0]['channel_id']!r} "
                     f"but this run derives it for {entry.channel_id!r}")
             continue
-        memory_id = record.get("memory_id")
-        if memory_id and any(row["id"] == memory_id for row in rows):
+        if record.get("content_sha") == entry.content_sha:
             unwritten.append(
-                f"{entry.lane}: {name} is in the store holding different text "
-                f"than this run derives")
+                f"{entry.lane}: {name} is recorded in the ledger as written, "
+                f"but the store does not hold it")
+        elif record:
+            unwritten.append(
+                f"{entry.lane}: {name} has changed since the last migration wrote it "
+                f"and the change has not landed; re-run write")
         else:
             unwritten.append(f"{entry.lane}: {name} is in no live memory of that lane")
     checks.append(check(

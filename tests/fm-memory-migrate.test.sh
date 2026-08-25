@@ -156,7 +156,11 @@ fm_migrate() {  # <home> <source> <data-dir> <args>...
   fm_migrate_assert_scratch "$home"
   fm_migrate_assert_scratch "$src"
   fm_migrate_assert_scratch "$data_dir"
-  "$MIGRATE" "$@" --home "$home" --source "$src" --data-dir "$data_dir" 2>&1
+  # Content the store rewrites to a blob is written to MNEMOSYNE_BLOB_DIR, so
+  # it is pinned inside this test's temp root and never the operator's own.
+  mkdir -p "$TMP_ROOT/blobs"
+  MNEMOSYNE_BLOB_DIR="$TMP_ROOT/blobs" \
+    "$MIGRATE" "$@" --home "$home" --source "$src" --data-dir "$data_dir" 2>&1
 }
 
 json_field() {  # <json> <python-expression over `d`>
@@ -1185,8 +1189,8 @@ MD
     *) fail "an edited source file broke the count reconciliation: $out" ;;
   esac
   case "$out" in
-    *"FAIL  15"*"holding different text than this run derives"*) ;;
-    *) fail "check 15 did not report that the store holds the pre-edit text: $out" ;;
+    *"FAIL  15"*"has changed since the last migration wrote it"*) ;;
+    *) fail "check 15 did not report that the source has drifted from the store: $out" ;;
   esac
   # A file that genuinely goes away must still be reported, and must not be
   # confused with the edited one that is still there.
@@ -1241,7 +1245,7 @@ MD
   [ "$(json_field "$out" "next(c['pass'] for c in d['checks'] if c['check'].startswith('15 '))")" \
     = "False" ] || fail "check 15 read a refused update as a clean migration: $out"
   case "$(json_field "$out" "next(c['detail'] for c in d['checks'] if c['check'].startswith('15 '))")" in
-    *"Flags release lane"*"holding different text than this run derives"*) ;;
+    *"Flags release lane"*"has changed since the last migration wrote it"*) ;;
     *) fail "check 15 did not name the memory whose text the store failed to update: $out" ;;
   esac
   pass "fm-memory-migrate: an update the store refused fails verification"
@@ -1458,6 +1462,55 @@ MD
   pass "fm-memory-migrate: two successive edits verify as history kept"
 }
 
+test_verify_accepts_content_the_store_rewrites_to_a_blob() {
+  skip_without_library "the sanitized-content test" && return 0
+  local home src data out
+  home=$(make_home blob-home)
+  src=$(make_sources blob-src)
+  data=$(make_lanes blob-data products fleet-infra)
+  # The store rewrites content past its size cap into a content-addressed
+  # stub before it writes, so the row legitimately holds something other than
+  # the file's own text. That is a migration that landed, not one that failed.
+  {
+    printf '%s\n' '---' 'name: Captured build log' 'description: the full log of a failing build' 'type: reference' '---'
+    python3 -c "print('The build log line that repeats and repeats. ' * 30000)"
+  } > "$src/-Users-x-Coding-flags/memory/build_log.md"
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed over content the store rewrote to a blob: $out"
+  case "$out" in
+    *"FAIL  15"*) fail "a memory the store rewrote to a blob was read as never landed: $out" ;;
+  esac
+  pass "fm-memory-migrate: content the store rewrites to a blob still counts as landed"
+}
+
+test_verify_catches_a_memory_the_ledger_claims_but_the_store_lost() {
+  skip_without_library "the lost-write test" && return 0
+  local home src data out
+  home=$(make_home lostwrite-home)
+  src=$(make_sources lostwrite-src)
+  data=$(make_lanes lostwrite-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # The ledger records this exact text as written. A store that no longer
+  # holds it has lost a memory, and that is not drift the captain can fix by
+  # re-running write.
+  python3 - "$data/banks/lane-products/mnemosyne.db" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("DELETE FROM working_memory WHERE content LIKE '%fastlane beta from a clean checkout%'")
+conn.commit()
+conn.close()
+PY
+  out=$(fm_migrate "$home" "$src" "$data" verify --json) || true
+  [ "$(json_field "$out" "next(c['pass'] for c in d['checks'] if c['check'].startswith('15 '))")" \
+    = "False" ] || fail "check 15 passed over a memory the store lost: $out"
+  case "$(json_field "$out" "next(c['detail'] for c in d['checks'] if c['check'].startswith('15 '))")" in
+    *"Flags release lane"*"recorded in the ledger as written, but the store does not hold it"*) ;;
+    *) fail "check 15 did not report the lost memory in its own words: $out" ;;
+  esac
+  pass "fm-memory-migrate: a memory the ledger claims but the store lost fails verification"
+}
+
 test_verify_passes_a_clean_migration() {
   skip_without_library "the verification test" && return 0
   local home src data out
@@ -1602,6 +1655,8 @@ test_verify_catches_a_misrouted_row_whose_source_file_is_gone
 test_every_check_still_fails_on_the_defect_it_exists_to_catch
 test_an_edited_source_is_never_reported_as_an_orphan
 test_verify_catches_an_update_the_store_refused
+test_verify_accepts_content_the_store_rewrites_to_a_blob
+test_verify_catches_a_memory_the_ledger_claims_but_the_store_lost
 test_a_renamed_source_needs_no_second_migration_to_verify
 test_a_file_created_at_a_renamed_path_never_retires_the_renamed_memory
 test_a_renamed_and_edited_source_is_a_delete_plus_create

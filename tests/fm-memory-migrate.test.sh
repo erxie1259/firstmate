@@ -1217,6 +1217,9 @@ MD
   case "$out" in
     *"NEVER BEEN MIGRATED"*) fail "a source that merely drifted was reported as never migrated: $out" ;;
   esac
+  case "$out" in
+    *"has NO BANK"*) fail "a source that merely drifted was reported as an unprovisioned lane: $out" ;;
+  esac
   # A file that genuinely goes away must still be reported, and must not be
   # confused with the edited one that is still there.
   rm "$src/-Users-x-Coding-flags/memory/signing_notes.md"
@@ -1285,6 +1288,9 @@ MD
   esac
   case "$detail" in
     *"has changed since the last migration"*) fail "a store refusal was reported as a drifted source: $detail" ;;
+  esac
+  case "$detail" in
+    *"has NO BANK"*) fail "a store refusal was reported as an unprovisioned lane: $detail" ;;
   esac
   pass "fm-memory-migrate: an update the store refused fails verification"
 }
@@ -1442,37 +1448,146 @@ test_a_channel_move_is_refused_and_check_15_names_it() {
   pass "fm-memory-migrate: a channel move is refused and check 15 names the memory and both channels"
 }
 
-test_verify_catches_a_memory_the_bridge_never_reached() {
-  skip_without_library "the transport-failure test" && return 0
+test_verify_catches_a_lane_that_has_no_bank_to_land_in() {
+  skip_without_library "the unprovisioned-lane test" && return 0
   local home src data out
-  home=$(make_home transport-home)
-  src=$(make_sources transport-src)
-  # fleet-infra is deliberately never provisioned, so its bridge will not
-  # start and this run never gets to ask the store anything for that lane.
-  data=$(make_lanes transport-data products)
+  home=$(make_home nobank-home)
+  src=$(make_sources nobank-src)
+  # fleet-infra is deliberately never provisioned, so it has no bank at all
+  # and no number of re-runs will give it one.
+  data=$(make_lanes nobank-data products)
   fm_migrate "$home" "$src" "$data" write >/dev/null || true
   out=$(fm_migrate "$home" "$src" "$data" verify) \
     && fail "verification passed while a memory was missing from the store: $out"
   case "$out" in
     *"FAIL  15 every derived memory landed in the store"*) ;;
+    *) fail "a memory with no bank to land in did not fail its own check: $out" ;;
+  esac
+  case "$out" in
+    *"has NO BANK to land in"*"fm-memory-mcp provision --lane fleet-infra"*) ;;
+    *) fail "check 15 did not name the command that puts the lane in place: $out" ;;
+  esac
+  case "$out" in
+    *"REFUSED by the store"*) fail "an unprovisioned lane was reported as a store refusal: $out" ;;
+  esac
+  case "$out" in
+    *"NEVER REACHED the store"*) fail "an unprovisioned lane was reported as a transient bridge failure: $out" ;;
+  esac
+  case "$out" in
+    *"NEVER BEEN MIGRATED"*) fail "an unprovisioned lane was reported as never migrated: $out" ;;
+  esac
+  case "$out" in
+    *STALE*) fail "an unprovisioned lane was reported as a source that merely drifted: $out" ;;
+  esac
+  pass "fm-memory-migrate: a lane with no bank is told which command puts one there"
+}
+
+test_verify_catches_a_bridge_that_failed_against_a_bank_in_place() {
+  skip_without_library "the transient-bridge test" && return 0
+  local home src data bank out
+  home=$(make_home transient-home)
+  src=$(make_sources transient-src)
+  data=$(make_lanes transient-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  cat > "$src/-Users-x-Coding-flags/memory/project_release.md" <<'MD'
+---
+name: Flags release lane
+description: how the flags app reaches TestFlight
+type: project
+---
+The release lane now runs fastlane beta from a dedicated worktree.
+MD
+  # The bank is right there; only this run cannot open it. That is the failure
+  # a re-run genuinely clears, and the fixture proves it by clearing it.
+  bank="$data/banks/lane-products/mnemosyne.db"
+  chmod 000 "$bank"
+  if [ -r "$bank" ]; then
+    chmod 644 "$bank"
+    echo "note: this user can read a mode-000 file; skipping the transient-bridge test" >&2
+    pass "fm-memory-migrate: cannot make a readable bank unreadable, skipping the transient-bridge test"
+    return 0
+  fi
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  chmod 644 "$bank"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    && fail "verification passed while a memory never reached the store: $out"
+  case "$out" in
+    *"FAIL  15 every derived memory landed in the store"*) ;;
     *) fail "a write that never reached the store did not fail its own check: $out" ;;
   esac
-  # A bridge that would not start is the one failure a re-run does clear, so
-  # the advice must say that rather than sending a person to intervene.
   case "$out" in
-    *"NEVER REACHED the store (lane_unavailable)"*"re-running write clears it"*) ;;
-    *) fail "check 15 did not report the failure as a transport failure a re-run clears: $out" ;;
+    *"NEVER REACHED the store (lane_unavailable)"*"bank was in place, so re-running write clears it"*) ;;
+    *) fail "check 15 did not report the failure as one a re-run clears: $out" ;;
   esac
   case "$out" in
-    *"REFUSED by the store"*) fail "a transport failure was reported as a store refusal: $out" ;;
+    *"REFUSED by the store"*) fail "a transient bridge failure was reported as a store refusal: $out" ;;
   esac
   case "$out" in
-    *"NEVER BEEN MIGRATED"*) fail "a transport failure was reported as never migrated: $out" ;;
+    *"has NO BANK"*) fail "a transient bridge failure was reported as an unprovisioned lane: $out" ;;
   esac
   case "$out" in
-    *STALE*) fail "a transport failure was reported as a source that merely drifted: $out" ;;
+    *"NEVER BEEN MIGRATED"*) fail "a transient bridge failure was reported as never migrated: $out" ;;
   esac
-  pass "fm-memory-migrate: a memory the bridge never reached fails verification with re-run advice"
+  case "$out" in
+    *STALE*) fail "a transient bridge failure was reported as a source that merely drifted: $out" ;;
+  esac
+  # The advice must be true: running write again resolves it.
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "re-running write did not clear the failure its own advice promised it would: $out"
+  pass "fm-memory-migrate: a bridge that failed against a bank in place is told to re-run"
+}
+
+test_a_recorded_refusal_survives_a_run_that_derives_nothing_for_its_lane() {
+  skip_without_library "the refusal-durability test" && return 0
+  local home src data out detail
+  home=$(make_home durable-home)
+  src=$(make_sources durable-src)
+  data=$(make_lanes durable-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  cat > "$src/-Users-x-Coding-flags/memory/project_release.md" <<'MD'
+---
+name: Flags release lane
+description: how the flags app reaches TestFlight
+type: project
+---
+The release lane now runs fastlane beta from a dedicated worktree.
+MD
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # Reverting asks the store for text it has already retired, which it refuses
+  # permanently. That refusal is now the only thing separating a memory the
+  # store will never hold from a source that has merely moved on.
+  cat > "$src/-Users-x-Coding-flags/memory/project_release.md" <<'MD'
+---
+name: Flags release lane
+description: how the flags app reaches TestFlight
+type: project
+---
+The release lane runs fastlane beta from a clean checkout of origin/main.
+MD
+  out=$(fm_migrate "$home" "$src" "$data" write --json) || true
+  [ "$(json_field "$out" "d['counts']['refused']")" = "1" ] \
+    || fail "the reverted source was not refused, so this no longer exercises a refusal: $out"
+  # A run in which the products sources are simply not there - an unmounted
+  # directory - must not be read as products having nothing left to refuse.
+  mkdir -p "$TMP_ROOT/durable-away"
+  mv "$src/-Users-x-Coding-flags" "$TMP_ROOT/durable-away/a"
+  mv "$src/-Users-x-live-Coding-flags" "$TMP_ROOT/durable-away/b"
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  mv "$TMP_ROOT/durable-away/a" "$src/-Users-x-Coding-flags"
+  mv "$TMP_ROOT/durable-away/b" "$src/-Users-x-live-Coding-flags"
+  out=$(fm_migrate "$home" "$src" "$data" verify --json) || true
+  [ "$(json_field "$out" "next(c['pass'] for c in d['checks'] if c['check'].startswith('15 '))")" \
+    = "False" ] || fail "a refusal recorded before an unrelated run was forgotten: $out"
+  detail=$(json_field "$out" "next(c['detail'] for c in d['checks'] if c['check'].startswith('15 '))")
+  case "$detail" in
+    *"Flags release lane was REFUSED by the store"*"needs a person"*) ;;
+    *) fail "the surviving refusal is not reported as the store refusal it is: $detail" ;;
+  esac
+  case "$detail" in
+    *"has changed since the last migration"*) fail "the refusal decayed into a drifted-source notice: $detail" ;;
+  esac
+  pass "fm-memory-migrate: a recorded refusal outlives a run that derived nothing for its lane"
 }
 
 test_an_unprovisioned_lane_is_not_minted_by_its_own_failure() {
@@ -1739,6 +1854,9 @@ MD
   case "$out" in
     *"has changed since the last migration"*) fail "a memory never written was reported as a drifted source: $out" ;;
   esac
+  case "$out" in
+    *"has NO BANK"*) fail "a memory never written was reported as an unprovisioned lane: $out" ;;
+  esac
   pass "fm-memory-migrate: a memory that never landed fails verification"
 }
 
@@ -1839,7 +1957,9 @@ test_a_file_created_at_a_renamed_path_never_retires_the_renamed_memory
 test_a_renamed_and_edited_source_is_a_delete_plus_create
 test_another_directory_of_one_project_stays_one_memory
 test_a_channel_move_is_refused_and_check_15_names_it
-test_verify_catches_a_memory_the_bridge_never_reached
+test_verify_catches_a_lane_that_has_no_bank_to_land_in
+test_verify_catches_a_bridge_that_failed_against_a_bank_in_place
+test_a_recorded_refusal_survives_a_run_that_derives_nothing_for_its_lane
 test_an_unprovisioned_lane_is_not_minted_by_its_own_failure
 test_verify_refuses_to_compare_without_the_stores_sanitizer
 test_two_successive_edits_verify_as_history_kept

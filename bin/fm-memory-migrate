@@ -176,10 +176,17 @@ REFUSALS ARE RECORDED, NEVER INFERRED
   A STORE REFUSAL is the store rejecting the write - `duplicate_in_other_
   project`, `duplicate_is_retired`, `supersede_noop`. It is a hard failure,
   and re-running is refused identically, so a person has to act.
-  A TRANSPORT FAILURE is this tool never getting to ask - `lane_unavailable`
-  when the bridge would not start, `lane_lost_midrun` when its pipe died. It
-  is a hard failure too, because the memory is not in the store, but running
-  `write` again is the whole fix and the message says so.
+  An UNPROVISIONED LANE is a lane with no bank to land in. A hard failure
+  that no re-run can clear, so the message names the `fm-memory-mcp provision`
+  command that can.
+  A TRANSIENT BRIDGE FAILURE is this tool never getting to ask while the bank
+  was in place - `lane_unavailable` when the bridge would not start,
+  `lane_lost_midrun` when its pipe died. It is a hard failure too, because the
+  memory is not in the store, but running `write` again is the whole fix and
+  the message says so.
+  Those last two share a refusal code and are told apart by a checked fact -
+  whether the lane's bank file exists - because a message exists to tell a
+  person what to do, and the mechanism is the wrong axis to sort that by.
   NEVER WRITTEN is no ledger record and nothing in the bank: this memory has
   not been migrated at all. A hard failure, because a memory that never
   landed reading as clean is the one thing this check exists to prevent.
@@ -191,6 +198,9 @@ REFUSALS ARE RECORDED, NEVER INFERRED
   Recording a refusal never fabricates state: a lane whose bank was never
   provisioned gets no ledger written for it, because a lane minted by its own
   failure would then be read back as a bank that cannot be opened.
+  Nor does it forget: a run rewrites only the lanes it actually drove, so a
+  lane it derived nothing for keeps the refusal it is still under rather than
+  having it decay into a source that merely looks stale.
 
 EXIT STATUS
   0 everything routed is durable in the store and no source file changed;
@@ -1156,22 +1166,35 @@ def read_refusals(data_dir: Path, lane: str) -> Dict[str, Any]:
     and writing a per-bank file for it would mint the bank directory as a side
     effect of the failure it is reporting.
     """
+    section = read_refusal_lanes(data_dir).get(lane)
+    return section if isinstance(section, dict) else {}
+
+
+def read_refusal_lanes(data_dir: Path) -> Dict[str, Any]:
     try:
         raw = json.loads(refusals_path(data_dir).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     lanes = raw.get("lanes") if isinstance(raw, dict) else None
-    section = lanes.get(lane) if isinstance(lanes, dict) else None
-    return section if isinstance(section, dict) else {}
+    return dict(lanes) if isinstance(lanes, dict) else {}
 
 
-def write_refusals(data_dir: Path, by_lane: Dict[str, Dict[str, Any]]) -> None:
-    """Replace the recorded refusals with what this run actually got told.
+def write_refusals(data_dir: Path, attempted: Dict[str, Dict[str, Any]]) -> None:
+    """Record what this run was told, without discarding what it never asked.
 
-    Written whole rather than merged, so a lane that ran clean stops carrying
-    the refusal of a run that no longer describes it.
+    Only the lanes this run actually drove are rewritten: one that ran clean
+    stops carrying the refusal of a run that no longer describes it, while a
+    lane this run derived nothing for keeps the refusal it is still under.
+    Dropping the second would let a permanently refused write decay into a
+    source that merely looks stale, which is the one reading this check exists
+    to make impossible.
     """
-    lanes = {lane: records for lane, records in by_lane.items() if records}
+    lanes = read_refusal_lanes(data_dir)
+    for lane, records in attempted.items():
+        if records:
+            lanes[lane] = records
+        else:
+            lanes.pop(lane, None)
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
         refusals_path(data_dir).write_text(
@@ -1180,6 +1203,19 @@ def write_refusals(data_dir: Path, by_lane: Dict[str, Dict[str, Any]]) -> None:
         )
     except OSError:
         pass
+
+
+def lane_is_provisioned(data_dir: Path, lane: str) -> bool:
+    """Whether this lane has a bank at all.
+
+    The one fact that separates a lane nobody provisioned from a bridge that
+    failed against a bank which is right there: the first needs a person to
+    provision it and no number of re-runs will do, the second is cleared by
+    running `write` again. Read from the filesystem rather than deduced from a
+    refusal code, because the code names the mechanism and the operator needs
+    the remedy.
+    """
+    return (data_dir / "banks" / f"lane-{lane}" / "mnemosyne.db").is_file()
 
 
 # --- the bridge --------------------------------------------------------------
@@ -2038,9 +2074,10 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
     # memory can read as a clean migration. This asks the question directly,
     # per derived memory, and answers it from the bank rather than the report.
     # Whether the bank holds a memory is `holds`, and nothing else. What
-    # separates the ways it can be absent is read, never inferred, and named
-    # four ways: a store refusal a re-run cannot clear, a transport failure a
-    # re-run does clear, a memory never migrated at all, and a source that has
+    # separates the ways it can be absent is read, never inferred, and named by
+    # the REMEDY rather than by the mechanism: a store refusal a person must
+    # resolve, a lane nobody provisioned, a bridge that failed against a bank
+    # that is in place, a memory never migrated at all, and a source that has
     # simply moved on since the last write. Only the last is a notice.
     refused_by_lane = {lane: read_refusals(data_dir, lane) for lane in lanes}
     unwritten = []
@@ -2060,10 +2097,16 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
                 continue
             refusal = refused_for(refused_by_lane.get(entry.lane) or {}, entry)
             code = refusal.get("code", "unknown") if refusal else ""
-            if refusal and code in TRANSPORT_CODES:
+            if refusal and code in TRANSPORT_CODES and not lane_is_provisioned(data_dir, entry.lane):
+                unwritten.append(
+                    f"{entry.lane}: {name} has NO BANK to land in ({code}); run "
+                    f"`fm-memory-mcp provision --lane {entry.lane} --data-dir {data_dir}` "
+                    f"first, because nothing else can put this lane in place")
+            elif refusal and code in TRANSPORT_CODES:
                 unwritten.append(
                     f"{entry.lane}: {name} NEVER REACHED the store ({code}): the bridge "
-                    f"for this lane failed, so re-running write clears it")
+                    f"failed while this lane's bank was in place, so re-running write "
+                    f"clears it")
             elif refusal:
                 unwritten.append(
                     f"{entry.lane}: {name} was REFUSED by the store "

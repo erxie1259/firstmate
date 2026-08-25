@@ -233,6 +233,41 @@ sys.exit(0 if not answer["result"].get("isError") else 1)
 RPC
 }
 
+# Put a row nobody indexed into a lane bank, the way a bank can already hold
+# rows this migration never wrote and never indexed.
+plant_unindexed_row() {  # <data-dir> <lane>
+  fm_migrate_assert_scratch "$1"
+  python3 - "$1/banks/lane-$2/mnemosyne.db" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute(
+    "INSERT INTO working_memory (id, content, source, scope, channel_id, consolidated_at)"
+    " VALUES ('planted-unindexed-row', 'A row some other writer left unindexed.',"
+    " 'some-other-writer', 'global', '_lane', '2026-08-24T00:00:00Z')")
+conn.commit()
+conn.close()
+PY
+}
+
+# Give the scratch data dir a Hermes bank, copied from one of its lane banks so
+# it carries a real schema. The bank it is copied from decides whether it holds
+# memories this migration wrote.
+make_hermes_bank() {  # <data-dir> <lane-to-copy>
+  fm_migrate_assert_scratch "$1"
+  mkdir -p "$1/banks/default"
+  cp "$1/banks/lane-$2/mnemosyne.db" "$1/banks/default/mnemosyne.db"
+}
+
+# How many memories in the Hermes bank carry this migration's own source.
+hermes_migration_rows() {  # <data-dir>
+  fm_migrate_assert_scratch "$1"
+  python3 - "$1/banks/default/mnemosyne.db" <<'PY'
+import sqlite3, sys
+print(sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True).execute(
+    "SELECT count(*) FROM working_memory WHERE source LIKE 'claude-automemory%'").fetchone()[0])
+PY
+}
+
 # The text of one lane's migrated memory, read back from the bank it landed in.
 migrated_content() {  # <data-dir> <lane>
   fm_migrate_assert_scratch "$1"
@@ -633,6 +668,188 @@ MD
   pass "fm-memory-migrate: a redacted description is never used as a recall spot-check query"
 }
 
+test_verify_accounts_for_a_source_file_that_disappeared() {
+  skip_without_library "the orphaned-source test" && return 0
+  local home src data out
+  home=$(make_home orphan-home)
+  src=$(make_sources orphan-src)
+  data=$(make_lanes orphan-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # A source file that goes away is never retired from the store, so the bank
+  # legitimately holds one more live memory than this run derives.
+  rm "$src/-Users-x-Coding-flags/memory/project_release.md"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed after a source file disappeared: $out"
+  case "$out" in
+    *"FAIL  1 count reconciliation"*) fail "a deliberately kept orphan was reported as a count mismatch: $out" ;;
+  esac
+  case "$out" in
+    *"kept whose source file is gone"*) ;;
+    *) fail "the kept orphan was not named in the reconciliation: $out" ;;
+  esac
+  case "$out" in
+    *"ORPHANED products/"*) ;;
+    *) fail "verification did not report the orphaned ledger key: $out" ;;
+  esac
+  pass "fm-memory-migrate: a memory whose source file vanished reconciles as a kept orphan"
+}
+
+test_verify_ignores_hermes_activity_that_is_not_ours() {
+  skip_without_library "the Hermes-activity test" && return 0
+  local home src data out stop
+  home=$(make_home hermes-home)
+  src=$(make_sources hermes-src)
+  data=$(make_lanes hermes-data products fleet-infra shared)
+  make_hermes_bank "$data" shared
+  # Hermes writes to its own bank constantly, including while a migration is
+  # running. That says nothing about whether this tool touched it.
+  stop="$data/keep-touching"
+  : > "$stop"
+  (while [ -f "$stop" ]; do touch "$data/banks/default/mnemosyne.db"; sleep 0.05; done) &
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  rm -f "$stop"
+  wait
+  [ "$(hermes_migration_rows "$data")" = "0" ] \
+    || fail "the fixture put a migration row in the Hermes bank"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed after Hermes wrote to its own bank during the run: $out"
+  case "$out" in
+    *"FAIL  13"*) fail "Hermes writing to its own bank was reported as this migration touching it: $out" ;;
+  esac
+  pass "fm-memory-migrate: Hermes writing to its own bank is not this migration touching it"
+}
+
+test_verify_catches_a_memory_of_ours_in_the_hermes_bank() {
+  skip_without_library "the Hermes-intrusion test" && return 0
+  local home src data out
+  home=$(make_home hermesleak-home)
+  src=$(make_sources hermesleak-src)
+  data=$(make_lanes hermesleak-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # A Hermes bank that holds memories carrying this migration's provenance is
+  # the one thing check 13 exists to catch.
+  make_hermes_bank "$data" products
+  [ "$(hermes_migration_rows "$data")" != "0" ] \
+    || fail "the fixture did not put a migration row in the Hermes bank"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    && fail "verification passed while migrated memories sat in the Hermes bank: $out"
+  case "$out" in
+    *"FAIL  13"*) ;;
+    *) fail "check 13 did not catch a migrated memory in the Hermes bank: $out" ;;
+  esac
+  pass "fm-memory-migrate: a memory of ours in the Hermes bank fails verification"
+}
+
+test_verify_accepts_a_cross_lane_duplicate() {
+  skip_without_library "the cross-lane duplicate verification test" && return 0
+  local home src data out
+  home=$(make_home xlane-home)
+  src=$(make_sources xlane-src)
+  data=$(make_lanes xlane-data products fleet-infra)
+  # One fact written down in two projects that live in different lanes is
+  # deliberately written once in EACH lane, never merged, so each lane holds
+  # text the other lane also holds.
+  cat > "$src/-Users-x-Coding-flags/memory/build_containers.md" <<'MD'
+---
+name: Build containers
+description: how release builds are containerised
+type: reference
+---
+Release builds run inside disposable containers built from the pinned base image.
+MD
+  cp "$src/-Users-x-Coding-flags/memory/build_containers.md" \
+     "$src/-Users-x-Coding-firstmate/memory/build_containers.md"
+  cat > "$src/-Users-x-Coding-firstmate/memory/container_policy.md" <<'MD'
+---
+name: Container policy
+description: what the fleet expects of a container
+type: reference
+---
+Every container the fleet runs is rebuilt nightly from the pinned base image.
+MD
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed on a correct migration holding a cross-lane duplicate: $out"
+  case "$out" in
+    *"FAIL  9 lane containment"*) fail "a lane's own cross-lane duplicate was reported as a leak: $out" ;;
+  esac
+  pass "fm-memory-migrate: a lane's own cross-lane duplicate is never reported as a leak"
+}
+
+test_verify_passes_after_a_re_migration_supersedes() {
+  skip_without_library "the re-migration verification test" && return 0
+  local home src data out
+  home=$(make_home remigrate-home)
+  src=$(make_sources remigrate-src)
+  data=$(make_lanes remigrate-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  cat > "$src/-Users-x-Coding-flags/memory/project_release.md" <<'MD'
+---
+name: Flags release lane
+description: how the flags app reaches TestFlight
+type: project
+---
+The release lane now runs fastlane beta from a dedicated worktree.
+MD
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed after a legitimate re-migration: $out"
+  case "$out" in
+    *"superseded kept as history"*) ;;
+    *) fail "the superseded row was not reported as history: $out" ;;
+  esac
+  pass "fm-memory-migrate: a re-migration after an edit verifies as history kept"
+}
+
+test_verify_treats_nothing_to_spot_check_as_a_pass() {
+  skip_without_library "the empty-spot-check test" && return 0
+  local home src data out detail
+  home=$(make_home nospot-home)
+  src="$TMP_ROOT/nospot-src"
+  fm_migrate_assert_scratch "$src"
+  mkdir -p "$src/-Users-x-Coding-flags/memory"
+  # The only memory this corpus produces is a pointer whose description was
+  # itself credential-bearing, so there is no description left to probe by.
+  cat > "$src/-Users-x-Coding-flags/memory/vault_only.md" <<MD
+---
+name: Vault
+description: the API key for TestFlight is in 1Password entry 4821
+type: user
+---
+Match password: $SECRET_LITERAL lives in the vault.
+MD
+  data=$(make_lanes nospot-data products)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  out=$(fm_migrate "$home" "$src" "$data" verify --json) || true
+  detail=$(json_field "$out" "next(c['detail'] for c in d['checks'] if c['check'].startswith('8 '))")
+  [ "$(json_field "$out" "next(c['pass'] for c in d['checks'] if c['check'].startswith('8 '))")" \
+    = "True" ] || fail "a corpus with nothing to spot-check failed check 8: $detail"
+  case "$detail" in
+    *"no migrated memory carries a description"*) ;;
+    *) fail "check 8 did not say there was nothing to spot-check: $detail" ;;
+  esac
+  pass "fm-memory-migrate: nothing to spot-check passes rather than failing as 0/0"
+}
+
+test_verify_parity_covers_only_the_memories_this_migration_wrote() {
+  skip_without_library "the parity-scope test" && return 0
+  local home src data out
+  home=$(make_home parity-home)
+  src=$(make_sources parity-src)
+  data=$(make_lanes parity-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  plant_unindexed_row "$data" products
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed over a row this migration never wrote: $out"
+  case "$out" in
+    *"FAIL  5 embedding parity"*) fail "another writer's unindexed row failed our embedding parity: $out" ;;
+  esac
+  case "$out" in
+    *"FAIL  6 FTS parity"*) fail "another writer's unindexed row failed our FTS parity: $out" ;;
+  esac
+  pass "fm-memory-migrate: index parity is judged over this migration's own memories"
+}
+
 test_verify_passes_a_clean_migration() {
   skip_without_library "the verification test" && return 0
   local home src data out
@@ -760,5 +977,12 @@ test_verify_passes_a_clean_migration
 test_verify_accepts_a_memory_left_to_a_canonical_pointer
 test_verify_catches_a_leak_hiding_in_a_project_channel
 test_verify_does_not_spot_check_a_redacted_description
+test_verify_accounts_for_a_source_file_that_disappeared
+test_verify_ignores_hermes_activity_that_is_not_ours
+test_verify_catches_a_memory_of_ours_in_the_hermes_bank
+test_verify_accepts_a_cross_lane_duplicate
+test_verify_passes_after_a_re_migration_supersedes
+test_verify_treats_nothing_to_spot_check_as_a_pass
+test_verify_parity_covers_only_the_memories_this_migration_wrote
 test_verify_catches_a_memory_that_never_landed
 test_rollback_leaves_every_source_intact

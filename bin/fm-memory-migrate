@@ -88,7 +88,9 @@ WHAT THIS DELIBERATELY DOES NOT DO
   missing file is as likely to be a renamed or unmounted directory as a
   deletion, and mass-retiring a lane on that reading is unrecoverable. Such
   ledger keys are reported as `orphaned` so the loss of the link is visible,
-  and retiring them stays a deliberate act.
+  and retiring them stays a deliberate act. Both `write` and `verify` report
+  them, and the count reconciliation reads the store's live rows as this run's
+  memories PLUS those kept orphans rather than calling them a mismatch.
   It writes no graph_edges for `[[wikilinks]]`: every write goes through the
   bridge, the bridge exposes no edge tool, and reaching around it into sqlite
   is exactly the direct-store access this whole design refuses. Link targets
@@ -114,6 +116,14 @@ FAILURE ISOLATION
 COUNTS
   written, skipped_duplicate, updated, credential_pointers, unrouted, refused,
   dropped_for_pointer.
+
+HERMES IS NEVER WRITTEN
+  The safety property is that no memory this migration writes ever lands in
+  Hermes's own bank, and `verify` asserts exactly that: it reads that bank
+  read-only and looks for rows carrying this migration's sources or its
+  metadata marker. Its mtime and row counts are recorded as context only,
+  never as a verdict, because Hermes writes to that bank constantly and no
+  before/after equality over state someone else is writing proves anything.
 
 EXIT STATUS
   0 everything routed is durable in the store and no source file changed;
@@ -141,6 +151,7 @@ LEDGER_FILENAME = "fm-memory-migrate.json"
 SESSION = "fm:memory-migrate"
 SOURCE = "claude-automemory"
 POINTER_SOURCE = "claude-automemory-pointer"
+MIGRATION_MARKER = "claude-automemory-phase3"
 LANE_CHANNEL = "_lane"
 DEFAULT_SOURCE_ROOT = Path.home() / ".claude" / "projects"
 DEFAULT_DATA_DIR = Path.home() / ".hermes" / "mnemosyne" / "data"
@@ -696,7 +707,7 @@ def make_entry(lane: str, members: Sequence[SourceFile], sha: str, cross_lane: b
         notes.append("also present in another lane")
 
     metadata: Dict[str, Any] = {
-        "migration": "claude-automemory-phase3",
+        "migration": MIGRATION_MARKER,
         "source": SOURCE,
         "source_path": paths[0],
         "source_paths": paths,
@@ -903,8 +914,46 @@ def write_hermes_record(data_dir: Path, before: Dict[str, Any], after: Dict[str,
         pass
 
 
+def hermes_intrusion(data_dir: Path) -> Dict[str, Any]:
+    """Whether anything this migration writes has landed in Hermes's own bank.
+
+    The property that matters is not that the bank is byte-identical - Hermes
+    writes to it constantly and no before/after comparison over concurrently
+    written state can establish anything - but that no row in it carries this
+    migration's provenance. That is what a stray write from here would look
+    like, and Hermes's own activity cannot fake it either way.
+    """
+    db = data_dir / "banks" / HERMES_BANK / "mnemosyne.db"
+    if not db.is_file():
+        return {"present": False, "rows": 0}
+    out: Dict[str, Any] = {"present": True, "rows": 0}
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        out["error"] = str(exc)
+        return out
+    placeholders = ", ".join("?" for _ in MIGRATED_SOURCES)
+    try:
+        rows = conn.execute(
+            f"SELECT id FROM working_memory WHERE source IN ({placeholders}) "  # noqa: S608
+            f"OR metadata_json LIKE ?",
+            (*MIGRATED_SOURCES, f'%"{MIGRATION_MARKER}"%'),
+        ).fetchall()
+        out["rows"] = len(rows)
+        out["ids"] = [row[0] for row in rows[:5]]
+    except sqlite3.Error as exc:
+        out["error"] = str(exc)
+    finally:
+        conn.close()
+    return out
+
+
 def hermes_snapshot(data_dir: Path) -> Dict[str, Any]:
-    """What must be identical before and after: Hermes's own bank, untouched."""
+    """Informational only: what Hermes's bank looked like at one instant.
+
+    Never a pass/fail signal. Hermes mutates its own mtime and row counts for
+    reasons that have nothing to do with this migration.
+    """
     db = data_dir / "banks" / HERMES_BANK / "mnemosyne.db"
     if not db.is_file():
         return {"present": False}
@@ -1223,6 +1272,23 @@ def open_bank(data_dir: Path, lane: str) -> Optional[sqlite3.Connection]:
         return None
 
 
+def count_indexed(conn: sqlite3.Connection, table: str, column: str,
+                  ids: Sequence[str]) -> Optional[int]:
+    """How many of these memory ids the given index table holds."""
+    found = 0
+    for start in range(0, len(ids), 400):
+        chunk = list(ids[start:start + 400])
+        placeholders = ", ".join("?" for _ in chunk)
+        try:
+            row = conn.execute(
+                f"SELECT count(*) FROM {table} WHERE {column} IN ({placeholders})",  # noqa: S608
+                chunk).fetchone()
+        except sqlite3.Error:
+            return None
+        found += row[0]
+    return found
+
+
 def bank_channels(conn: sqlite3.Connection) -> List[str]:
     """Every channel this bank holds a memory under, migrated or not.
 
@@ -1313,6 +1379,23 @@ def near_duplicates(conn: sqlite3.Connection, ids: Sequence[str]) -> List[Dict[s
     return out
 
 
+def orphaned_ledger_keys(entries: Sequence[Entry], lanes: Sequence[str],
+                        data_dir: Path) -> List[Dict[str, str]]:
+    """Ledger keys this run derives nothing for: their source file is gone.
+
+    They are reported, never retired: under mirror mode a missing file is as
+    likely to be a rename or an unmounted directory as a deletion.
+    """
+    out: List[Dict[str, str]] = []
+    for lane in lanes:
+        derived = {entry.key for entry in entries if entry.lane == lane}
+        ledger = read_ledger(data_dir, lane)
+        for key in sorted(set(ledger) - derived):
+            record = ledger[key] or {}
+            out.append({"lane": lane, "key": key, "memory_id": record.get("memory_id", "")})
+    return out
+
+
 def check(name: str, passed: bool, detail: str) -> Dict[str, Any]:
     return {"check": name, "pass": passed, "detail": detail}
 
@@ -1321,7 +1404,10 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
            home: Path, dropped: Sequence[Dict[str, Any]] = ()) -> Dict[str, Any]:
     """The integrity checklist, read from the banks rather than from a report."""
     checks: List[Dict[str, Any]] = []
-    lanes = sorted({entry.lane for entry in entries})
+    # The ledgers name lanes this run derived nothing for, and their keys are
+    # exactly the memories whose source file is gone. verify has to read them
+    # the way write does or it cannot tell a kept orphan from a lost memory.
+    lanes = sorted({entry.lane for entry in entries} | set(ledger_lanes(data_dir)))
     rows_by_lane: Dict[str, List[Dict[str, Any]]] = {}
     channels_by_lane: Dict[str, List[str]] = {}
     unreadable: List[str] = []
@@ -1343,19 +1429,33 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
     live_by_lane = {lane: [r for r in rows if not is_retired(r)] for lane, rows in rows_by_lane.items()}
     live_rows = [row for rows in live_by_lane.values() for row in rows]
 
-    # 1 count reconciliation, per lane
+    # 1 count reconciliation, per lane. A memory whose source file disappeared
+    # is deliberately never retired, so the store legitimately holds it on top
+    # of what this run derives. It reconciles as an accounted-for orphan and is
+    # named in the detail, because the whole point of keeping it is that the
+    # broken link stays visible.
+    orphaned = orphaned_ledger_keys(entries, lanes, data_dir)
+    orphan_ids: Dict[str, set] = {}
+    for item in orphaned:
+        orphan_ids.setdefault(item["lane"], set()).add(item["memory_id"])
     mismatched = []
+    kept_total = 0
     for lane in lanes:
         expected = len([e for e in entries if e.lane == lane])
-        actual = len(live_by_lane.get(lane, []))
-        if expected != actual:
-            mismatched.append(f"{lane}: derived {expected}, store holds {actual} live")
+        live = live_by_lane.get(lane, [])
+        kept = [row for row in live if row["id"] in orphan_ids.get(lane, set())]
+        kept_total += len(kept)
+        if expected + len(kept) != len(live):
+            mismatched.append(
+                f"{lane}: derived {expected} plus {len(kept)} kept orphans, "
+                f"store holds {len(live)} live")
     retired_total = len(all_rows) - len(live_rows)
     checks.append(check(
         "1 count reconciliation",
         not mismatched and not unreadable,
         "; ".join(mismatched + [f"{lane}: bank unreadable" for lane in unreadable]) or
         f"every lane matches ({len(entries)} live memories across {len(lanes)} lanes"
+        f"{f', plus {kept_total} kept whose source file is gone' if kept_total else ''}"
         f"{f', plus {retired_total} superseded kept as history' if retired_total else ''})"))
 
     # 2 provenance completeness
@@ -1395,35 +1495,41 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
         f"{len(non_global)} migrated memories are not global" if non_global
         else f"all {len(all_rows)} migrated memories are global"))
 
-    # 5 and 6 embedding and FTS parity, per bank
-    parity_problems = []
+    # 5 and 6 embedding and FTS parity, over the memories this migration wrote.
+    # A bank also holds rows nobody here wrote - phase 2's pointers, whatever
+    # the lane already had - and their indexing is the store's business, not
+    # this checklist's; counting the whole bank makes someone else's gap read
+    # as a memory of ours that recall cannot reach.
+    embedding_problems: List[str] = []
+    fts_problems: List[str] = []
     for lane in lanes:
+        ids = [row["id"] for row in rows_by_lane.get(lane, [])]
+        if not ids:
+            continue
         conn = open_bank(data_dir, lane)
         if conn is None:
             continue
         try:
-            counts = {}
-            for table in ("working_memory", "episodic_memory", "memory_embeddings", "fts_working"):
-                try:
-                    counts[table] = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # noqa: S608
-                except sqlite3.Error as exc:
-                    parity_problems.append(f"{lane}: cannot count {table}: {exc}")
-                    counts[table] = -1
+            embedded = count_indexed(conn, "memory_embeddings", "memory_id", ids)
+            indexed = count_indexed(conn, "fts_working", "id", ids)
         finally:
             conn.close()
-        expected_embeddings = counts.get("working_memory", 0) + counts.get("episodic_memory", 0)
-        if counts.get("memory_embeddings") != expected_embeddings:
-            parity_problems.append(
-                f"{lane}: {counts.get('memory_embeddings')} embeddings for {expected_embeddings} memories")
-        if counts.get("fts_working") != counts.get("working_memory"):
-            parity_problems.append(
-                f"{lane}: {counts.get('fts_working')} FTS rows for {counts.get('working_memory')} memories")
-    embedding_problems = [p for p in parity_problems if "embedding" in p or "cannot count" in p]
-    fts_problems = [p for p in parity_problems if "FTS" in p]
+        if embedded is None:
+            embedding_problems.append(f"{lane}: the embedding table could not be read")
+        elif embedded != len(ids):
+            embedding_problems.append(
+                f"{lane}: {len(ids) - embedded} of {len(ids)} migrated memories have no embedding")
+        if indexed is None:
+            fts_problems.append(f"{lane}: the FTS index could not be read")
+        elif indexed != len(ids):
+            fts_problems.append(
+                f"{lane}: {len(ids) - indexed} of {len(ids)} migrated memories are not in the FTS index")
     checks.append(check("5 embedding parity", not embedding_problems,
-                        "; ".join(embedding_problems) or "every bank has one embedding per memory"))
+                        "; ".join(embedding_problems)
+                        or f"every one of {len(all_rows)} migrated memories carries an embedding"))
     checks.append(check("6 FTS parity", not fts_problems,
-                        "; ".join(fts_problems) or "every bank has one FTS row per memory"))
+                        "; ".join(fts_problems)
+                        or f"every one of {len(all_rows)} migrated memories is in its bank's FTS index"))
 
     # 7 clean lifecycle slate. A fresh migration retires nothing at all. A
     # re-run over an edited file supersedes, which is the point of superseding,
@@ -1466,25 +1572,26 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
         not duplicated,
         "; ".join(duplicated[:5]) or f"each of {len(seen)} source files has exactly one live memory"))
 
-    # 13 Hermes untouched. Absent is not a failure - a data dir with no Hermes
-    # bank has nothing for this tool to disturb - and its counts moving since
-    # the migration is not one either, because Hermes writes to it constantly.
-    # What must hold is that the run itself left it identical.
+    # 13 Hermes untouched. The property is that nothing this migration writes
+    # is in Hermes's own bank. Its row counts and mtime move constantly for
+    # reasons of its own, so they are context here and never a verdict.
     snapshot = hermes_snapshot(data_dir)
-    record = read_hermes_record(data_dir)
-    if record is not None:
-        unchanged = record.get("before") == record.get("after")
-        detail = ("the last migration run left the Hermes bank identical: "
-                  f"{json.dumps(record.get('after'))}") if unchanged else (
-                  f"the last migration run CHANGED the Hermes bank: {json.dumps(record)}")
-    elif not snapshot.get("present"):
-        unchanged = True
+    intrusion = hermes_intrusion(data_dir)
+    if not intrusion.get("present"):
+        untouched = True
         detail = "this data dir has no Hermes bank; there was nothing to disturb"
+    elif intrusion.get("error"):
+        untouched = False
+        detail = f"the Hermes bank could not be read to prove it holds nothing of ours: {intrusion['error']}"
+    elif intrusion.get("rows"):
+        untouched = False
+        detail = (f"{intrusion['rows']} rows in the Hermes bank carry this migration's "
+                  f"provenance: {', '.join(intrusion.get('ids') or [])}")
     else:
-        unchanged = "error" not in snapshot
-        detail = (f"no migration run recorded here; the Hermes bank is currently "
-                  f"{json.dumps(snapshot)}")
-    checks.append(check("13 Hermes bank untouched by the migration", unchanged, detail))
+        untouched = True
+        detail = ("the Hermes bank holds no memory this migration wrote "
+                  f"(it currently holds {snapshot.get('working_memory', 'unknown')} of its own)")
+    checks.append(check("13 Hermes bank untouched by the migration", untouched, detail))
 
     # 14 sources intact
     manifest = source_manifest(files)
@@ -1510,7 +1617,9 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
     return {
         "checks": checks,
         "near_duplicate_review": review,
+        "orphaned_ledger_keys": orphaned,
         "hermes": snapshot,
+        "hermes_run_record": read_hermes_record(data_dir),
         "lanes": lanes,
     }
 
@@ -1520,6 +1629,7 @@ def recall_spot_check(rows_by_lane: Dict[str, List[Dict[str, Any]]], data_dir: P
     hits = 0
     total = 0
     misses: List[str] = []
+    problems: List[str] = []
     for lane, rows in sorted(rows_by_lane.items()):
         # A description that was itself credential-bearing is the same constant
         # string on every pointer that lost one, so it identifies no row and
@@ -1532,7 +1642,7 @@ def recall_spot_check(rows_by_lane: Dict[str, List[Dict[str, Any]]], data_dir: P
         try:
             session = BridgeSession(lane, data_dir, home)
         except (MigrateError, OSError) as exc:
-            misses.append(f"{lane}: {exc}")
+            problems.append(f"{lane}: {exc}")
             continue
         try:
             for row in candidates:
@@ -1552,12 +1662,19 @@ def recall_spot_check(rows_by_lane: Dict[str, List[Dict[str, Any]]], data_dir: P
                     misses.append(f"{lane}/{row['id']}: {row['metadata'].get('source_name', '')}")
         finally:
             session.close()
+    if not problems and total == 0:
+        # Every migrated memory here is one whose description was itself
+        # credential-bearing, or carries none at all. There is nothing a
+        # paraphrase probe could ask for, which is not the same as a miss.
+        return check("8 recall spot-check by paraphrase", True,
+                     "no migrated memory carries a description to spot-check by")
     ratio = (hits / total) if total else 0.0
     return check(
         "8 recall spot-check by paraphrase",
-        total > 0 and ratio >= 0.9,
+        not problems and total > 0 and ratio >= 0.9,
         f"{hits}/{total} memories returned in the top 5 for their own description"
-        + (f"; missed: {', '.join(misses[:5])}" if misses else ""))
+        + (f"; missed: {', '.join(misses[:5])}" if misses else "")
+        + (f"; {'; '.join(problems[:3])}" if problems else ""))
 
 
 def distinctive_terms(rows: Sequence[Dict[str, Any]], other_rows: Sequence[Dict[str, Any]]) -> List[str]:
@@ -1589,6 +1706,10 @@ def lane_containment(rows_by_lane: Dict[str, List[Dict[str, Any]]],
         # that row's own identity and text, never the term alone.
         foreign_ids = {r["id"] for r in others}
         foreign_text = {normalize(r["content"]) for r in others}
+        # A group spanning two lanes is deliberately written once in EACH, so
+        # this lane's own row can carry another lane's text by design. Only a
+        # row this lane's bank should not hold at all is a leak.
+        own_ids = {r["id"] for r in rows}
         try:
             session = BridgeSession(lane, data_dir, home)
         except (MigrateError, OSError) as exc:
@@ -1610,7 +1731,9 @@ def lane_containment(rows_by_lane: Dict[str, List[Dict[str, Any]]],
                         continue
                     for result in payload.get("results") or []:
                         content = result.get("content") or ""
-                        if term not in content.lower():
+                        if term not in set(re.split(r"[^a-z0-9]+", content.lower())):
+                            continue
+                        if result.get("id") in own_ids:
                             continue
                         if result.get("id") in foreign_ids or normalize(content) in foreign_text:
                             leak = (f"{lane} returned another lane's memory for term {term!r} "
@@ -1740,6 +1863,9 @@ def render_checks(result: Dict[str, Any]) -> bool:
         mark = "PASS" if item["pass"] else "FAIL"
         ok = ok and item["pass"]
         print(f"{mark}  {item['check']}: {item['detail']}")
+    for orphan in result.get("orphaned_ledger_keys") or []:
+        print(f"ORPHANED {orphan['lane']}/{orphan['key']} "
+              f"(memory {orphan['memory_id']} kept; retiring it is a deliberate act)")
     review = result["near_duplicate_review"]
     if review:
         print(f"\nnear-duplicate review ({len(review)} pairs at cosine >= {NEAR_DUPLICATE_COSINE}, "
@@ -1809,9 +1935,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         result["source_drift"] = drift
         result["hermes_before"] = hermes_before
         result["hermes_after"] = hermes_after
-        hermes_ok = hermes_before == hermes_after
+        intrusion = hermes_intrusion(data_dir)
+        result["hermes_intrusion"] = intrusion
+        hermes_ok = not intrusion.get("rows") and not intrusion.get("error")
         if args.json:
-            print(json.dumps(dict(result, hermes_unchanged=hermes_ok), indent=2))
+            print(json.dumps(dict(result, hermes_uncontaminated=hermes_ok), indent=2))
         else:
             counts = result["counts"]
             print(" ".join(f"{k}={v}" for k, v in sorted(counts.items())))
@@ -1823,7 +1951,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"ORPHANED {orphan['lane']}/{orphan['key']} "
                       f"(memory {orphan['memory_id']} kept; retiring it is a deliberate act)")
             print(f"sources unchanged: {'yes' if not drift else 'NO - ' + ', '.join(drift)}")
-            print(f"Hermes bank unchanged: {'yes' if hermes_ok else 'NO'}")
+            print(f"Hermes bank holds nothing this migration wrote: "
+                  f"{'yes' if hermes_ok else 'NO - ' + json.dumps(intrusion)}")
         if drift:
             print("fm-memory-migrate: a source file changed during the run; mirror mode is violated",
                   file=sys.stderr)

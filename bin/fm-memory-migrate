@@ -82,6 +82,10 @@ IDEMPOTENCE
   rather than as a second live memory claiming the same thing.
   The ledger is derived, never authoritative: if it is lost, or the row it
   names is gone or already retired, the memory is written fresh instead.
+  Which record belongs to a memory is decided by the source files that record
+  carries, not by the key it sits under. A record whose files are not this
+  memory's is another memory's row and is never superseded, so a same-stem
+  sibling that goes missing can never hand its neighbour's key to anyone.
 
 WHAT THIS DELIBERATELY DOES NOT DO
   It never retires a memory whose source file disappeared. Under mirror mode a
@@ -143,7 +147,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 BRIDGE = Path(__file__).resolve().parent / "fm-memory-mcp"
 PROJECT_MODE = Path(__file__).resolve().parent / "fm-project-mode.sh"
@@ -709,6 +713,7 @@ def make_entry(lane: str, members: Sequence[SourceFile], sha: str, cross_lane: b
     metadata: Dict[str, Any] = {
         "migration": MIGRATION_MARKER,
         "source": SOURCE,
+        "lane": lane,
         "source_path": paths[0],
         "source_paths": paths,
         "source_dirs": sorted({m.dir_name for m in members}),
@@ -750,7 +755,7 @@ def make_entry(lane: str, members: Sequence[SourceFile], sha: str, cross_lane: b
         content = credential_pointer_content(parsed, paths)
         notes.append("credential-bearing: pointer only, content not copied")
         return Entry(
-            key=entry_key(lane, channel, primary),
+            key=entry_key(lane, channel, primary, sha),
             lane=lane,
             channel_id=channel,
             content=content,
@@ -766,7 +771,7 @@ def make_entry(lane: str, members: Sequence[SourceFile], sha: str, cross_lane: b
     memory_type, importance, veracity = TYPE_MAP.get(parsed.declared_type or "", UNTYPED)
     content = entry_content(parsed)
     return Entry(
-        key=entry_key(lane, channel, primary),
+        key=entry_key(lane, channel, primary, sha),
         lane=lane,
         channel_id=channel,
         content=content,
@@ -780,25 +785,31 @@ def make_entry(lane: str, members: Sequence[SourceFile], sha: str, cross_lane: b
     )
 
 
-def entry_key(lane: str, channel: str, primary: SourceFile) -> str:
+def entry_key(lane: str, channel: str, primary: SourceFile, sha: str) -> str:
     """A ledger key stable across the fragmentation this tool collapses.
 
     Deliberately the memory's own file name under its resolved channel, not a
     source path: the same file under a second directory of the same project is
     the SAME memory, and keying by path would make it a second one the moment
     the captain worked from a different checkout.
+    Two different memories can share a file name inside one channel - four
+    EquiMe directories collapse into one channel - so the key carries a digest
+    of the memory's own text. Nothing in it depends on which of its same-stem
+    siblings happens to exist, because a key that shifted when a sibling went
+    missing would point the supersession at another memory's row.
     """
-    return f"{lane}/{channel}/{primary.path.stem}"
+    return f"{lane}/{channel}/{primary.path.stem}@{sha[:12]}"
 
 
 def disambiguate(entries: List[Entry]) -> None:
-    """Two different memories can share a file name inside one channel."""
+    """Two memories whose short digests collide still need separate keys."""
     seen: Dict[str, int] = {}
+    for entry in entries:
+        seen[entry.key] = seen.get(entry.key, 0) + 1
     for index, entry in enumerate(entries):
-        count = seen.get(entry.key, 0)
-        seen[entry.key] = count + 1
-        if count:
-            entries[index] = entry._replace(key=f"{entry.key}#{count + 1}")
+        if seen[entry.key] > 1:
+            entries[index] = entry._replace(
+                key=f"{entry.key}@{entry.metadata['content_sha']}")
 
 
 # --- the source manifest (mirror mode's proof) -------------------------------
@@ -1106,6 +1117,30 @@ class BridgeSession:
                 pass
 
 
+def ledger_record_for(ledger: Dict[str, Any], entry: Entry) -> Tuple[Optional[str], Dict[str, Any]]:
+    """(key, record) for the row this entry's own source files landed in.
+
+    Identity is the provenance the record carries, not the key it happens to
+    sit under. A record whose source files are not this entry's belongs to
+    another memory, and superseding it would retire a live memory that this
+    run never derived - which is exactly what the never-retire rule forbids.
+    A record found under a different key is this memory re-keyed: its file was
+    renamed, or the digest in its key moved because its text changed.
+    """
+    paths = set(entry.metadata.get("source_paths") or [])
+
+    def carries(record: Any) -> bool:
+        return bool(paths & set((record or {}).get("source_paths") or []))
+
+    record = ledger.get(entry.key)
+    if record is not None:
+        return (entry.key, dict(record)) if carries(record) else (None, {})
+    for key in sorted(ledger):
+        if carries(ledger[key]):
+            return (key, dict(ledger[key]))
+    return (None, {})
+
+
 def write_arguments(entry: Entry) -> Dict[str, Any]:
     args: Dict[str, Any] = {
         "content": entry.content,
@@ -1169,7 +1204,7 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
         try:
             for index, entry in enumerate(lane_entries):
                 try:
-                    record = ledger.get(entry.key) or {}
+                    previous_key, record = ledger_record_for(ledger, entry)
                     previous_id = record.get("memory_id")
                     changed = bool(previous_id) and record.get("content_sha") != entry.content_sha
                     ok = False
@@ -1202,6 +1237,8 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
                         continue
                     memory_id = payload.get("id")
                     if memory_id:
+                        if previous_key and previous_key != entry.key:
+                            ledger.pop(previous_key, None)
                         ledger[entry.key] = {
                             "memory_id": memory_id,
                             "content_sha": entry.content_sha,
@@ -1432,7 +1469,8 @@ def check(name: str, passed: bool, detail: str) -> Dict[str, Any]:
 
 
 def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path,
-           home: Path, dropped: Sequence[Dict[str, Any]] = ()) -> Dict[str, Any]:
+           home: Path, dropped: Sequence[Dict[str, Any]] = (),
+           problems: Sequence[Dict[str, str]] = ()) -> Dict[str, Any]:
     """The integrity checklist, read from the banks rather than from a report."""
     checks: List[Dict[str, Any]] = []
     # The ledgers name lanes this run derived nothing for, and their keys are
@@ -1596,22 +1634,33 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
     checks.append(recall_spot_check(live_by_lane, data_dir, home))
 
     # 9 lane containment
+    # A row this lane's own ledger claims was written here by this tool, which
+    # answers the provenance question even when its source file is long gone.
+    ledger_ids = {lane: {(record or {}).get("memory_id") for record in (ledgers.get(lane) or {}).values()}
+                  for lane in lanes}
     checks.append(lane_containment(live_by_lane, channels_by_lane, lane_of_source_path(entries),
-                                   data_dir, home))
+                                   orphan_ids, ledger_ids, data_dir, home))
 
     # 10 cross-lane awareness
     checks.append(awareness_check(live_by_lane, data_dir, home))
 
     # 11 idempotence is proved by re-running `write`; what verify can prove is
     # that the store holds no second live row for one source file.
+    # Keyed per lane: re-registering a project onto another lane leaves its old
+    # rows in the old bank, because this tool never retires them, so one source
+    # file legitimately has a live memory in two banks. Two live rows for it in
+    # ONE bank is the duplicate this check is looking for.
     duplicated = []
-    seen: Dict[str, str] = {}
-    for row in live_rows:
-        key = row["metadata"].get("source_path") or ""
-        if key and key in seen:
-            duplicated.append(f"{key} is claimed by {seen[key]} and {row['id']}")
-        elif key:
-            seen[key] = row["id"]
+    seen: Dict[Tuple[str, str], str] = {}
+    for lane, rows in sorted(live_by_lane.items()):
+        for row in rows:
+            path = row["metadata"].get("source_path") or ""
+            if not path:
+                continue
+            if (lane, path) in seen:
+                duplicated.append(f"{lane}: {path} is claimed by {seen[(lane, path)]} and {row['id']}")
+            else:
+                seen[(lane, path)] = row["id"]
     checks.append(check(
         "11 no duplicate live rows per source",
         not duplicated,
@@ -1638,13 +1687,16 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
                   f"(it currently holds {snapshot.get('working_memory', 'unknown')} of its own)")
     checks.append(check("13 Hermes bank untouched by the migration", untouched, detail))
 
-    # 14 sources intact
+    # 14 sources intact. A file the scan could not read never became a
+    # SourceFile, so the manifest cannot see it; this check would claim every
+    # source is readable while the unreadable ones were quietly dropped.
     manifest = source_manifest(files)
     broken = [path for path, record in manifest.items() if "error" in record]
+    broken += [problem["path"] for problem in problems]
     checks.append(check(
         "14 every source file still readable on disk",
         not broken,
-        f"{len(broken)} source files could not be read: {', '.join(broken[:5])}" if broken
+        f"{len(broken)} source files could not be read: {', '.join(sorted(broken)[:5])}" if broken
         else f"all {len(manifest)} source files are intact and were only ever read"))
 
     review = []
@@ -1734,6 +1786,15 @@ def distinctive_terms(rows: Sequence[Dict[str, Any]], other_rows: Sequence[Dict[
     return sorted(tokens(rows) - tokens(other_rows))[:3]
 
 
+def entitled_to(lane: str, row: Dict[str, Any], lane_of_path: Dict[str, str]) -> bool:
+    """Whether this lane's bank is where this row belongs."""
+    recorded = row["metadata"].get("lane")
+    if recorded:
+        return recorded == lane
+    paths = row["metadata"].get("source_paths") or []
+    return bool(paths) and all(lane_of_path.get(path) == lane for path in paths)
+
+
 def lane_of_source_path(entries: Sequence[Entry]) -> Dict[str, str]:
     """Which lane this run derived each source file for.
 
@@ -1750,30 +1811,72 @@ def lane_of_source_path(entries: Sequence[Entry]) -> Dict[str, str]:
 
 
 def misrouted_rows(lane: str, rows: Sequence[Dict[str, Any]],
-                   lane_of_path: Dict[str, str]) -> List[str]:
-    """Migrated rows in this bank whose own provenance belongs to another lane."""
-    out = []
+                   lane_of_path: Dict[str, str], kept_orphans: Set[str],
+                   ledger_ids: Set[str]) -> Tuple[List[str], List[str]]:
+    """(leaks, residue) - rows in this bank whose provenance is another lane's.
+
+    A row records the lane it was derived for, so this holds whether or not
+    its source file still exists on disk. Rows the never-retire rule is
+    deliberately keeping are residue rather than leaks: a project re-registered
+    onto another lane leaves its old rows behind by design.
+    """
+    leaks: List[str] = []
+    residue: List[str] = []
+    unresolved: List[str] = []
     for row in rows:
-        elsewhere = sorted({lane_of_path[path]
-                            for path in row["metadata"].get("source_paths") or []
-                            if lane_of_path.get(path, lane) != lane})
-        if elsewhere:
-            out.append(f"{lane} holds {row['id']}, derived for lane {', '.join(elsewhere)}")
-    return out
+        recorded = row["metadata"].get("lane")
+        paths = row["metadata"].get("source_paths") or []
+        claimed = {lane_of_path[path] for path in paths if path in lane_of_path}
+        if recorded:
+            claimed.add(recorded)
+        elsewhere = sorted(claimed - {lane})
+        if not elsewhere:
+            if recorded == lane or any(lane_of_path.get(path) == lane for path in paths):
+                continue
+            # Nothing left on disk says where this row came from. A row the
+            # never-retire rule is deliberately keeping is accounted for; any
+            # other is a row whose containment cannot be shown either way.
+            if row["id"] in kept_orphans:
+                residue.append(row["id"])
+            elif row["id"] not in ledger_ids:
+                unresolved.append(f"{lane} holds {row['id']} and nothing records which lane it came from")
+            continue
+        if row["id"] in kept_orphans:
+            # Re-registering a project onto another lane leaves its old rows
+            # behind, because this tool never retires them. That residue is
+            # the never-retire rule working, not a live cross-lane write.
+            residue.append(row["id"])
+            continue
+        leaks.append(f"{lane} holds {row['id']}, derived for lane {', '.join(elsewhere)}")
+    return (leaks + unresolved, residue)
 
 
 def lane_containment(rows_by_lane: Dict[str, List[Dict[str, Any]]],
                      channels_by_lane: Dict[str, List[str]],
-                     lane_of_path: Dict[str, str], data_dir: Path,
+                     lane_of_path: Dict[str, str], kept_orphans: Dict[str, Set[str]],
+                     ledger_ids: Dict[str, Set[str]], data_dir: Path,
                      home: Path) -> Dict[str, Any]:
     leaks: List[str] = []
+    residue: List[str] = []
     seen: set = set()
     probes = 0
     for lane, rows in sorted(rows_by_lane.items()):
-        leaks.extend(misrouted_rows(lane, rows, lane_of_path))
+        lane_leaks, lane_residue = misrouted_rows(
+            lane, rows, lane_of_path, kept_orphans.get(lane) or set(),
+            ledger_ids.get(lane) or set())
+        leaks.extend(lane_leaks)
+        residue.extend(lane_residue)
     for lane, rows in sorted(rows_by_lane.items()):
         others = [r for other, rs in rows_by_lane.items() if other != lane for r in rs]
-        terms = distinctive_terms(others, rows)
+        # A group spanning two lanes is deliberately written once in EACH, so
+        # this lane's own row can carry another lane's text by design. What
+        # makes that row legitimate is its provenance - it was derived FOR this
+        # lane - not the fact that it sits in this bank. Only those rows are
+        # subtracted from the probe: a row this lane is not entitled to hold
+        # must not be able to hide its own words from the term that finds it.
+        entitled = [r for r in rows if entitled_to(lane, r, lane_of_path)]
+        entitled_ids = {r["id"] for r in entitled}
+        terms = distinctive_terms(others, entitled)
         if not terms:
             continue
         # The probe reads the whole bank, which holds memories this migration
@@ -1782,14 +1885,6 @@ def lane_containment(rows_by_lane: Dict[str, List[Dict[str, Any]]],
         # that row's own identity and text, never the term alone.
         foreign_ids = {r["id"] for r in others}
         foreign_text = {normalize(r["content"]) for r in others}
-        # A group spanning two lanes is deliberately written once in EACH, so
-        # this lane's own row can carry another lane's text by design. What
-        # makes that row legitimate is its provenance - it was derived from
-        # THIS lane's own files - not the fact that it sits in this bank.
-        entitled_ids = {r["id"] for r in rows
-                        if (r["metadata"].get("source_paths") or [])
-                        and all(lane_of_path.get(path) == lane
-                                for path in r["metadata"]["source_paths"])}
         try:
             session = BridgeSession(lane, data_dir, home)
         except (MigrateError, OSError) as exc:
@@ -1823,10 +1918,13 @@ def lane_containment(rows_by_lane: Dict[str, List[Dict[str, Any]]],
                                 leaks.append(leak)
         finally:
             session.close()
+    accounted = (f"; {len(residue)} rows kept in a lane their project no longer routes to, "
+                 f"reported as orphaned rather than retired" if residue else "")
     return check(
         "9 lane containment",
         not leaks,
-        "; ".join(leaks[:5]) or f"{probes} cross-lane term probes returned nothing from another lane")
+        "; ".join(leaks[:5]) + accounted if leaks else
+        f"{probes} cross-lane term probes returned nothing from another lane{accounted}")
 
 
 def awareness_check(rows_by_lane: Dict[str, List[Dict[str, Any]]], data_dir: Path,
@@ -2039,7 +2137,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         failed = bool(drift) or not hermes_ok or result["counts"]["refused"] or unrouted
         return 1 if failed else 0
 
-    result = verify(entries, files, data_dir, home, plan["dropped_for_pointer"])
+    result = verify(entries, files, data_dir, home, plan["dropped_for_pointer"], problems)
     if args.json:
         print(json.dumps(result, indent=2))
         return 0 if all(c["pass"] for c in result["checks"]) else 1

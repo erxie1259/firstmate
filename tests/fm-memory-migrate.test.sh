@@ -253,6 +253,23 @@ conn.close()
 PY
 }
 
+# Verify a copy of a written data dir after breaking exactly one thing in it.
+# The copy keeps each defect isolated from the next.
+verify_with_defect() {  # <home> <src> <data> <tag> <lane> <sql>
+  local copy="$3-$4"
+  fm_migrate_assert_scratch "$3"
+  fm_migrate_assert_scratch "$copy"
+  cp -R "$3" "$copy"
+  python3 - "$copy/banks/lane-$5/mnemosyne.db" "$6" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.executescript(sys.argv[2])
+conn.commit()
+conn.close()
+PY
+  fm_migrate "$1" "$2" "$copy" verify
+}
+
 # Give the scratch data dir a Hermes bank, copied from one of its lane banks so
 # it carries a real schema. The bank it is copied from decides whether it holds
 # memories this migration wrote.
@@ -985,6 +1002,158 @@ test_verify_still_fails_when_our_own_memory_is_unindexed() {
   pass "fm-memory-migrate: a migrated memory with no embedding still fails parity"
 }
 
+test_a_vanished_same_stem_sibling_never_retires_its_neighbour() {
+  skip_without_library "the same-stem sibling test" && return 0
+  local home src data out before after
+  home=$(make_home sibling-home)
+  src=$(make_sources sibling-src)
+  data=$(make_lanes sibling-data products fleet-infra)
+  # Canonicalisation puts both checkouts of one project in one channel, so two
+  # files can share a stem there while saying different things.
+  cat > "$src/-Users-x-Coding-flags/memory/notes.md" <<'MD'
+---
+name: Notes from the first checkout
+description: what the first checkout wrote down
+type: reference
+---
+The simulator build is the one that reproduces the launch crash.
+MD
+  cat > "$src/-Users-x-live-Coding-flags/memory/notes.md" <<'MD'
+---
+name: Notes from the second checkout
+description: what the second checkout wrote down
+type: reference
+---
+The device build needs the provisioning profile refreshed every ninety days.
+MD
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  before=$(live_migrated_rows "$data" products)
+  # One checkout goes away - unmounted, renamed, or deleted. The other memory
+  # must not inherit its ledger key and must not be superseded by it.
+  rm "$src/-Users-x-Coding-flags/memory/notes.md"
+  out=$(fm_migrate "$home" "$src" "$data" write --json) || true
+  [ "$(json_field "$out" "d['counts']['updated']")" = "0" ] \
+    || fail "a vanished same-stem sibling superseded the memory that remained: $out"
+  after=$(live_migrated_rows "$data" products)
+  [ "$before" = "$after" ] \
+    || fail "a vanished same-stem sibling cost a live memory: $before -> $after"
+  [ "$(bank_text_contains "$data" products 'reproduces the launch crash')" != "0" ] \
+    || fail "the memory whose source file vanished was retired instead of kept"
+  pass "fm-memory-migrate: a vanished same-stem sibling never retires the memory that remains"
+}
+
+test_verify_accepts_a_project_that_changed_lane() {
+  skip_without_library "the re-laned project test" && return 0
+  local home src data out
+  home=$(make_home relane-home)
+  src=$(make_sources relane-src)
+  data=$(make_lanes relane-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # The captain re-registers the project onto another lane. Its old rows stay
+  # where they are, because this tool never retires anything.
+  cat > "$home/data/projects.md" <<'MD'
+# Projects
+
+- flags [no-mistakes +yolo lane:fleet-infra] - Flutter flags app (added 2026-07-29)
+- firstmate [no-mistakes +yolo lane:fleet-infra] - the fleet orchestrator (added 2026-08-18)
+- jy-cards [local-only +yolo] - registered with no lane token (added 2026-08-18)
+MD
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed after a project was re-registered onto another lane: $out"
+  case "$out" in
+    *"FAIL  9 lane containment"*) fail "rows left in the old lane were reported as a cross-lane leak: $out" ;;
+  esac
+  case "$out" in
+    *"kept in a lane their project no longer routes to"*) ;;
+    *) fail "the stale-lane residue was not reported at all: $out" ;;
+  esac
+  pass "fm-memory-migrate: rows left behind by a re-laned project are residue, not a leak"
+}
+
+test_verify_catches_a_misrouted_row_whose_source_file_is_gone() {
+  skip_without_library "the vanished-provenance leak test" && return 0
+  local home src data out
+  home=$(make_home gonepath-home)
+  src=$(make_sources gonepath-src)
+  data=$(make_lanes gonepath-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # A memory this migration wrote into the wrong bank, whose source file has
+  # since disappeared. Its own metadata still records the lane it belongs to.
+  remember_into_lane "$data" products "The fleet rebuilds every runner image nightly." firstmate \
+    claude-automemory \
+    "{\"lane\": \"fleet-infra\", \"migration\": \"claude-automemory-phase3\", \"source_paths\": [\"/gone/fleet-infra/note.md\"]}" \
+    || fail "could not seed a misrouted row whose source file is gone"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    && fail "verification passed while a fleet-infra memory sat in the products bank: $out"
+  case "$out" in
+    *"FAIL  9 lane containment"*) ;;
+    *) fail "lane containment went blind because the leaked row's source file was gone: $out" ;;
+  esac
+  pass "fm-memory-migrate: a misrouted row is caught even after its source file disappears"
+}
+
+test_every_check_still_fails_on_the_defect_it_exists_to_catch() {
+  skip_without_library "the checks-can-fail audit" && return 0
+  local home src data out
+  home=$(make_home candetect-home)
+  src=$(make_sources candetect-src)
+  data=$(make_lanes candetect-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+
+  out=$(verify_with_defect "$home" "$src" "$data" unpinned products \
+    "UPDATE working_memory SET consolidated_at = NULL WHERE source LIKE 'claude-automemory%';")
+  case "$out" in
+    *"FAIL  3 no silent loss to trim"*) ;;
+    *) fail "check 3 did not catch an unpinned migrated memory: $out" ;;
+  esac
+
+  out=$(verify_with_defect "$home" "$src" "$data" scoped products \
+    "UPDATE working_memory SET scope = 'local' WHERE source LIKE 'claude-automemory%';")
+  case "$out" in
+    *"FAIL  4 scope correctness"*) ;;
+    *) fail "check 4 did not catch a migrated memory that is not global: $out" ;;
+  esac
+
+  out=$(verify_with_defect "$home" "$src" "$data" unsearchable products \
+    "DELETE FROM fts_working WHERE id IN (SELECT id FROM working_memory WHERE source LIKE 'claude-automemory%');")
+  case "$out" in
+    *"FAIL  6 FTS parity"*) ;;
+    *) fail "check 6 did not catch a migrated memory missing from the FTS index: $out" ;;
+  esac
+
+  out=$(verify_with_defect "$home" "$src" "$data" retired products \
+    "UPDATE working_memory SET valid_until = '2020-01-01T00:00:00Z' WHERE id = (SELECT id FROM working_memory WHERE source LIKE 'claude-automemory%' ORDER BY id LIMIT 1);")
+  case "$out" in
+    *"FAIL  7 clean lifecycle slate"*) ;;
+    *) fail "check 7 did not catch a retired memory with nothing replacing it: $out" ;;
+  esac
+
+  out=$(verify_with_defect "$home" "$src" "$data" invisible fleet-infra \
+    "UPDATE working_memory SET importance = 0.1;")
+  case "$out" in
+    *"FAIL  10 cross-lane awareness"*) ;;
+    *) fail "check 10 did not catch a lane that contributes no title: $out" ;;
+  esac
+
+  out=$(verify_with_defect "$home" "$src" "$data" doubled products \
+    "INSERT INTO working_memory (id, content, source, scope, channel_id, consolidated_at, metadata_json) SELECT 'duplicate-' || id, content || ' (a second row)', source, scope, channel_id, consolidated_at, metadata_json FROM working_memory WHERE source LIKE 'claude-automemory%' ORDER BY id LIMIT 1;")
+  case "$out" in
+    *"FAIL  11 no duplicate live rows per source"*) ;;
+    *) fail "check 11 did not catch two live rows for one source file: $out" ;;
+  esac
+
+  chmod 000 "$src/-Users-x-Coding-flags/memory/project_release.md"
+  out=$(fm_migrate "$home" "$src" "$data" verify)
+  chmod 644 "$src/-Users-x-Coding-flags/memory/project_release.md"
+  case "$out" in
+    *"FAIL  14 every source file still readable on disk"*) ;;
+    *) fail "check 14 did not catch a source file it could not read: $out" ;;
+  esac
+
+  pass "fm-memory-migrate: every check still fails on the defect it exists to catch"
+}
+
 test_verify_passes_a_clean_migration() {
   skip_without_library "the verification test" && return 0
   local home src data out
@@ -1123,5 +1292,9 @@ test_verify_still_fails_when_our_own_memory_is_unindexed
 test_verify_reads_a_renamed_source_file_as_one_memory
 test_verify_catches_a_migration_written_row_in_the_wrong_lane
 test_verify_catches_a_consolidated_memory_in_the_hermes_bank
+test_a_vanished_same_stem_sibling_never_retires_its_neighbour
+test_verify_accepts_a_project_that_changed_lane
+test_verify_catches_a_misrouted_row_whose_source_file_is_gone
+test_every_check_still_fails_on_the_defect_it_exists_to_catch
 test_verify_catches_a_memory_that_never_landed
 test_rollback_leaves_every_source_intact

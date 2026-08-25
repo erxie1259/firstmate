@@ -592,6 +592,9 @@ def entry_content(parsed: Parsed) -> str:
     return f"[{parsed.name}] {parsed.body}".strip()
 
 
+REDACTED_FIELD = "[redacted: this field is itself credential-bearing]"
+
+
 def safe_field(text: str) -> Optional[str]:
     """A frontmatter field, but only if it is not itself secret-bearing.
 
@@ -724,7 +727,7 @@ def make_entry(lane: str, members: Sequence[SourceFile], sha: str, cross_lane: b
         # refused from, so they are held to the same test before they land.
         for field in ("description", "source_name"):
             if metadata.get(field) and safe_field(str(metadata[field])) is None:
-                metadata[field] = "[redacted: this field is itself credential-bearing]"
+                metadata[field] = REDACTED_FIELD
         # Text lifted out of the refused body is held to that test too: a
         # link target is body text, and D2 keeps the body out of the store.
         for field in BODY_DERIVED_FIELDS:
@@ -1220,6 +1223,20 @@ def open_bank(data_dir: Path, lane: str) -> Optional[sqlite3.Connection]:
         return None
 
 
+def bank_channels(conn: sqlite3.Connection) -> List[str]:
+    """Every channel this bank holds a memory under, migrated or not.
+
+    A memory that leaked into the wrong lane carries its own project channel,
+    and recall only searches the channels it is asked for, so the probe has to
+    ask the bank which channels exist rather than assume the lane-wide one.
+    """
+    try:
+        rows = conn.execute("SELECT DISTINCT channel_id FROM working_memory").fetchall()
+    except sqlite3.Error:
+        return []
+    return sorted({row[0] for row in rows if row[0]})
+
+
 def is_retired(row: Dict[str, Any]) -> bool:
     """Superseded, or already past its shelf life.
 
@@ -1306,6 +1323,7 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
     checks: List[Dict[str, Any]] = []
     lanes = sorted({entry.lane for entry in entries})
     rows_by_lane: Dict[str, List[Dict[str, Any]]] = {}
+    channels_by_lane: Dict[str, List[str]] = {}
     unreadable: List[str] = []
     for lane in lanes:
         conn = open_bank(data_dir, lane)
@@ -1314,6 +1332,7 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
             continue
         try:
             rows_by_lane[lane] = migrated_rows(conn)
+            channels_by_lane[lane] = bank_channels(conn)
         finally:
             conn.close()
 
@@ -1427,7 +1446,7 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
     checks.append(recall_spot_check(live_by_lane, data_dir, home))
 
     # 9 lane containment
-    checks.append(lane_containment(live_by_lane, data_dir, home))
+    checks.append(lane_containment(live_by_lane, channels_by_lane, data_dir, home))
 
     # 10 cross-lane awareness
     checks.append(awareness_check(live_by_lane, data_dir, home))
@@ -1502,7 +1521,12 @@ def recall_spot_check(rows_by_lane: Dict[str, List[Dict[str, Any]]], data_dir: P
     total = 0
     misses: List[str] = []
     for lane, rows in sorted(rows_by_lane.items()):
-        candidates = [r for r in rows if (r["metadata"].get("description") or "").strip()]
+        # A description that was itself credential-bearing is the same constant
+        # string on every pointer that lost one, so it identifies no row and
+        # asking recall to find one by it proves nothing about the migration.
+        candidates = [r for r in rows
+                      if (r["metadata"].get("description") or "").strip()
+                      and r["metadata"].get("description") != REDACTED_FIELD]
         if not candidates:
             continue
         try:
@@ -1548,9 +1572,11 @@ def distinctive_terms(rows: Sequence[Dict[str, Any]], other_rows: Sequence[Dict[
     return sorted(tokens(rows) - tokens(other_rows))[:3]
 
 
-def lane_containment(rows_by_lane: Dict[str, List[Dict[str, Any]]], data_dir: Path,
+def lane_containment(rows_by_lane: Dict[str, List[Dict[str, Any]]],
+                     channels_by_lane: Dict[str, List[str]], data_dir: Path,
                      home: Path) -> Dict[str, Any]:
     leaks: List[str] = []
+    seen: set = set()
     probes = 0
     for lane, rows in sorted(rows_by_lane.items()):
         others = [r for other, rs in rows_by_lane.items() if other != lane for r in rs]
@@ -1568,21 +1594,30 @@ def lane_containment(rows_by_lane: Dict[str, List[Dict[str, Any]]], data_dir: Pa
         except (MigrateError, OSError) as exc:
             leaks.append(f"{lane}: {exc}")
             continue
+        probe_channels: List[Optional[str]] = [
+            channel for channel in channels_by_lane.get(lane, []) if channel != LANE_CHANNEL]
+        probe_channels.append(None)
         try:
             for term in terms:
-                probes += 1
-                ok, payload = session.call_tool(
-                    "memory_recall", {"query": term, "top_k": 10, "include_awareness": False})
-                if not ok:
-                    continue
-                for result in payload.get("results") or []:
-                    content = result.get("content") or ""
-                    if term not in content.lower():
+                for channel in probe_channels:
+                    probes += 1
+                    arguments: Dict[str, Any] = {
+                        "query": term, "top_k": 10, "include_awareness": False}
+                    if channel:
+                        arguments["project"] = channel
+                    ok, payload = session.call_tool("memory_recall", arguments)
+                    if not ok:
                         continue
-                    if result.get("id") in foreign_ids or normalize(content) in foreign_text:
-                        leaks.append(
-                            f"{lane} returned another lane's memory for term {term!r} "
-                            f"({result.get('id')})")
+                    for result in payload.get("results") or []:
+                        content = result.get("content") or ""
+                        if term not in content.lower():
+                            continue
+                        if result.get("id") in foreign_ids or normalize(content) in foreign_text:
+                            leak = (f"{lane} returned another lane's memory for term {term!r} "
+                                    f"({result.get('id')})")
+                            if leak not in seen:
+                                seen.add(leak)
+                                leaks.append(leak)
         finally:
             session.close()
     return check(

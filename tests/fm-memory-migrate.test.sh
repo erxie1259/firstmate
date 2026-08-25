@@ -211,24 +211,37 @@ PY
 # Write a memory into a lane bank through the real bridge, so the bank holds a
 # memory this migration never wrote - which is what every lane bank actually
 # looks like once phase 2's pointers live in it.
-remember_into_lane() {  # <data-dir> <lane> <content>
+remember_into_lane() {  # <data-dir> <lane> <content> [project-channel]
   fm_migrate_assert_scratch "$1"
-  python3 - "$MCP" "$1" "$2" "$3" <<'RPC' >/dev/null
+  python3 - "$MCP" "$1" "$2" "$3" "${4:-}" <<'RPC' >/dev/null
 import json, subprocess, sys
-mcp, data_dir, lane, content = sys.argv[1:5]
+mcp, data_dir, lane, content, project = sys.argv[1:6]
 proc = subprocess.Popen([sys.executable, mcp, "serve", "--lane", lane, "--data-dir", data_dir],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                         text=True)
+arguments = {"content": content, "memory_type": "context", "importance": 0.5}
+if project:
+    arguments["project"] = project
 requests = [
     {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
     {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-     "params": {"name": "memory_remember",
-                "arguments": {"content": content, "memory_type": "context", "importance": 0.5}}},
+     "params": {"name": "memory_remember", "arguments": arguments}},
 ]
 out, _ = proc.communicate("\n".join(json.dumps(r) for r in requests) + "\n")
 answer = json.loads(out.strip().splitlines()[-1])
 sys.exit(0 if not answer["result"].get("isError") else 1)
 RPC
+}
+
+# The text of one lane's migrated memory, read back from the bank it landed in.
+migrated_content() {  # <data-dir> <lane>
+  fm_migrate_assert_scratch "$1"
+  python3 - "$1/banks/lane-$2/mnemosyne.db" <<'PY'
+import sqlite3, sys
+print(sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True).execute(
+    "SELECT content FROM working_memory WHERE source LIKE 'claude-automemory%'"
+    " AND superseded_by IS NULL ORDER BY id LIMIT 1").fetchone()[0])
+PY
 }
 
 library_available() {
@@ -570,6 +583,56 @@ MD
   pass "fm-memory-migrate: a fact left to its canonical pointer does not fail verification"
 }
 
+test_verify_catches_a_leak_hiding_in_a_project_channel() {
+  skip_without_library "the project-channel leak test" && return 0
+  local home src data leaked out
+  home=$(make_home chanleak-home)
+  src=$(make_sources chanleak-src)
+  data=$(make_lanes chanleak-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # A fleet-infra memory copied into the products bank under its own project
+  # channel is exactly the cross-lane leak the lane model exists to prevent,
+  # and it never lands in the lane-wide channel a default recall searches.
+  leaked=$(migrated_content "$data" fleet-infra)
+  remember_into_lane "$data" products "$leaked" firstmate \
+    || fail "could not seed the cross-lane leak through the bridge"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    && fail "verification passed while another lane's memory sat in the products bank: $out"
+  case "$out" in
+    *"FAIL  9 lane containment"*) ;;
+    *) fail "lane containment did not catch a leak living in a project channel: $out" ;;
+  esac
+  pass "fm-memory-migrate: a leak in a project channel fails lane containment"
+}
+
+test_verify_does_not_spot_check_a_redacted_description() {
+  skip_without_library "the redacted-description spot-check test" && return 0
+  local home src data out detail
+  home=$(make_home redact-home)
+  src=$(make_sources redact-src)
+  data=$(make_lanes redact-data products fleet-infra)
+  # A description that itself names a secret is replaced by a constant, which
+  # is the same string on every such pointer and identifies no memory.
+  cat > "$src/-Users-x-Coding-flags/memory/vault_notes.md" <<MD
+---
+name: TestFlight vault
+description: the API key for TestFlight is in 1Password entry 4821
+type: user
+---
+Match password: $SECRET_LITERAL lives in the vault.
+MD
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  out=$(fm_migrate "$home" "$src" "$data" verify --json) || true
+  detail=$(json_field "$out" "next(c['detail'] for c in d['checks'] if c['check'].startswith('8 '))")
+  case "$detail" in
+    "4/4 memories"*) ;;
+    *) fail "the spot-check did not skip the pointer whose description was redacted: $detail" ;;
+  esac
+  [ "$(json_field "$out" "next(c['pass'] for c in d['checks'] if c['check'].startswith('8 '))")" \
+    = "True" ] || fail "the recall spot-check failed on a correct migration: $out"
+  pass "fm-memory-migrate: a redacted description is never used as a recall spot-check query"
+}
+
 test_verify_passes_a_clean_migration() {
   skip_without_library "the verification test" && return 0
   local home src data out
@@ -695,5 +758,7 @@ test_write_keeps_the_secret_out_of_the_store
 test_one_unavailable_lane_costs_only_its_own_memories
 test_verify_passes_a_clean_migration
 test_verify_accepts_a_memory_left_to_a_canonical_pointer
+test_verify_catches_a_leak_hiding_in_a_project_channel
+test_verify_does_not_spot_check_a_redacted_description
 test_verify_catches_a_memory_that_never_landed
 test_rollback_leaves_every_source_intact

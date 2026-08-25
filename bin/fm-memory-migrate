@@ -121,6 +121,23 @@ WHAT THIS DELIBERATELY DOES NOT DO
   is exactly the direct-store access this whole design refuses. Link targets
   are preserved in `metadata.links` and in the body text itself.
 
+ONE CONTENT MODEL, THREE NAMES
+  `group_key` is the folded digest that decides whether two files say the same
+  thing, and it groups duplicates and nothing else.
+  `identity_digest` is the exact-byte digest that says whether a ledger record
+  and a derived entry are the same memory across time, beside the source paths
+  they share; `same_memory` is the one place that question is answered.
+  `stored_form` is the text the store actually holds, produced by the store's
+  own sanitizer, and `holds` is the one place materialisation is answered -
+  whether a bank row carries this entry's current text.
+  Identity and materialisation never borrow each other's implementation: a row
+  carrying the id the ledger recorded proves something once landed, not that
+  what landed is what the file says now.
+  A stored form is its own type and refuses to be compared with a raw string:
+  the store rewrites some content before it writes, so a raw comparison reads
+  a correct migration as a lost memory, and a comparison that answered False
+  quietly is the shape of every defect this model exists to prevent.
+
 THE BRIDGE IS THE ONLY WRITER
   Nothing here opens a store read-write. Every write is a tools/call on a
   `fm-memory-mcp serve` process, so the pin against the 24h trim, the global
@@ -150,6 +167,16 @@ HERMES IS NEVER WRITTEN
   never as a verdict, because Hermes writes to that bank constantly and no
   before/after equality over state someone else is writing proves anything.
 
+REFUSALS ARE RECORDED, NEVER INFERRED
+  A write the store refuses is written down beside the ledger, so `verify`
+  reads what happened instead of guessing it from what landed. Nothing the
+  bank holds distinguishes a write that was rejected from a source edited
+  since the last run, and the two need opposite advice: a refusal is a hard
+  failure that re-running cannot clear, and a source that has moved on is a
+  notice the next `write` resolves. Check 15 fails on the first and lists the
+  second under `STALE`, because a state that is not a failure must still be
+  impossible to miss.
+
 EXIT STATUS
   0 everything routed is durable in the store and no source file changed;
   1 anything was refused, unrouted, or a check failed; 2 usage.
@@ -164,6 +191,7 @@ import math
 import os
 import re
 import sqlite3
+import functools
 import subprocess
 import sys
 import tempfile
@@ -428,19 +456,59 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
-def content_digest(text: str) -> str:
+def group_key(text: str) -> str:
+    """The digest two hand-copied duplicates of one memory share.
+
+    Folded, and for grouping only: it answers "are these the same fact
+    written twice", never "does the store hold this" and never "is this the
+    same memory as before".
+    """
     return hashlib.sha256(normalize(text).encode("utf-8")).hexdigest()
 
 
-def exact_digest(text: str) -> str:
-    """The digest of the text exactly as it is stored.
+def identity_digest(text: str) -> str:
+    """The digest that identifies a memory across time.
 
     The ledger asks whether the store already holds THIS memory, and the
-    store's own dedupe compares content byte for byte. A normalized digest
-    would call a whitespace-only or case-only edit unchanged, skip the
-    supersession, and leave the store holding two live rows for one file.
+    store's own dedupe compares content byte for byte. A folded digest would
+    call a whitespace-only or case-only edit unchanged, skip the supersession,
+    and leave the store holding two live rows for one file.
     """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class StoredForm:
+    """Text in the form the store actually holds it, and only ever that.
+
+    Comparing derived text against store content directly is the mistake this
+    type exists to make impossible: the store rewrites some content before it
+    writes, so raw equality reads a correct migration as a lost memory. An
+    equality against anything that is not a stored form RAISES rather than
+    quietly answering False, because a quiet False is the failure this whole
+    class of defect is made of.
+    """
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, StoredForm):
+            return self.text == other.text
+        raise TypeError(
+            "store content is only ever compared against another stored form; "
+            f"got {type(other).__name__}. Put the other side through stored_form() "
+            "so the store's own rewriting is modelled on both sides.")
+
+    def __ne__(self, other: Any) -> bool:
+        return not self.__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash(("fm-memory-migrate.stored-form", self.text))
+
+    def __repr__(self) -> str:
+        return f"StoredForm({self.text[:60]!r})"
 
 
 WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
@@ -666,7 +734,7 @@ def build_entries(files: Sequence[SourceFile], home: Path) -> Dict[str, Any]:
 
     groups: Dict[str, List[SourceFile]] = {}
     for source in routed:
-        groups.setdefault(content_digest(source.parsed.body), []).append(source)
+        groups.setdefault(group_key(source.parsed.body), []).append(source)
 
     statements = canonical_statements(home)
     entries: List[Entry] = []
@@ -786,7 +854,7 @@ def make_entry(lane: str, members: Sequence[SourceFile], sha: str, cross_lane: b
             veracity="stated",
             source=POINTER_SOURCE,
             metadata=metadata,
-            content_sha=exact_digest(content),
+            content_sha=identity_digest(content),
             notes=notes,
         )
 
@@ -802,7 +870,7 @@ def make_entry(lane: str, members: Sequence[SourceFile], sha: str, cross_lane: b
         veracity=veracity,
         source=SOURCE,
         metadata=metadata,
-        content_sha=exact_digest(content),
+        content_sha=identity_digest(content),
         notes=notes,
     )
 
@@ -1030,20 +1098,37 @@ def ledger_path(data_dir: Path, lane: str) -> Path:
 
 
 def read_ledger(data_dir: Path, lane: str) -> Dict[str, Any]:
+    return ledger_section(data_dir, lane, "memories")
+
+
+def read_refusals(data_dir: Path, lane: str) -> Dict[str, Any]:
+    """What the last run asked this lane's store for and was refused.
+
+    A refusal is recorded rather than inferred. Nothing the store leaves
+    behind distinguishes a write it rejected from a source edited since the
+    last run, and telling a captain to re-run a write that will be refused
+    again is worse than saying nothing.
+    """
+    return ledger_section(data_dir, lane, "refused")
+
+
+def ledger_section(data_dir: Path, lane: str, name: str) -> Dict[str, Any]:
     try:
         raw = json.loads(ledger_path(data_dir, lane).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    records = raw.get("memories") if isinstance(raw, dict) else None
-    return records if isinstance(records, dict) else {}
+    section = raw.get(name) if isinstance(raw, dict) else None
+    return section if isinstance(section, dict) else {}
 
 
-def write_ledger(data_dir: Path, lane: str, records: Dict[str, Any]) -> None:
+def write_ledger(data_dir: Path, lane: str, records: Dict[str, Any],
+                 refused: Optional[Dict[str, Any]] = None) -> None:
     path = ledger_path(data_dir, lane)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps({"version": 1, "memories": records}, indent=2, sort_keys=True) + "\n",
+            json.dumps({"version": 1, "memories": records, "refused": refused or {}},
+                       indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
     except OSError:
@@ -1250,14 +1335,25 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
             session = BridgeSession(lane, data_dir, home)
         except (MigrateError, OSError) as exc:
             counts["refused"] += len(lane_entries)
+            unavailable: Dict[str, Any] = {}
             for entry in lane_entries:
                 refusals.append({"key": entry.key, "lane": lane, "code": "lane_unavailable", "message": str(exc)})
+                unavailable[entry.key] = {
+                    "content_sha": entry.content_sha,
+                    "code": "lane_unavailable",
+                    "message": str(exc),
+                    "source_paths": entry.metadata["source_paths"],
+                }
+            write_ledger(data_dir, lane, ledger, unavailable)
             lane_reports.append({"lane": lane, "state": "unavailable", "detail": str(exc)})
             continue
 
         lane_counts = {"written": 0, "skipped_duplicate": 0, "updated": 0, "refused": 0}
         lane_state = "ready"
         lane_detail = ""
+        # What this run asked for and was refused, recorded as fact beside the
+        # ledger so `verify` reads it rather than guessing from what landed.
+        lane_refused: Dict[str, Any] = {}
         try:
             for index, entry in enumerate(lane_entries):
                 try:
@@ -1297,6 +1393,12 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
                             "code": error.get("code", "unknown"),
                             "message": error.get("message", json.dumps(payload)),
                         })
+                        lane_refused[entry.key] = {
+                            "content_sha": entry.content_sha,
+                            "code": error.get("code", "unknown"),
+                            "message": error.get("message", json.dumps(payload)),
+                            "source_paths": entry.metadata["source_paths"],
+                        }
                         continue
                     memory_id = payload.get("id")
                     if memory_id:
@@ -1321,12 +1423,18 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
                             "key": lost.key, "lane": lane,
                             "code": "lane_lost_midrun", "message": str(exc),
                         })
+                        lane_refused[lost.key] = {
+                            "content_sha": lost.content_sha,
+                            "code": "lane_lost_midrun",
+                            "message": str(exc),
+                            "source_paths": lost.metadata["source_paths"],
+                        }
                     break
         finally:
             session.close()
 
         orphaned.extend(orphaned_ledger_keys(lane_entries, [lane], {lane: ledger}))
-        write_ledger(data_dir, lane, ledger)
+        write_ledger(data_dir, lane, ledger, lane_refused)
 
         floor_error = None
         if lane_counts["written"] or lane_counts["updated"]:
@@ -1529,7 +1637,8 @@ def orphaned_ledger_keys(entries: Sequence[Entry], lanes: Sequence[str],
     return out
 
 
-def stored_form(text: str) -> str:
+@functools.lru_cache(maxsize=None)
+def stored_form(text: str) -> StoredForm:
     """The text the store would hold for this content.
 
     The library rewrites a data: URI, anything over 1 MB, and high-entropy
@@ -1545,7 +1654,7 @@ def stored_form(text: str) -> str:
     try:
         from mnemosyne.core.content_sanitizer import sanitize_content  # noqa: PLC0415
     except ImportError:
-        return text
+        return StoredForm(text)
     previous = os.environ.get("MNEMOSYNE_BLOB_DIR")
     with tempfile.TemporaryDirectory(prefix="fm-memory-migrate-verify-") as scratch:
         os.environ["MNEMOSYNE_BLOB_DIR"] = scratch
@@ -1558,7 +1667,35 @@ def stored_form(text: str) -> str:
                 os.environ.pop("MNEMOSYNE_BLOB_DIR", None)
             else:
                 os.environ["MNEMOSYNE_BLOB_DIR"] = previous
-    return sanitized
+    return StoredForm(sanitized)
+
+
+def holds(row: Dict[str, Any], entry: Entry) -> bool:
+    """Whether this store row holds this entry's current text.
+
+    The one answer to materialisation, and never asked with identity: a row
+    that carries the id the ledger recorded proves only that something once
+    landed for this memory, which is exactly what a refused update leaves
+    behind. Both sides go through the store's own form, so the rewriting it
+    applies is modelled on each of them.
+    """
+    return stored_form(row.get("content") or "") == stored_form(entry.content)
+
+
+def refused_for(refusals: Dict[str, Any], entry: Entry) -> Dict[str, Any]:
+    """What the store refused for this exact memory, as the last run recorded it."""
+    record = refusals.get(entry.key)
+    if isinstance(record, dict) and record.get("content_sha") == entry.content_sha:
+        return record
+    paths = set(entry.metadata.get("source_paths") or [])
+    for candidate in refusals.values():
+        if not isinstance(candidate, dict):
+            continue
+        if candidate.get("content_sha") != entry.content_sha:
+            continue
+        if paths & set(candidate.get("source_paths") or []):
+            return candidate
+    return {}
 
 
 def check(name: str, passed: bool, detail: str) -> Dict[str, Any]:
@@ -1840,48 +1977,48 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
     # path that row still records, so a store that permanently fails to hold a
     # memory can read as a clean migration. This asks the question directly,
     # per derived memory, and answers it from the bank rather than the report.
-    # Landed means the bank holds THIS text. A row that merely carries the id
-    # the ledger recorded proves only that something once landed for this
-    # memory, which is exactly what a refused update leaves behind, so the
-    # answer is read from content and never from identity - but the text
-    # compared is the form the store would actually hold, because the library
-    # rewrites oversized and encoded content before it writes.
-    # What separates the three ways a memory can be absent is the ledger's own
-    # digest: it recorded this exact text and the store lacks it (the tool
-    # believed a write landed that did not), it recorded different text (the
-    # source has moved on since the last migration), or it recorded nothing
-    # at all (this memory has never been written).
+    # Whether the bank holds a memory is `holds`, and nothing else. What
+    # separates the ways it can be absent is read, never inferred: the last run
+    # recorded what the store refused it, and a refusal is a hard failure a
+    # re-run cannot clear, while a source that has simply moved on since the
+    # last write is a notice the next run resolves.
+    refused_by_lane = {lane: read_refusals(data_dir, lane) for lane in lanes}
     unwritten = []
+    stale = []
     for entry in entries:
         rows = live_by_lane.get(entry.lane) or []
         record = ledger_record_for(ledgers.get(entry.lane) or {}, entry)[1]
         name = entry.metadata.get("source_name") or entry.key
-        landed = [row for row in rows if normalize(row["content"]) == normalize(entry.content)]
-        if not landed:
-            held = normalize(stored_form(entry.content))
-            landed = [row for row in rows if normalize(row["content"]) == held]
+        landed = [row for row in rows if holds(row, entry)]
         if landed:
             if not any(row["channel_id"] == entry.channel_id for row in landed):
                 unwritten.append(
                     f"{entry.lane}: {name} is held under channel {landed[0]['channel_id']!r} "
                     f"but this run derives it for {entry.channel_id!r}")
             continue
-        if record.get("content_sha") == entry.content_sha:
+        refusal = refused_for(refused_by_lane.get(entry.lane) or {}, entry)
+        if refusal:
+            unwritten.append(
+                f"{entry.lane}: {name} was REFUSED by the store "
+                f"({refusal.get('code', 'unknown')}); re-running write is refused again, "
+                f"so this one needs a person")
+        elif record.get("content_sha") == entry.content_sha:
             unwritten.append(
                 f"{entry.lane}: {name} is recorded in the ledger as written, "
                 f"but the store does not hold it")
-        elif record:
-            unwritten.append(
-                f"{entry.lane}: {name} has changed since the last migration wrote it "
-                f"and the change has not landed; re-run write")
         else:
-            unwritten.append(f"{entry.lane}: {name} is in no live memory of that lane")
+            stale.append(
+                f"{entry.lane}: {name} has changed since the last migration wrote it; "
+                f"re-run write")
     checks.append(check(
         "15 every derived memory landed in the store",
         not unwritten,
-        f"{len(unwritten)} derived memories were refused or never written: {'; '.join(unwritten[:5])}"
-        if unwritten else
-        f"all {len(entries)} derived memories are live in their own lane and channel"))
+        (f"{len(unwritten)} derived memories were refused or never written: "
+         f"{'; '.join(unwritten[:5])}" if unwritten else
+         f"all {len(entries) - len(stale)} derived memories are live in their own lane "
+         f"and channel")
+        + (f"; {len(stale)} sources have moved on since the last write and are "
+           f"listed below" if stale else "")))
 
     review = []
     for lane in lanes:
@@ -1899,6 +2036,7 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
         "checks": checks,
         "near_duplicate_review": review,
         "orphaned_ledger_keys": orphaned,
+        "stale_sources": stale,
         "hermes": snapshot,
         "hermes_run_record": read_hermes_record(data_dir),
         "lanes": lanes,
@@ -2228,6 +2366,8 @@ def render_checks(result: Dict[str, Any]) -> bool:
     for orphan in result.get("orphaned_ledger_keys") or []:
         print(f"ORPHANED {orphan['lane']}/{orphan['key']} "
               f"(memory {orphan['memory_id']} kept; retiring it is a deliberate act)")
+    for item in result.get("stale_sources") or []:
+        print(f"STALE {item}")
     review = result["near_duplicate_review"]
     if review:
         print(f"\nnear-duplicate review ({len(review)} pairs at cosine >= {NEAR_DUPLICATE_COSINE}, "

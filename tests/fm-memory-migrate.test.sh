@@ -337,6 +337,18 @@ print(sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True).execute(
 PY
 }
 
+# The text a lane bank actually holds for the memory carrying this phrase.
+stored_row_text() {  # <data-dir> <lane> <needle>
+  fm_migrate_assert_scratch "$1"
+  python3 - "$1/banks/lane-$2/mnemosyne.db" "$3" <<'PY'
+import sqlite3, sys
+row = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True).execute(
+    "SELECT content FROM working_memory WHERE source LIKE 'claude-automemory%'"
+    " AND metadata_json LIKE ?", (f"%{sys.argv[2]}%",)).fetchone()
+print(row[0] if row else "")
+PY
+}
+
 # The text of one lane's migrated memory, read back from the bank it landed in.
 migrated_content() {  # <data-dir> <lane>
   fm_migrate_assert_scratch "$1"
@@ -1189,8 +1201,15 @@ MD
     *) fail "an edited source file broke the count reconciliation: $out" ;;
   esac
   case "$out" in
-    *"FAIL  15"*"has changed since the last migration wrote it"*) ;;
-    *) fail "check 15 did not report that the source has drifted from the store: $out" ;;
+    *"PASS  15"*) ;;
+    *) fail "a source edited since the last write was reported as a failed write: $out" ;;
+  esac
+  case "$out" in
+    *"STALE"*"has changed since the last migration wrote it; re-run write"*) ;;
+    *) fail "the drifted source was not reported as a visible stale notice: $out" ;;
+  esac
+  case "$out" in
+    *REFUSED*) fail "a source that merely drifted was reported as a refused write: $out" ;;
   esac
   # A file that genuinely goes away must still be reported, and must not be
   # confused with the edited one that is still there.
@@ -1211,7 +1230,7 @@ MD
 
 test_verify_catches_an_update_the_store_refused() {
   skip_without_library "the refused-update test" && return 0
-  local home src data out
+  local home src data out detail
   home=$(make_home refusedupdate-home)
   src=$(make_sources refusedupdate-src)
   data=$(make_lanes refusedupdate-data products fleet-infra)
@@ -1244,9 +1263,13 @@ MD
   out=$(fm_migrate "$home" "$src" "$data" verify --json) || true
   [ "$(json_field "$out" "next(c['pass'] for c in d['checks'] if c['check'].startswith('15 '))")" \
     = "False" ] || fail "check 15 read a refused update as a clean migration: $out"
-  case "$(json_field "$out" "next(c['detail'] for c in d['checks'] if c['check'].startswith('15 '))")" in
-    *"Flags release lane"*"has changed since the last migration wrote it"*) ;;
-    *) fail "check 15 did not name the memory whose text the store failed to update: $out" ;;
+  detail=$(json_field "$out" "next(c['detail'] for c in d['checks'] if c['check'].startswith('15 '))")
+  case "$detail" in
+    *"Flags release lane was REFUSED by the store"*"needs a person"*) ;;
+    *) fail "check 15 did not report the refusal with advice a person can act on: $detail" ;;
+  esac
+  case "$detail" in
+    *"re-run write"*) fail "a refused write was given the advice that re-running fixes it: $detail" ;;
   esac
   pass "fm-memory-migrate: an update the store refused fails verification"
 }
@@ -1419,8 +1442,11 @@ test_verify_catches_a_memory_the_store_refused() {
     *) fail "a refused write did not fail its own check: $out" ;;
   esac
   case "$out" in
-    *"is in no live memory of that lane"*) ;;
-    *) fail "check 15 did not say which memory never landed: $out" ;;
+    *"was REFUSED by the store"*"needs a person"*) ;;
+    *) fail "check 15 did not say which memory the store refused: $out" ;;
+  esac
+  case "$out" in
+    *STALE*) fail "a refused write was reported as a source that merely drifted: $out" ;;
   esac
   pass "fm-memory-migrate: a memory the store refused fails verification on its own check"
 }
@@ -1462,28 +1488,6 @@ MD
   pass "fm-memory-migrate: two successive edits verify as history kept"
 }
 
-test_verify_accepts_content_the_store_rewrites_to_a_blob() {
-  skip_without_library "the sanitized-content test" && return 0
-  local home src data out
-  home=$(make_home blob-home)
-  src=$(make_sources blob-src)
-  data=$(make_lanes blob-data products fleet-infra)
-  # The store rewrites content past its size cap into a content-addressed
-  # stub before it writes, so the row legitimately holds something other than
-  # the file's own text. That is a migration that landed, not one that failed.
-  {
-    printf '%s\n' '---' 'name: Captured build log' 'description: the full log of a failing build' 'type: reference' '---'
-    python3 -c "print('The build log line that repeats and repeats. ' * 30000)"
-  } > "$src/-Users-x-Coding-flags/memory/build_log.md"
-  fm_migrate "$home" "$src" "$data" write >/dev/null || true
-  out=$(fm_migrate "$home" "$src" "$data" verify) \
-    || fail "verification failed over content the store rewrote to a blob: $out"
-  case "$out" in
-    *"FAIL  15"*) fail "a memory the store rewrote to a blob was read as never landed: $out" ;;
-  esac
-  pass "fm-memory-migrate: content the store rewrites to a blob still counts as landed"
-}
-
 test_verify_catches_a_memory_the_ledger_claims_but_the_store_lost() {
   skip_without_library "the lost-write test" && return 0
   local home src data out
@@ -1509,6 +1513,65 @@ PY
     *) fail "check 15 did not report the lost memory in its own words: $out" ;;
   esac
   pass "fm-memory-migrate: a memory the ledger claims but the store lost fails verification"
+}
+
+test_the_stored_form_matches_what_the_bridge_really_stores() {
+  skip_without_library "the stored-form round-trip test" && return 0
+  local home src data out stored
+  home=$(make_home roundtrip-home)
+  src=$(make_sources roundtrip-src)
+  data=$(make_lanes roundtrip-data products fleet-infra)
+  # The store rewrites content past its size cap into a content-addressed
+  # stub, so what the bank holds is not what the file says. The tool models
+  # that with the store's own sanitizer; this drives the whole round trip and
+  # reads back what actually landed.
+  {
+    printf '%s\n' '---' 'name: Captured build log' 'description: the full log of a failing build' 'type: reference' '---'
+    python3 -c "print('The build log line that repeats and repeats. ' * 30000)"
+  } > "$src/-Users-x-Coding-flags/memory/build_log.md"
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  stored=$(stored_row_text "$data" products 'Captured build log')
+  case "$stored" in
+    *"The build log line that repeats"*)
+      fail "the store kept the raw text, so this no longer exercises the rewriting" ;;
+    "") fail "the oversized memory did not land in the bank at all" ;;
+    *) ;;
+  esac
+  # The tool's model of the stored form matched what the bridge really wrote,
+  # which is exactly what check 15 asserts memory by memory.
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed over content the store rewrote to a blob: $out"
+  case "$out" in
+    *"FAIL  15"*) fail "a memory the store rewrote to a blob was read as never landed: $out" ;;
+  esac
+  pass "fm-memory-migrate: the stored form matches what the bridge really stores"
+}
+
+test_store_content_refuses_comparison_with_raw_text() {
+  local out
+  # The stored form is its own type so that a consumer comparing derived text
+  # straight against store content fails at the moment of the mistake rather
+  # than quietly answering "no, that memory never landed".
+  out=$(python3 - "$MIGRATE" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_loader(
+    "fm_memory_migrate", importlib.machinery.SourceFileLoader("fm_memory_migrate", sys.argv[1]))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+held = module.stored_form("a memory the store holds")
+if held != module.stored_form("a memory the store holds"):
+    print("two stored forms of one text compared unequal")
+    raise SystemExit
+try:
+    held == "a memory the store holds"
+except TypeError:
+    print("guarded")
+else:
+    print("a raw string comparison was answered instead of refused")
+PY
+) || fail "the stored-form guard could not be exercised: $out"
+  [ "$out" = "guarded" ] || fail "store content did not refuse comparison with raw text: $out"
+  pass "fm-memory-migrate: store content refuses to be compared with raw derived text"
 }
 
 test_verify_passes_a_clean_migration() {
@@ -1655,7 +1718,8 @@ test_verify_catches_a_misrouted_row_whose_source_file_is_gone
 test_every_check_still_fails_on_the_defect_it_exists_to_catch
 test_an_edited_source_is_never_reported_as_an_orphan
 test_verify_catches_an_update_the_store_refused
-test_verify_accepts_content_the_store_rewrites_to_a_blob
+test_the_stored_form_matches_what_the_bridge_really_stores
+test_store_content_refuses_comparison_with_raw_text
 test_verify_catches_a_memory_the_ledger_claims_but_the_store_lost
 test_a_renamed_source_needs_no_second_migration_to_verify
 test_a_file_created_at_a_renamed_path_never_retires_the_renamed_memory

@@ -46,6 +46,7 @@ make_home() {  # <name>
 - flags [no-mistakes +yolo lane:products] - Flutter flags app (added 2026-07-29)
 - firstmate [no-mistakes +yolo lane:fleet-infra] - the fleet orchestrator (added 2026-08-18)
 - jy-cards [local-only +yolo] - registered with no lane token (added 2026-08-18)
+- widgets [no-mistakes +yolo lane:products] - a second project of the products lane (added 2026-08-20)
 MD
   printf '%s' "$home"
 }
@@ -1309,6 +1310,102 @@ test_another_directory_of_one_project_stays_one_memory() {
   pass "fm-memory-migrate: another directory of one project stays one memory"
 }
 
+test_a_fact_a_second_project_takes_up_moves_to_the_lane_channel() {
+  skip_without_library "the channel-move test" && return 0
+  local home src data out
+  home=$(make_home chanmove-home)
+  src=$(make_sources chanmove-src)
+  data=$(make_lanes chanmove-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # A second project of the same lane takes up the same fact, so the memory
+  # belongs to the lane-wide channel rather than to one project.
+  mkdir -p "$src/-Users-x-Coding-widgets/memory"
+  cp "$src/-Users-x-Coding-flags/memory/shared_fact.md" \
+     "$src/-Users-x-Coding-widgets/memory/shared_fact.md"
+  out=$(fm_migrate "$home" "$src" "$data" write --json) || true
+  case "$(json_field "$out" "json.dumps(d['refusals'])")" in
+    *duplicate_in_other_project*|*supersede_noop*)
+      # The store refuses to relocate content it already holds under another
+      # channel, so the move is reported rather than performed.
+      ;;
+    *)
+      [ "$(json_field "$out" "d['counts']['updated']")" = "1" ] \
+        || fail "the channel move neither landed as a supersession nor was refused: $out" ;;
+  esac
+  # Either way verify must say so rather than reporting a clean migration.
+  out=$(fm_migrate "$home" "$src" "$data" verify) || true
+  case "$out" in
+    *"PASS  15 every derived memory landed in the store"*) ;;
+    *"FAIL  15 every derived memory landed in the store"*)
+      case "$out" in
+        *"but this run derives it for '_lane'"*) ;;
+        *) fail "check 15 failed without naming the channel the memory is stuck under: $out" ;;
+      esac ;;
+    *) fail "verification did not report whether the derived memory landed: $out" ;;
+  esac
+  [ "$(bank_text_contains "$data" products 'wall-clock timestamps')" != "0" ] \
+    || fail "the memory was lost while its channel moved"
+  pass "fm-memory-migrate: a fact a second project takes up either moves channel or is reported"
+}
+
+test_verify_catches_a_memory_the_store_refused() {
+  skip_without_library "the refused-write test" && return 0
+  local home src data out
+  home=$(make_home refused-home)
+  src=$(make_sources refused-src)
+  # fleet-infra is deliberately never provisioned, so its memories cannot land.
+  data=$(make_lanes refused-data products)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    && fail "verification passed while a refused memory was missing from the store: $out"
+  case "$out" in
+    *"FAIL  15 every derived memory landed in the store"*) ;;
+    *) fail "a refused write did not fail its own check: $out" ;;
+  esac
+  case "$out" in
+    *"is in no live memory of that lane"*) ;;
+    *) fail "check 15 did not say which memory never landed: $out" ;;
+  esac
+  pass "fm-memory-migrate: a memory the store refused fails verification on its own check"
+}
+
+test_two_successive_edits_verify_as_history_kept() {
+  skip_without_library "the supersession-chain test" && return 0
+  local home src data out
+  home=$(make_home chain-home)
+  src=$(make_sources chain-src)
+  data=$(make_lanes chain-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  cat > "$src/-Users-x-Coding-flags/memory/project_release.md" <<'MD'
+---
+name: Flags release lane
+description: how the flags app reaches TestFlight
+type: project
+---
+The release lane runs fastlane beta from a dedicated worktree.
+MD
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # A second edit builds a chain A -> B -> C in which B is itself retired, so
+  # the row naming A is a retired one.
+  cat > "$src/-Users-x-Coding-flags/memory/project_release.md" <<'MD'
+---
+name: Flags release lane
+description: how the flags app reaches TestFlight
+type: project
+---
+The release lane runs fastlane beta from a dedicated worktree on a signed tag.
+MD
+  out=$(fm_migrate "$home" "$src" "$data" write --json) || true
+  [ "$(json_field "$out" "d['counts']['updated']")" = "1" ] \
+    || fail "the second edit did not supersede the memory the first one wrote: $out"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed after two successive edits of one source: $out"
+  case "$out" in
+    *"FAIL  7 clean lifecycle slate"*) fail "a supersession chain was read as a memory lost: $out" ;;
+  esac
+  pass "fm-memory-migrate: two successive edits verify as history kept"
+}
+
 test_verify_passes_a_clean_migration() {
   skip_without_library "the verification test" && return 0
   local home src data out
@@ -1456,5 +1553,8 @@ test_a_renamed_source_needs_no_second_migration_to_verify
 test_a_file_created_at_a_renamed_path_never_retires_the_renamed_memory
 test_a_renamed_and_edited_source_is_a_delete_plus_create
 test_another_directory_of_one_project_stays_one_memory
+test_a_fact_a_second_project_takes_up_moves_to_the_lane_channel
+test_verify_catches_a_memory_the_store_refused
+test_two_successive_edits_verify_as_history_kept
 test_verify_catches_a_memory_that_never_landed
 test_rollback_leaves_every_source_intact

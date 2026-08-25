@@ -95,6 +95,15 @@ WHAT THIS DELIBERATELY DOES NOT DO
   and retiring them stays a deliberate act. Both `write` and `verify` report
   them, and the count reconciliation reads the store's live rows as this run's
   memories PLUS those kept orphans rather than calling them a mismatch.
+  A fact a second project of the lane takes up moves to the lane-wide channel,
+  and one no longer shared moves back under its project. That is a deliberate
+  re-placement of a memory whose source is present and readable, so it is
+  written as a supersession and the row it replaces stays as history. It is not
+  the never-retire case, which is about a source that has VANISHED and stays
+  reported rather than retired. The store refuses to relocate content it
+  already holds under another channel, so where its dedupe reads the two texts
+  as one the move is reported as a refusal rather than performed - `verify`
+  fails check 15 and names the channel the memory is stuck under.
   A ledger record and a source file are the same memory when their paths
   intersect OR their text is identical: an edit keeps the paths, a rename
   keeps the text. A file that is renamed AND edited between two runs matches
@@ -1145,6 +1154,26 @@ def same_memory(record: Any, entry: Entry) -> bool:
     return bool(record.get("content_sha")) and record["content_sha"] == entry.content_sha
 
 
+def sources_readable(entry: Entry) -> bool:
+    """Whether every file this memory is derived from is on disk right now.
+
+    The never-retire rule exists because a missing file is as likely to be a
+    rename or an unmounted directory as a deletion. Nothing that supersedes a
+    memory may run on that uncertainty, so a re-placement is only ever offered
+    when every source this memory came from can be read this instant.
+    """
+    paths = entry.metadata.get("source_paths") or []
+    if not paths:
+        return False
+    for path in paths:
+        try:
+            with open(path, "rb"):
+                pass
+        except OSError:
+            return False
+    return True
+
+
 def ledger_record_for(ledger: Dict[str, Any], entry: Entry) -> Tuple[Optional[str], Dict[str, Any]]:
     """(key, record) for the row this entry's memory landed in.
 
@@ -1230,9 +1259,19 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
                     previous_key, record = ledger_record_for(ledger, entry)
                     previous_id = record.get("memory_id")
                     changed = bool(previous_id) and record.get("content_sha") != entry.content_sha
+                    # A fact a second project of this lane has taken up belongs
+                    # to the lane-wide channel, and one no longer shared belongs
+                    # back under its project. The source is right there and
+                    # readable, so this is a deliberate re-placement of a memory
+                    # that exists, not a guess about one that might be gone: the
+                    # never-retire rule governs vanished sources and is untouched.
+                    moved = (bool(previous_id)
+                             and bool(record.get("channel"))
+                             and record["channel"] != entry.channel_id
+                             and sources_readable(entry))
                     ok = False
                     payload: Dict[str, Any] = {}
-                    if changed:
+                    if changed or moved:
                         ok, payload = session.call_tool(
                             "memory_supersede", dict(write_arguments(entry), memory_id=previous_id))
                         if ok:
@@ -1265,6 +1304,7 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
                         ledger[entry.key] = {
                             "memory_id": memory_id,
                             "content_sha": entry.content_sha,
+                            "channel": entry.channel_id,
                             "source_paths": entry.metadata["source_paths"],
                         }
                 except (MigrateError, OSError) as exc:
@@ -1644,8 +1684,31 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
     # so what must hold is not "nothing is retired" but "nothing was retired
     # without something live taking its place" - the shape a lost memory would
     # actually have.
-    replaced = {row["metadata"].get("supersedes") for row in live_rows}
-    orphan_retired = [row["id"] for row in all_rows if is_retired(row) and row["id"] not in replaced]
+    # A second edit of one file builds a chain A -> B -> C in which B is itself
+    # retired, so the only row naming A is a retired one. Following the chain is
+    # what tells "replaced twice" from "replaced by nothing", which is the loss
+    # this check exists to catch.
+    successor = {}
+    for row in all_rows:
+        replaces = row["metadata"].get("supersedes")
+        if replaces:
+            successor[replaces] = row["id"]
+    by_id = {row["id"]: row for row in all_rows}
+    orphan_retired = []
+    for row in all_rows:
+        if not is_retired(row):
+            continue
+        seen_ids = {row["id"]}
+        current = successor.get(row["id"])
+        while current and current not in seen_ids:
+            seen_ids.add(current)
+            replacement = by_id.get(current)
+            if replacement is None or not is_retired(replacement):
+                break
+            current = successor.get(current)
+        replacement = by_id.get(current) if current else None
+        if replacement is None or is_retired(replacement):
+            orphan_retired.append(row["id"])
     retired_count = len(all_rows) - len(live_rows)
     checks.append(check(
         "7 clean lifecycle slate",
@@ -1738,6 +1801,34 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
         not broken,
         f"{len(broken)} source files could not be read: {', '.join(sorted(broken)[:5])}" if broken
         else f"all {len(manifest)} source files are intact and were only ever read"))
+
+    # 15 nothing derived was refused and left unwritten. A refusal is the one
+    # failure the rest of this checklist can absorb: the count reconciles
+    # against the row that is still there and the provenance check excuses the
+    # path that row still records, so a store that permanently fails to hold a
+    # memory can read as a clean migration. This asks the question directly,
+    # per derived memory, and answers it from the bank rather than the report.
+    unwritten = []
+    for entry in entries:
+        rows = live_by_lane.get(entry.lane) or []
+        record = ledger_record_for(ledgers.get(entry.lane) or {}, entry)[1]
+        wanted = normalize(entry.content)
+        landed = [row for row in rows
+                  if normalize(row["content"]) == wanted
+                  or (record.get("memory_id") and row["id"] == record["memory_id"])]
+        name = entry.metadata.get("source_name") or entry.key
+        if not landed:
+            unwritten.append(f"{entry.lane}: {name} is in no live memory of that lane")
+        elif not any(row["channel_id"] == entry.channel_id for row in landed):
+            unwritten.append(
+                f"{entry.lane}: {name} is held under channel {landed[0]['channel_id']!r} "
+                f"but this run derives it for {entry.channel_id!r}")
+    checks.append(check(
+        "15 every derived memory landed in the store",
+        not unwritten,
+        f"{len(unwritten)} derived memories were refused or never written: {'; '.join(unwritten[:5])}"
+        if unwritten else
+        f"all {len(entries)} derived memories are live in their own lane and channel"))
 
     review = []
     for lane in lanes:

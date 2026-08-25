@@ -395,7 +395,22 @@ def content_digest(text: str) -> str:
     return hashlib.sha256(normalize(text).encode("utf-8")).hexdigest()
 
 
+def exact_digest(text: str) -> str:
+    """The digest of the text exactly as it is stored.
+
+    The ledger asks whether the store already holds THIS memory, and the
+    store's own dedupe compares content byte for byte. A normalized digest
+    would call a whitespace-only or case-only edit unchanged, skip the
+    supersession, and leave the store holding two live rows for one file.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
+
+# Metadata whose values are lifted out of the file's body rather than its
+# frontmatter, and which therefore carry whatever the body carries.
+BODY_DERIVED_FIELDS = ("links",)
 
 
 def wikilinks(body: str) -> List[str]:
@@ -485,6 +500,35 @@ def canonical_statements(home: Path) -> Dict[str, str]:
             elif heading is not None:
                 body.append(line)
     return out
+
+
+PARTIAL_OVERLAP_RATIO = 0.6
+OVERLAP_WORD_RE = re.compile(r"[a-z0-9]{4,}")
+
+
+def statement_words(text: str) -> set:
+    return set(OVERLAP_WORD_RE.findall(normalize(text)))
+
+
+def partial_overlap(body: str, statements: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """How much of a memory a canonical section already says, short of all of it.
+
+    An exact match is the pointer's fact and the memory is dropped. Anything
+    less is reported and kept: dropping on a fuzzy signal loses whatever the
+    memory says that the canonical file does not.
+    """
+    words = statement_words(body)
+    if len(words) < 5:
+        return None
+    best: Optional[Dict[str, Any]] = None
+    for statement, owner in statements.items():
+        other = statement_words(statement)
+        if not other:
+            continue
+        ratio = len(words & other) / len(words)
+        if ratio >= PARTIAL_OVERLAP_RATIO and (best is None or ratio > best["overlap"]):
+            best = {"owner": owner, "overlap": round(ratio, 2)}
+    return best
 
 
 # --- the migration plan ------------------------------------------------------
@@ -587,6 +631,7 @@ def build_entries(files: Sequence[SourceFile], home: Path) -> Dict[str, Any]:
     statements = canonical_statements(home)
     entries: List[Entry] = []
     dropped: List[Dict[str, str]] = []
+    overlaps: List[Dict[str, Any]] = []
     cross_lane: List[Dict[str, Any]] = []
 
     for sha, members in sorted(groups.items(), key=lambda kv: kv[1][0].path.as_posix()):
@@ -599,6 +644,13 @@ def build_entries(files: Sequence[SourceFile], home: Path) -> Dict[str, Any]:
                 "owner": owner,
             })
             continue
+        overlap = partial_overlap(primary.parsed.body, statements)
+        if overlap:
+            overlaps.append({
+                "name": primary.parsed.name,
+                "paths": ", ".join(str(m.path) for m in members),
+                **overlap,
+            })
         by_lane: Dict[str, List[SourceFile]] = {}
         for member in members:
             by_lane.setdefault(str(member.lane), []).append(member)
@@ -615,6 +667,7 @@ def build_entries(files: Sequence[SourceFile], home: Path) -> Dict[str, Any]:
     return {
         "entries": entries,
         "dropped_for_pointer": dropped,
+        "partial_pointer_overlaps": overlaps,
         "cross_lane_duplicates": cross_lane,
         "unrouted": unrouted,
         "groups": groups,
@@ -671,6 +724,14 @@ def make_entry(lane: str, members: Sequence[SourceFile], sha: str, cross_lane: b
         for field in ("description", "source_name"):
             if metadata.get(field) and safe_field(str(metadata[field])) is None:
                 metadata[field] = "[redacted: this field is itself credential-bearing]"
+        # Text lifted out of the refused body is held to that test too: a
+        # link target is body text, and D2 keeps the body out of the store.
+        for field in BODY_DERIVED_FIELDS:
+            kept = [v for v in metadata.get(field) or [] if safe_field(str(v))]
+            if kept:
+                metadata[field] = kept
+            else:
+                metadata.pop(field, None)
         content = credential_pointer_content(parsed, paths)
         notes.append("credential-bearing: pointer only, content not copied")
         return Entry(
@@ -683,7 +744,7 @@ def make_entry(lane: str, members: Sequence[SourceFile], sha: str, cross_lane: b
             veracity="stated",
             source=POINTER_SOURCE,
             metadata=metadata,
-            content_sha=content_digest(content),
+            content_sha=exact_digest(content),
             notes=notes,
         )
 
@@ -699,7 +760,7 @@ def make_entry(lane: str, members: Sequence[SourceFile], sha: str, cross_lane: b
         veracity=veracity,
         source=SOURCE,
         metadata=metadata,
-        content_sha=content_digest(content),
+        content_sha=exact_digest(content),
         notes=notes,
     )
 
@@ -1031,46 +1092,64 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
             continue
 
         lane_counts = {"written": 0, "skipped_duplicate": 0, "updated": 0, "refused": 0}
+        lane_state = "ready"
+        lane_detail = ""
         try:
-            for entry in lane_entries:
-                record = ledger.get(entry.key) or {}
-                previous_id = record.get("memory_id")
-                changed = bool(previous_id) and record.get("content_sha") != entry.content_sha
-                ok = False
-                payload: Dict[str, Any] = {}
-                if changed:
-                    ok, payload = session.call_tool(
-                        "memory_supersede", dict(write_arguments(entry), memory_id=previous_id))
-                    if ok:
-                        lane_counts["updated"] += 1
-                if not ok:
-                    # The ledger is derived, so a supersession it asked for that
-                    # the store refused - the row is gone, or was already
-                    # retired - falls back to writing the memory plainly rather
-                    # than losing it to a record that no longer describes reality.
-                    ok, payload = session.call_tool("memory_remember", write_arguments(entry))
-                    if ok:
-                        if payload.get("created"):
-                            lane_counts["written"] += 1
-                        else:
-                            lane_counts["skipped_duplicate"] += 1
-                if not ok:
-                    lane_counts["refused"] += 1
-                    error = payload.get("error") or {}
-                    refusals.append({
-                        "key": entry.key,
-                        "lane": lane,
-                        "code": error.get("code", "unknown"),
-                        "message": error.get("message", json.dumps(payload)),
-                    })
-                    continue
-                memory_id = payload.get("id")
-                if memory_id:
-                    ledger[entry.key] = {
-                        "memory_id": memory_id,
-                        "content_sha": entry.content_sha,
-                        "source_paths": entry.metadata["source_paths"],
-                    }
+            for index, entry in enumerate(lane_entries):
+                try:
+                    record = ledger.get(entry.key) or {}
+                    previous_id = record.get("memory_id")
+                    changed = bool(previous_id) and record.get("content_sha") != entry.content_sha
+                    ok = False
+                    payload: Dict[str, Any] = {}
+                    if changed:
+                        ok, payload = session.call_tool(
+                            "memory_supersede", dict(write_arguments(entry), memory_id=previous_id))
+                        if ok:
+                            lane_counts["updated"] += 1
+                    if not ok:
+                        # The ledger is derived, so a supersession it asked for that
+                        # the store refused - the row is gone, or was already
+                        # retired - falls back to writing the memory plainly rather
+                        # than losing it to a record that no longer describes reality.
+                        ok, payload = session.call_tool("memory_remember", write_arguments(entry))
+                        if ok:
+                            if payload.get("created"):
+                                lane_counts["written"] += 1
+                            else:
+                                lane_counts["skipped_duplicate"] += 1
+                    if not ok:
+                        lane_counts["refused"] += 1
+                        error = payload.get("error") or {}
+                        refusals.append({
+                            "key": entry.key,
+                            "lane": lane,
+                            "code": error.get("code", "unknown"),
+                            "message": error.get("message", json.dumps(payload)),
+                        })
+                        continue
+                    memory_id = payload.get("id")
+                    if memory_id:
+                        ledger[entry.key] = {
+                            "memory_id": memory_id,
+                            "content_sha": entry.content_sha,
+                            "source_paths": entry.metadata["source_paths"],
+                        }
+                except (MigrateError, OSError) as exc:
+                    # A bridge that dies mid-lane costs that lane's remaining
+                    # memories and no others. The writes that did land keep their
+                    # ledger entries and every other lane is still attempted,
+                    # because stopping the run here would leave how much of the
+                    # fleet is indexed unknowable.
+                    lane_state, lane_detail = "lost", str(exc)
+                    remaining = lane_entries[index:]
+                    lane_counts["refused"] += len(remaining)
+                    for lost in remaining:
+                        refusals.append({
+                            "key": lost.key, "lane": lane,
+                            "code": "lane_lost_midrun", "message": str(exc),
+                        })
+                    break
         finally:
             session.close()
 
@@ -1082,7 +1161,9 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
         floor_error = None
         if lane_counts["written"] or lane_counts["updated"]:
             floor_error = record_floor(data_dir, lane, home)
-        report = {"lane": lane, "state": "ready", **lane_counts}
+        report = {"lane": lane, "state": lane_state, **lane_counts}
+        if lane_detail:
+            report["detail"] = lane_detail
         if floor_error:
             report["row_floor_error"] = floor_error
         lane_reports.append(report)
@@ -1467,6 +1548,12 @@ def lane_containment(rows_by_lane: Dict[str, List[Dict[str, Any]]], data_dir: Pa
         terms = distinctive_terms(others, rows)
         if not terms:
             continue
+        # The probe reads the whole bank, which holds memories this migration
+        # never wrote - a phase-2 canonical pointer, say. A hit is a leak only
+        # when what came back IS another lane's migrated memory, so the test is
+        # that row's own identity and text, never the term alone.
+        foreign_ids = {r["id"] for r in others}
+        foreign_text = {normalize(r["content"]) for r in others}
         try:
             session = BridgeSession(lane, data_dir, home)
         except (MigrateError, OSError) as exc:
@@ -1480,8 +1567,13 @@ def lane_containment(rows_by_lane: Dict[str, List[Dict[str, Any]]], data_dir: Pa
                 if not ok:
                     continue
                 for result in payload.get("results") or []:
-                    if term in (result.get("content") or "").lower():
-                        leaks.append(f"{lane} returned another lane's term {term!r}")
+                    content = result.get("content") or ""
+                    if term not in content.lower():
+                        continue
+                    if result.get("id") in foreign_ids or normalize(content) in foreign_text:
+                        leaks.append(
+                            f"{lane} returned another lane's memory for term {term!r} "
+                            f"({result.get('id')})")
         finally:
             session.close()
     return check(
@@ -1568,6 +1660,10 @@ def render_plan(plan: Dict[str, Any], files: Sequence[SourceFile], problems: Seq
         print("\ndropped in favour of a canonical-file pointer:")
         for item in plan["dropped_for_pointer"]:
             print(f"  {item['name']} -> {item['owner']}")
+    if plan["partial_pointer_overlaps"]:
+        print("\npartly stated by a canonical file already - migrated anyway, reported for review:")
+        for item in plan["partial_pointer_overlaps"]:
+            print(f"  {item['name']} ~ {item['owner']} ({int(item['overlap'] * 100)}% of its words)")
     canonicalised = canonicalised_projects(files)
     if canonicalised:
         print("\ncanonicalised - one project assembled from several memory directories:")
@@ -1645,6 +1741,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "credential_pointers": [entry_json(e) for e in entries if e.source == POINTER_SOURCE],
                 "cross_lane_duplicates": plan["cross_lane_duplicates"],
                 "dropped_for_pointer": plan["dropped_for_pointer"],
+                "partial_pointer_overlaps": plan["partial_pointer_overlaps"],
                 "unrouted": [{"path": str(f.path), "dir": f.dir_name, "project": f.project} for f in unrouted],
                 "unrouted_fragments": unrouted_fragments(files),
                 "canonicalised_projects": canonicalised_projects(files),

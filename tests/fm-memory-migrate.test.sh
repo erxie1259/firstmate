@@ -208,6 +208,29 @@ print(h.hexdigest())
 PY
 }
 
+# Write a memory into a lane bank through the real bridge, so the bank holds a
+# memory this migration never wrote - which is what every lane bank actually
+# looks like once phase 2's pointers live in it.
+remember_into_lane() {  # <data-dir> <lane> <content>
+  fm_migrate_assert_scratch "$1"
+  python3 - "$MCP" "$1" "$2" "$3" <<'RPC' >/dev/null
+import json, subprocess, sys
+mcp, data_dir, lane, content = sys.argv[1:5]
+proc = subprocess.Popen([sys.executable, mcp, "serve", "--lane", lane, "--data-dir", data_dir],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        text=True)
+requests = [
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+     "params": {"name": "memory_remember",
+                "arguments": {"content": content, "memory_type": "context", "importance": 0.5}}},
+]
+out, _ = proc.communicate("\n".join(json.dumps(r) for r in requests) + "\n")
+answer = json.loads(out.strip().splitlines()[-1])
+sys.exit(0 if not answer["result"].get("isError") else 1)
+RPC
+}
+
 library_available() {
   python3 - <<'PY' >/dev/null 2>&1
 import importlib.util, sys
@@ -335,6 +358,49 @@ MD
   pass "fm-memory-migrate: split directories of an unregistered project are reported, not routed"
 }
 
+test_plan_keeps_a_refused_body_out_of_the_pointer_metadata() {
+  local home src out
+  home=$(make_home links-home)
+  src=$(make_sources links-src)
+  # A wikilink target is body text, and the body of this file is exactly what
+  # D2 refuses to publish; a safe target beside it must still survive.
+  cat > "$src/-Users-x-Coding-flags/memory/vault_notes.md" <<MD
+---
+name: Vault notes
+description: where the release vault lives
+type: user
+---
+The unlock value is $SECRET_LITERAL, recorded as [[$SECRET_LITERAL]]. See [[release-vault]].
+MD
+  out=$(fm_migrate "$home" "$src" "$TMP_ROOT/links-data" plan --json) || true
+  [ "$(printf '%s' "$out" | grep -c "$SECRET_LITERAL")" = "0" ] \
+    || fail "a link target lifted out of a refused body reproduced the secret literal"
+  [ "$(json_field "$out" "json.dumps(next(e['metadata'].get('links') for e in d['credential_pointers'] if e['metadata']['source_name']=='Vault notes'))")" \
+    = '["release-vault"]' ] \
+    || fail "the credential pointer did not keep exactly the safe link targets: $out"
+  pass "fm-memory-migrate: no text from a refused body reaches the pointer's metadata"
+}
+
+test_plan_reports_a_partial_canonical_overlap() {
+  local home src out
+  home=$(make_home overlap-home)
+  src=$(make_sources overlap-src)
+  cat > "$home/data/captain.md" <<'MD'
+# Captain preferences
+
+## Chat is for outcomes only
+
+Chat carries outcomes only, never routine acknowledgements, and never a status ping.
+MD
+  out=$(fm_migrate "$home" "$src" "$TMP_ROOT/overlap-data" plan --json) || true
+  [ "$(json_field "$out" "sum(1 for e in d['entries'] if e['metadata']['source_name']=='newer-dialect-memory')")" \
+    = "1" ] || fail "a memory a canonical file only partly states was dropped: $out"
+  [ "$(json_field "$out" "next(x['owner'] for x in d['partial_pointer_overlaps'])")" \
+    = "data/captain.md § Chat is for outcomes only" ] \
+    || fail "the partial overlap with a canonical section was not reported: $out"
+  pass "fm-memory-migrate: a partial canonical overlap is reported, never dropped"
+}
+
 # --- writing through the bridge ----------------------------------------------
 
 test_write_is_idempotent() {
@@ -426,6 +492,56 @@ test_one_unavailable_lane_costs_only_its_own_memories() {
   [ "$(json_field "$out" "next(r['lane'] for r in d['refusals'])")" = "fleet-infra" ] \
     || fail "the refusal does not name the lane that failed: $out"
   pass "fm-memory-migrate: a lane that cannot be opened costs its own memories and no others"
+}
+
+test_write_supersedes_an_edit_the_normalizer_would_fold_away() {
+  skip_without_library "the whitespace-only supersession test" && return 0
+  local home src data out live
+  home=$(make_home fold-home)
+  src=$(make_sources fold-src)
+  data=$(make_lanes fold-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # The stored text changes but its normalized form does not, which is exactly
+  # the edit a ledger keyed on normalized text would call unchanged.
+  cat > "$src/-Users-x-Coding-flags/memory/project_release.md" <<'MD'
+---
+name: Flags release lane
+description: how the flags app reaches TestFlight
+type: project
+---
+The release lane runs FASTLANE BETA from a clean   checkout of origin/main.
+MD
+  out=$(fm_migrate "$home" "$src" "$data" write --json) || true
+  [ "$(json_field "$out" "d['counts']['updated']")" = "1" ] \
+    || fail "an edit the normalizer folds away did not supersede its memory: $out"
+  live=$(live_migrated_rows "$data" products)
+  [ "$live" = "3" ] \
+    || fail "a case-only edit left $live live memories where 3 were expected"
+  pass "fm-memory-migrate: an edit that only changes case or spacing supersedes rather than duplicates"
+}
+
+test_verify_does_not_call_a_lane_local_memory_a_leak() {
+  skip_without_library "the lane-containment false-positive test" && return 0
+  local home src data out
+  home=$(make_home local-home)
+  src=$(make_sources local-src)
+  data=$(make_lanes local-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # A memory this migration never wrote, in the products bank, using a word
+  # that only the fleet-infra migration otherwise uses. It is this lane's own
+  # memory, so returning it is not a cross-lane leak.
+  remember_into_lane "$data" products \
+    "Release notes skip routine acknowledgements from the flags build log." \
+    || fail "could not seed a lane-local memory through the bridge"
+  out=$(fm_migrate "$home" "$src" "$data" verify) || true
+  case "$out" in
+    *"FAIL  9 lane containment"*) fail "a lane's own non-migrated memory was reported as a cross-lane leak: $out" ;;
+  esac
+  case "$out" in
+    *"PASS  9 lane containment"*) ;;
+    *) fail "verification did not report lane containment: $out" ;;
+  esac
+  pass "fm-memory-migrate: a lane's own memory sharing a word with another lane is not a leak"
 }
 
 test_verify_passes_a_clean_migration() {
@@ -542,7 +658,11 @@ test_plan_keeps_credentials_out_and_points_at_the_file
 test_plan_reports_split_directories_it_cannot_route
 test_plan_drops_what_a_canonical_file_already_states
 test_plan_parses_an_untyped_file
+test_plan_keeps_a_refused_body_out_of_the_pointer_metadata
+test_plan_reports_a_partial_canonical_overlap
 test_write_is_idempotent
+test_write_supersedes_an_edit_the_normalizer_would_fold_away
+test_verify_does_not_call_a_lane_local_memory_a_leak
 test_write_supersedes_a_changed_source
 test_write_never_touches_a_source_file
 test_write_keeps_the_secret_out_of_the_store

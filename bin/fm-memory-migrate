@@ -168,14 +168,29 @@ HERMES IS NEVER WRITTEN
   before/after equality over state someone else is writing proves anything.
 
 REFUSALS ARE RECORDED, NEVER INFERRED
-  A write the store refuses is written down beside the ledger, so `verify`
+  A write that did not land is written down beside the ledger, so `verify`
   reads what happened instead of guessing it from what landed. Nothing the
   bank holds distinguishes a write that was rejected from a source edited
-  since the last run, and the two need opposite advice: a refusal is a hard
-  failure that re-running cannot clear, and a source that has moved on is a
-  notice the next `write` resolves. Check 15 fails on the first and lists the
-  second under `STALE`, because a state that is not a failure must still be
-  impossible to miss.
+  since the last run, and the four ways a memory can be absent need four
+  different answers, so check 15 tells them apart by name.
+  A STORE REFUSAL is the store rejecting the write - `duplicate_in_other_
+  project`, `duplicate_is_retired`, `supersede_noop`. It is a hard failure,
+  and re-running is refused identically, so a person has to act.
+  A TRANSPORT FAILURE is this tool never getting to ask - `lane_unavailable`
+  when the bridge would not start, `lane_lost_midrun` when its pipe died. It
+  is a hard failure too, because the memory is not in the store, but running
+  `write` again is the whole fix and the message says so.
+  NEVER WRITTEN is no ledger record and nothing in the bank: this memory has
+  not been migrated at all. A hard failure, because a memory that never
+  landed reading as clean is the one thing this check exists to prevent.
+  STALE is the ledger recording this memory, the bank holding it under older
+  text, and the source having moved on. That is the ordinary state of a
+  mirror whose sources are edited by their owners, so it is a notice rather
+  than a failure - listed under `STALE` in normal output, because a state
+  that is not a failure must still be impossible to miss.
+  Recording a refusal never fabricates state: a lane whose bank was never
+  provisioned gets no ledger written for it, because a lane minted by its own
+  failure would then be read back as a bank that cannot be opened.
 
 EXIT STATUS
   0 everything routed is durable in the store and no source file changed;
@@ -202,10 +217,14 @@ from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Se
 BRIDGE = Path(__file__).resolve().parent / "fm-memory-mcp"
 PROJECT_MODE = Path(__file__).resolve().parent / "fm-project-mode.sh"
 LEDGER_FILENAME = "fm-memory-migrate.json"
+REFUSALS_FILENAME = "fm-memory-migrate-refusals.json"
 SESSION = "fm:memory-migrate"
 SOURCE = "claude-automemory"
 POINTER_SOURCE = "claude-automemory-pointer"
 MIGRATION_MARKER = "claude-automemory-phase3"
+# Codes this tool records because it never reached the store, as against the
+# ones the store itself issued. A re-run clears these and cannot clear those.
+TRANSPORT_CODES = ("lane_unavailable", "lane_lost_midrun")
 LANE_CHANNEL = "_lane"
 DEFAULT_SOURCE_ROOT = Path.home() / ".claude" / "projects"
 DEFAULT_DATA_DIR = Path.home() / ".hermes" / "mnemosyne" / "data"
@@ -1098,42 +1117,68 @@ def ledger_path(data_dir: Path, lane: str) -> Path:
 
 
 def read_ledger(data_dir: Path, lane: str) -> Dict[str, Any]:
-    return ledger_section(data_dir, lane, "memories")
-
-
-def read_refusals(data_dir: Path, lane: str) -> Dict[str, Any]:
-    """What the last run asked this lane's store for and was refused.
-
-    A refusal is recorded rather than inferred. Nothing the store leaves
-    behind distinguishes a write it rejected from a source edited since the
-    last run, and telling a captain to re-run a write that will be refused
-    again is worse than saying nothing.
-    """
-    return ledger_section(data_dir, lane, "refused")
-
-
-def ledger_section(data_dir: Path, lane: str, name: str) -> Dict[str, Any]:
     try:
         raw = json.loads(ledger_path(data_dir, lane).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    section = raw.get(name) if isinstance(raw, dict) else None
+    section = raw.get("memories") if isinstance(raw, dict) else None
     return section if isinstance(section, dict) else {}
 
 
-def write_ledger(data_dir: Path, lane: str, records: Dict[str, Any],
-                 refused: Optional[Dict[str, Any]] = None) -> None:
+def write_ledger(data_dir: Path, lane: str, records: Dict[str, Any]) -> None:
     path = ledger_path(data_dir, lane)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps({"version": 1, "memories": records, "refused": refused or {}},
+            json.dumps({"version": 1, "memories": records},
                        indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
     except OSError:
         # A ledger that cannot be written costs one duplicate on a later edit,
         # never a wrong answer, so it must not lose the writes that did land.
+        pass
+
+
+def refusals_path(data_dir: Path) -> Path:
+    return data_dir / REFUSALS_FILENAME
+
+
+def read_refusals(data_dir: Path, lane: str) -> Dict[str, Any]:
+    """What the last run asked this lane's store for and did not get.
+
+    A refusal is recorded rather than inferred. Nothing the store leaves
+    behind distinguishes a write it rejected from a source edited since the
+    last run, and telling a captain to re-run a write that will be refused
+    again is worse than saying nothing.
+    It lives beside the data dir rather than inside a bank, because the lane
+    that most needs a refusal recorded is the one whose bank would not open,
+    and writing a per-bank file for it would mint the bank directory as a side
+    effect of the failure it is reporting.
+    """
+    try:
+        raw = json.loads(refusals_path(data_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    lanes = raw.get("lanes") if isinstance(raw, dict) else None
+    section = lanes.get(lane) if isinstance(lanes, dict) else None
+    return section if isinstance(section, dict) else {}
+
+
+def write_refusals(data_dir: Path, by_lane: Dict[str, Dict[str, Any]]) -> None:
+    """Replace the recorded refusals with what this run actually got told.
+
+    Written whole rather than merged, so a lane that ran clean stops carrying
+    the refusal of a run that no longer describes it.
+    """
+    lanes = {lane: records for lane, records in by_lane.items() if records}
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        refusals_path(data_dir).write_text(
+            json.dumps({"version": 1, "lanes": lanes}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
         pass
 
 
@@ -1325,6 +1370,9 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
 
     counts = {"written": 0, "skipped_duplicate": 0, "updated": 0, "refused": 0}
     refusals: List[Dict[str, Any]] = []
+    # What this run asked for and did not get, per lane, recorded as fact so
+    # `verify` reads it rather than guessing from what landed.
+    refused_records: Dict[str, Dict[str, Any]] = {}
     lane_reports: List[Dict[str, Any]] = []
     orphaned: List[Dict[str, str]] = []
 
@@ -1344,15 +1392,13 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
                     "message": str(exc),
                     "source_paths": entry.metadata["source_paths"],
                 }
-            write_ledger(data_dir, lane, ledger, unavailable)
+            refused_records[lane] = unavailable
             lane_reports.append({"lane": lane, "state": "unavailable", "detail": str(exc)})
             continue
 
         lane_counts = {"written": 0, "skipped_duplicate": 0, "updated": 0, "refused": 0}
         lane_state = "ready"
         lane_detail = ""
-        # What this run asked for and was refused, recorded as fact beside the
-        # ledger so `verify` reads it rather than guessing from what landed.
         lane_refused: Dict[str, Any] = {}
         try:
             for index, entry in enumerate(lane_entries):
@@ -1434,7 +1480,8 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
             session.close()
 
         orphaned.extend(orphaned_ledger_keys(lane_entries, [lane], {lane: ledger}))
-        write_ledger(data_dir, lane, ledger, lane_refused)
+        write_ledger(data_dir, lane, ledger)
+        refused_records[lane] = lane_refused
 
         floor_error = None
         if lane_counts["written"] or lane_counts["updated"]:
@@ -1457,6 +1504,8 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
             continue
         for key, record in sorted(read_ledger(data_dir, lane).items()):
             orphaned.append({"lane": lane, "key": key, "memory_id": (record or {}).get("memory_id", "")})
+
+    write_refusals(data_dir, refused_records)
 
     return {
         "counts": counts,
@@ -1650,18 +1699,29 @@ def stored_form(text: str) -> StoredForm:
     only reads, so that write is pointed at a directory thrown away here: the
     stub is derived from the content's own digest and reads the same either
     way.
+    A sanitizer that will not load raises rather than falling back to the raw
+    text, the way the bridge refuses `library_unavailable` rather than writing
+    unsanitized: comparing raw text against a bank written with sanitization
+    would report every rewritten memory as never landed, and answering a
+    question this cannot answer is worse than saying it cannot.
     """
     try:
         from mnemosyne.core.content_sanitizer import sanitize_content  # noqa: PLC0415
-    except ImportError:
-        return StoredForm(text)
+    except ImportError as exc:
+        raise MigrateError(
+            "the store's sanitizer could not be loaded "
+            f"(mnemosyne.core.content_sanitizer: {exc}), so what the bank holds "
+            "cannot be compared") from exc
     previous = os.environ.get("MNEMOSYNE_BLOB_DIR")
     with tempfile.TemporaryDirectory(prefix="fm-memory-migrate-verify-") as scratch:
         os.environ["MNEMOSYNE_BLOB_DIR"] = scratch
         try:
             sanitized, _blob = sanitize_content(text)
-        except Exception:  # noqa: BLE001 - a sanitizer that cannot run proves nothing
-            sanitized = text
+        except Exception as exc:  # noqa: BLE001 - a sanitizer that cannot run proves nothing
+            raise MigrateError(
+                "the store's sanitizer could not be run "
+                f"(mnemosyne.core.content_sanitizer: {exc}), so what the bank "
+                "holds cannot be compared") from exc
         finally:
             if previous is None:
                 os.environ.pop("MNEMOSYNE_BLOB_DIR", None)
@@ -1978,47 +2038,62 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
     # memory can read as a clean migration. This asks the question directly,
     # per derived memory, and answers it from the bank rather than the report.
     # Whether the bank holds a memory is `holds`, and nothing else. What
-    # separates the ways it can be absent is read, never inferred: the last run
-    # recorded what the store refused it, and a refusal is a hard failure a
-    # re-run cannot clear, while a source that has simply moved on since the
-    # last write is a notice the next run resolves.
+    # separates the ways it can be absent is read, never inferred, and named
+    # four ways: a store refusal a re-run cannot clear, a transport failure a
+    # re-run does clear, a memory never migrated at all, and a source that has
+    # simply moved on since the last write. Only the last is a notice.
     refused_by_lane = {lane: read_refusals(data_dir, lane) for lane in lanes}
     unwritten = []
     stale = []
-    for entry in entries:
-        rows = live_by_lane.get(entry.lane) or []
-        record = ledger_record_for(ledgers.get(entry.lane) or {}, entry)[1]
-        name = entry.metadata.get("source_name") or entry.key
-        landed = [row for row in rows if holds(row, entry)]
-        if landed:
-            if not any(row["channel_id"] == entry.channel_id for row in landed):
+    try:
+        for entry in entries:
+            rows = live_by_lane.get(entry.lane) or []
+            record = ledger_record_for(ledgers.get(entry.lane) or {}, entry)[1]
+            name = entry.metadata.get("source_name") or entry.key
+            landed = [row for row in rows if holds(row, entry)]
+            if landed:
+                if not any(row["channel_id"] == entry.channel_id for row in landed):
+                    unwritten.append(
+                        f"{entry.lane}: {name} is held under channel "
+                        f"{landed[0]['channel_id']!r} but this run derives it for "
+                        f"{entry.channel_id!r}")
+                continue
+            refusal = refused_for(refused_by_lane.get(entry.lane) or {}, entry)
+            code = refusal.get("code", "unknown") if refusal else ""
+            if refusal and code in TRANSPORT_CODES:
                 unwritten.append(
-                    f"{entry.lane}: {name} is held under channel {landed[0]['channel_id']!r} "
-                    f"but this run derives it for {entry.channel_id!r}")
-            continue
-        refusal = refused_for(refused_by_lane.get(entry.lane) or {}, entry)
-        if refusal:
-            unwritten.append(
-                f"{entry.lane}: {name} was REFUSED by the store "
-                f"({refusal.get('code', 'unknown')}); re-running write is refused again, "
-                f"so this one needs a person")
-        elif record.get("content_sha") == entry.content_sha:
-            unwritten.append(
-                f"{entry.lane}: {name} is recorded in the ledger as written, "
-                f"but the store does not hold it")
-        else:
-            stale.append(
-                f"{entry.lane}: {name} has changed since the last migration wrote it; "
-                f"re-run write")
+                    f"{entry.lane}: {name} NEVER REACHED the store ({code}): the bridge "
+                    f"for this lane failed, so re-running write clears it")
+            elif refusal:
+                unwritten.append(
+                    f"{entry.lane}: {name} was REFUSED by the store "
+                    f"({code}); re-running write is refused again, "
+                    f"so this one needs a person")
+            elif not record:
+                unwritten.append(
+                    f"{entry.lane}: {name} has NEVER BEEN MIGRATED - no ledger record "
+                    f"and nothing in the bank holds it; run write")
+            elif record.get("content_sha") == entry.content_sha:
+                unwritten.append(
+                    f"{entry.lane}: {name} is recorded in the ledger as written, "
+                    f"but the store does not hold it")
+            else:
+                stale.append(
+                    f"{entry.lane}: {name} has changed since the last migration wrote it; "
+                    f"re-run write")
+        blocked = ""
+    except MigrateError as exc:
+        unwritten, stale, blocked = [], [], str(exc)
     checks.append(check(
         "15 every derived memory landed in the store",
-        not unwritten,
-        (f"{len(unwritten)} derived memories were refused or never written: "
-         f"{'; '.join(unwritten[:5])}" if unwritten else
-         f"all {len(entries) - len(stale)} derived memories are live in their own lane "
-         f"and channel")
-        + (f"; {len(stale)} sources have moved on since the last write and are "
-           f"listed below" if stale else "")))
+        not unwritten and not blocked,
+        blocked or
+        ((f"{len(unwritten)} derived memories were refused or never written: "
+          f"{'; '.join(unwritten[:5])}" if unwritten else
+          f"all {len(entries) - len(stale)} derived memories are live in their own lane "
+          f"and channel")
+         + (f"; {len(stale)} sources have moved on since the last write and are "
+            f"listed below" if stale else ""))))
 
     review = []
     for lane in lanes:

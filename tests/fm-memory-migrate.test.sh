@@ -1211,6 +1211,12 @@ MD
   case "$out" in
     *REFUSED*) fail "a source that merely drifted was reported as a refused write: $out" ;;
   esac
+  case "$out" in
+    *"NEVER REACHED the store"*) fail "a source that merely drifted was reported as a transport failure: $out" ;;
+  esac
+  case "$out" in
+    *"NEVER BEEN MIGRATED"*) fail "a source that merely drifted was reported as never migrated: $out" ;;
+  esac
   # A file that genuinely goes away must still be reported, and must not be
   # confused with the edited one that is still there.
   rm "$src/-Users-x-Coding-flags/memory/signing_notes.md"
@@ -1270,6 +1276,15 @@ MD
   esac
   case "$detail" in
     *"re-run write"*) fail "a refused write was given the advice that re-running fixes it: $detail" ;;
+  esac
+  case "$detail" in
+    *"NEVER REACHED the store"*) fail "a store refusal was reported as a transport failure: $detail" ;;
+  esac
+  case "$detail" in
+    *"NEVER BEEN MIGRATED"*) fail "a store refusal was reported as never migrated: $detail" ;;
+  esac
+  case "$detail" in
+    *"has changed since the last migration"*) fail "a store refusal was reported as a drifted source: $detail" ;;
   esac
   pass "fm-memory-migrate: an update the store refused fails verification"
 }
@@ -1427,28 +1442,106 @@ test_a_channel_move_is_refused_and_check_15_names_it() {
   pass "fm-memory-migrate: a channel move is refused and check 15 names the memory and both channels"
 }
 
-test_verify_catches_a_memory_the_store_refused() {
-  skip_without_library "the refused-write test" && return 0
+test_verify_catches_a_memory_the_bridge_never_reached() {
+  skip_without_library "the transport-failure test" && return 0
   local home src data out
-  home=$(make_home refused-home)
-  src=$(make_sources refused-src)
-  # fleet-infra is deliberately never provisioned, so its memories cannot land.
-  data=$(make_lanes refused-data products)
+  home=$(make_home transport-home)
+  src=$(make_sources transport-src)
+  # fleet-infra is deliberately never provisioned, so its bridge will not
+  # start and this run never gets to ask the store anything for that lane.
+  data=$(make_lanes transport-data products)
   fm_migrate "$home" "$src" "$data" write >/dev/null || true
   out=$(fm_migrate "$home" "$src" "$data" verify) \
-    && fail "verification passed while a refused memory was missing from the store: $out"
+    && fail "verification passed while a memory was missing from the store: $out"
   case "$out" in
     *"FAIL  15 every derived memory landed in the store"*) ;;
-    *) fail "a refused write did not fail its own check: $out" ;;
+    *) fail "a write that never reached the store did not fail its own check: $out" ;;
+  esac
+  # A bridge that would not start is the one failure a re-run does clear, so
+  # the advice must say that rather than sending a person to intervene.
+  case "$out" in
+    *"NEVER REACHED the store (lane_unavailable)"*"re-running write clears it"*) ;;
+    *) fail "check 15 did not report the failure as a transport failure a re-run clears: $out" ;;
   esac
   case "$out" in
-    *"was REFUSED by the store"*"needs a person"*) ;;
-    *) fail "check 15 did not say which memory the store refused: $out" ;;
+    *"REFUSED by the store"*) fail "a transport failure was reported as a store refusal: $out" ;;
   esac
   case "$out" in
-    *STALE*) fail "a refused write was reported as a source that merely drifted: $out" ;;
+    *"NEVER BEEN MIGRATED"*) fail "a transport failure was reported as never migrated: $out" ;;
   esac
-  pass "fm-memory-migrate: a memory the store refused fails verification on its own check"
+  case "$out" in
+    *STALE*) fail "a transport failure was reported as a source that merely drifted: $out" ;;
+  esac
+  pass "fm-memory-migrate: a memory the bridge never reached fails verification with re-run advice"
+}
+
+test_an_unprovisioned_lane_is_not_minted_by_its_own_failure() {
+  skip_without_library "the unprovisioned-lane test" && return 0
+  local home src data out
+  home=$(make_home unminted-home)
+  src=$(make_sources unminted-src)
+  # fleet-infra has no bank at all, so recording what it refused must not
+  # bring one into existence.
+  data=$(make_lanes unminted-data products)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # Nothing derives for fleet-infra any more, so the lane should have left no
+  # trace behind. A ledger written for it during the failure would keep it in
+  # verify's lane set forever as a bank that cannot be opened.
+  rm -rf "$src/-Users-x-Coding-firstmate"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "a lane that was never provisioned kept failing verification after it stopped deriving: $out"
+  case "$out" in
+    *fleet-infra*) fail "a lane that was never provisioned is still in verify's lane set: $out" ;;
+  esac
+  case "$out" in
+    *"PASS  1 count reconciliation"*) ;;
+    *) fail "count reconciliation did not pass once the unprovisioned lane stopped deriving: $out" ;;
+  esac
+  pass "fm-memory-migrate: a lane that was never provisioned is not minted by its own failure"
+}
+
+test_verify_refuses_to_compare_without_the_stores_sanitizer() {
+  skip_without_library "the missing-sanitizer test" && return 0
+  local home src data shim out
+  home=$(make_home nosanitizer-home)
+  src=$(make_sources nosanitizer-src)
+  data=$(make_lanes nosanitizer-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # The bank was written with the store's sanitization applied. A verify run
+  # that cannot load that sanitizer cannot tell a rewritten memory from a
+  # missing one, so it must say so rather than answer anyway.
+  shim="$TMP_ROOT/nosanitizer-shim"
+  mkdir -p "$shim"
+  cat > "$shim/sitecustomize.py" <<'PY'
+import sys
+
+
+class _Blocked:
+    def find_module(self, name, path=None):
+        if name == "mnemosyne.core.content_sanitizer":
+            raise ImportError("blocked for this test")
+        return None
+
+    def find_spec(self, name, path=None, target=None):
+        return self.find_module(name, path)
+
+
+sys.meta_path.insert(0, _Blocked())
+PY
+  out=$(PYTHONPATH="$shim" fm_migrate "$home" "$src" "$data" verify) \
+    && fail "verification passed while it could not model what the store holds: $out"
+  case "$out" in
+    *"FAIL  15 every derived memory landed in the store"*) ;;
+    *) fail "a verify that cannot load the store's sanitizer did not fail check 15: $out" ;;
+  esac
+  case "$out" in
+    *"sanitizer could not be loaded"*"cannot be compared"*) ;;
+    *) fail "check 15 did not name the library it could not load: $out" ;;
+  esac
+  case "$out" in
+    *"NEVER BEEN MIGRATED"*) fail "an unanswerable comparison was reported as a memory never migrated: $out" ;;
+  esac
+  pass "fm-memory-migrate: verify fails loudly when the store's sanitizer will not load"
 }
 
 test_two_successive_edits_verify_as_history_kept() {
@@ -1626,6 +1719,26 @@ MD
     *"FAIL  2 provenance completeness"*) ;;
     *) fail "verification did not fail provenance completeness: $out" ;;
   esac
+  # A memory with no ledger record at all has never been migrated, which is a
+  # different thing from one the store holds under older text, and check 15
+  # must fail on it in its own words rather than filing it as benign drift.
+  case "$out" in
+    *"FAIL  15 every derived memory landed in the store"*) ;;
+    *) fail "a memory that was never written passed its own check: $out" ;;
+  esac
+  case "$out" in
+    *"Late arrival has NEVER BEEN MIGRATED"*"run write"*) ;;
+    *) fail "check 15 did not say the memory had never been migrated: $out" ;;
+  esac
+  case "$out" in
+    *"REFUSED by the store"*) fail "a memory never written was reported as a store refusal: $out" ;;
+  esac
+  case "$out" in
+    *"NEVER REACHED the store"*) fail "a memory never written was reported as a transport failure: $out" ;;
+  esac
+  case "$out" in
+    *"has changed since the last migration"*) fail "a memory never written was reported as a drifted source: $out" ;;
+  esac
   pass "fm-memory-migrate: a memory that never landed fails verification"
 }
 
@@ -1726,7 +1839,9 @@ test_a_file_created_at_a_renamed_path_never_retires_the_renamed_memory
 test_a_renamed_and_edited_source_is_a_delete_plus_create
 test_another_directory_of_one_project_stays_one_memory
 test_a_channel_move_is_refused_and_check_15_names_it
-test_verify_catches_a_memory_the_store_refused
+test_verify_catches_a_memory_the_bridge_never_reached
+test_an_unprovisioned_lane_is_not_minted_by_its_own_failure
+test_verify_refuses_to_compare_without_the_stores_sanitizer
 test_two_successive_edits_verify_as_history_kept
 test_verify_catches_a_memory_that_never_landed
 test_rollback_leaves_every_source_intact

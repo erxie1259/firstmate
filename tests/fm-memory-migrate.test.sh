@@ -1162,8 +1162,9 @@ test_an_edited_source_is_never_reported_as_an_orphan() {
   src=$(make_sources edited-src)
   data=$(make_lanes edited-data products fleet-infra)
   fm_migrate "$home" "$src" "$data" write >/dev/null || true
-  # The file is edited but not migrated again. Its memory is the one the store
-  # already holds, and the file is right there on disk.
+  # The file is edited but not migrated again. Its source is right there on
+  # disk, so it is no orphan - but the store does not hold what the plan now
+  # derives, and check 15 says so rather than calling the migration clean.
   cat > "$src/-Users-x-Coding-flags/memory/project_release.md" <<'MD'
 ---
 name: Flags release lane
@@ -1172,26 +1173,78 @@ type: project
 ---
 The release lane now runs fastlane beta from a dedicated worktree.
 MD
-  out=$(fm_migrate "$home" "$src" "$data" verify) \
-    || fail "verification failed after a source file was edited but not re-migrated: $out"
+  out=$(fm_migrate "$home" "$src" "$data" verify) || true
   case "$out" in
     *ORPHANED*) fail "an edited source file was reported as an orphaned ledger key: $out" ;;
   esac
   case "$out" in
     *"kept whose source file is gone"*) fail "an edited source file was counted as a lost source: $out" ;;
   esac
+  case "$out" in
+    *"PASS  1 count reconciliation"*) ;;
+    *) fail "an edited source file broke the count reconciliation: $out" ;;
+  esac
+  case "$out" in
+    *"FAIL  15"*"holding different text than this run derives"*) ;;
+    *) fail "check 15 did not report that the store holds the pre-edit text: $out" ;;
+  esac
   # A file that genuinely goes away must still be reported, and must not be
   # confused with the edited one that is still there.
   rm "$src/-Users-x-Coding-flags/memory/signing_notes.md"
-  out=$(fm_migrate "$home" "$src" "$data" verify) \
-    || fail "verification failed after a source file disappeared alongside an edited one: $out"
+  out=$(fm_migrate "$home" "$src" "$data" verify) || true
   orphans=$(printf '%s\n' "$out" | grep -c ORPHANED)
   [ "$orphans" = "1" ] || fail "expected exactly one orphan, got $orphans: $out"
   case "$out" in
     *"ORPHANED products/"*signing_notes*) ;;
     *) fail "the orphan reported is not the source file that disappeared: $out" ;;
   esac
+  case "$out" in
+    *"PASS  1 count reconciliation"*) ;;
+    *) fail "the vanished source broke the count reconciliation: $out" ;;
+  esac
   pass "fm-memory-migrate: an edited source is an update, only a vanished one is an orphan"
+}
+
+test_verify_catches_an_update_the_store_refused() {
+  skip_without_library "the refused-update test" && return 0
+  local home src data out
+  home=$(make_home refusedupdate-home)
+  src=$(make_sources refusedupdate-src)
+  data=$(make_lanes refusedupdate-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  cat > "$src/-Users-x-Coding-flags/memory/project_release.md" <<'MD'
+---
+name: Flags release lane
+description: how the flags app reaches TestFlight
+type: project
+---
+The release lane now runs fastlane beta from a dedicated worktree.
+MD
+  out=$(fm_migrate "$home" "$src" "$data" write --json) || true
+  [ "$(json_field "$out" "d['counts']['updated']")" = "1" ] \
+    || fail "the edit did not supersede the memory it replaces: $out"
+  # Reverting the file asks the store to bring back text it has already
+  # retired, which it refuses. The memory then holds text this run does not
+  # derive, and the checklist must not read that as a clean migration.
+  cat > "$src/-Users-x-Coding-flags/memory/project_release.md" <<'MD'
+---
+name: Flags release lane
+description: how the flags app reaches TestFlight
+type: project
+---
+The release lane runs fastlane beta from a clean checkout of origin/main.
+MD
+  out=$(fm_migrate "$home" "$src" "$data" write --json) || true
+  [ "$(json_field "$out" "d['counts']['refused']")" = "1" ] \
+    || fail "the reverted source was not refused, so this no longer exercises a refused update: $out"
+  out=$(fm_migrate "$home" "$src" "$data" verify --json) || true
+  [ "$(json_field "$out" "next(c['pass'] for c in d['checks'] if c['check'].startswith('15 '))")" \
+    = "False" ] || fail "check 15 read a refused update as a clean migration: $out"
+  case "$(json_field "$out" "next(c['detail'] for c in d['checks'] if c['check'].startswith('15 '))")" in
+    *"Flags release lane"*"holding different text than this run derives"*) ;;
+    *) fail "check 15 did not name the memory whose text the store failed to update: $out" ;;
+  esac
+  pass "fm-memory-migrate: an update the store refused fails verification"
 }
 
 test_a_renamed_source_needs_no_second_migration_to_verify() {
@@ -1548,6 +1601,7 @@ test_verify_accepts_a_project_that_changed_lane
 test_verify_catches_a_misrouted_row_whose_source_file_is_gone
 test_every_check_still_fails_on_the_defect_it_exists_to_catch
 test_an_edited_source_is_never_reported_as_an_orphan
+test_verify_catches_an_update_the_store_refused
 test_a_renamed_source_needs_no_second_migration_to_verify
 test_a_file_created_at_a_renamed_path_never_retires_the_renamed_memory
 test_a_renamed_and_edited_source_is_a_delete_plus_create

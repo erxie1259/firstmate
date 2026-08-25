@@ -1807,21 +1807,31 @@ def verify(entries: Sequence[Entry], files: Sequence[SourceFile], data_dir: Path
     # path that row still records, so a store that permanently fails to hold a
     # memory can read as a clean migration. This asks the question directly,
     # per derived memory, and answers it from the bank rather than the report.
+    # Landed means the bank holds THIS text. A row that merely carries the id
+    # the ledger recorded proves only that something once landed for this
+    # memory, which is exactly what a refused update leaves behind, so the
+    # answer is read from content and never from identity. Form is compared
+    # loosely, so a store that re-spaces what it was given still counts.
     unwritten = []
     for entry in entries:
         rows = live_by_lane.get(entry.lane) or []
         record = ledger_record_for(ledgers.get(entry.lane) or {}, entry)[1]
         wanted = normalize(entry.content)
-        landed = [row for row in rows
-                  if normalize(row["content"]) == wanted
-                  or (record.get("memory_id") and row["id"] == record["memory_id"])]
+        landed = [row for row in rows if normalize(row["content"]) == wanted]
         name = entry.metadata.get("source_name") or entry.key
-        if not landed:
-            unwritten.append(f"{entry.lane}: {name} is in no live memory of that lane")
-        elif not any(row["channel_id"] == entry.channel_id for row in landed):
+        if landed:
+            if not any(row["channel_id"] == entry.channel_id for row in landed):
+                unwritten.append(
+                    f"{entry.lane}: {name} is held under channel {landed[0]['channel_id']!r} "
+                    f"but this run derives it for {entry.channel_id!r}")
+            continue
+        memory_id = record.get("memory_id")
+        if memory_id and any(row["id"] == memory_id for row in rows):
             unwritten.append(
-                f"{entry.lane}: {name} is held under channel {landed[0]['channel_id']!r} "
-                f"but this run derives it for {entry.channel_id!r}")
+                f"{entry.lane}: {name} is in the store holding different text "
+                f"than this run derives")
+        else:
+            unwritten.append(f"{entry.lane}: {name} is in no live memory of that lane")
     checks.append(check(
         "15 every derived memory landed in the store",
         not unwritten,

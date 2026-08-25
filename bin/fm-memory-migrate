@@ -1262,15 +1262,7 @@ def write_migration(entries: Sequence[Entry], data_dir: Path, home: Path) -> Dic
         finally:
             session.close()
 
-        current = {entry.key for entry in lane_entries}
-        claimed = {(ledger.get(key) or {}).get("memory_id") for key in current if key in ledger}
-        claimed.discard(None)
-        claimed.discard("")
-        for key in sorted(set(ledger) - current):
-            record = ledger[key] or {}
-            if record.get("memory_id") in claimed:
-                continue
-            orphaned.append({"lane": lane, "key": key, "memory_id": record.get("memory_id", "")})
+        orphaned.extend(orphaned_ledger_keys(lane_entries, [lane], {lane: ledger}))
         write_ledger(data_dir, lane, ledger)
 
         floor_error = None
@@ -1444,21 +1436,31 @@ def orphaned_ledger_keys(entries: Sequence[Entry], lanes: Sequence[str],
 
     They are reported, never retired: under mirror mode a missing file is as
     likely to be a rename or an unmounted directory as a deletion.
-    A key whose memory a key this run DID derive already claims is not one of
-    them. That is a renamed file: the ledger key is keyed on the file stem, so
-    the rename writes a second key, and the store's exact-content dedupe hands
-    back the same row. One memory under a new name is not a lost source.
+    Which record belongs to a memory is the same question `write` asks, and it
+    is answered the same way: by the source files the record carries. A key
+    this run derives nothing for is not an orphan when its record holds a file
+    this run still derives - an edited file re-keys, because the key carries a
+    digest of the memory's text - nor when the row it names is one a derived
+    entry already claims, which is what a rename leaves behind. What is left
+    is a record whose source files this run no longer sees at all.
     """
     out: List[Dict[str, str]] = []
     for lane in lanes:
         ledger = ledgers.get(lane) or {}
-        derived = {entry.key for entry in entries if entry.lane == lane}
-        claimed = {(ledger.get(key) or {}).get("memory_id") for key in derived if key in ledger}
-        claimed.discard(None)
-        claimed.discard("")
-        for key in sorted(set(ledger) - derived):
+        claimed_keys = set()
+        claimed_ids = set()
+        for entry in entries:
+            if entry.lane != lane:
+                continue
+            key, record = ledger_record_for(ledger, entry)
+            claimed_keys.add(entry.key)
+            if key:
+                claimed_keys.add(key)
+            if record.get("memory_id"):
+                claimed_ids.add(record["memory_id"])
+        for key in sorted(set(ledger) - claimed_keys):
             record = ledger[key] or {}
-            if record.get("memory_id") in claimed:
+            if record.get("memory_id") in claimed_ids:
                 continue
             out.append({"lane": lane, "key": key, "memory_id": record.get("memory_id", "")})
     return out

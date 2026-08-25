@@ -1154,6 +1154,45 @@ test_every_check_still_fails_on_the_defect_it_exists_to_catch() {
   pass "fm-memory-migrate: every check still fails on the defect it exists to catch"
 }
 
+test_an_edited_source_is_never_reported_as_an_orphan() {
+  skip_without_library "the edited-source orphan test" && return 0
+  local home src data out orphans
+  home=$(make_home edited-home)
+  src=$(make_sources edited-src)
+  data=$(make_lanes edited-data products fleet-infra)
+  fm_migrate "$home" "$src" "$data" write >/dev/null || true
+  # The file is edited but not migrated again. Its memory is the one the store
+  # already holds, and the file is right there on disk.
+  cat > "$src/-Users-x-Coding-flags/memory/project_release.md" <<'MD'
+---
+name: Flags release lane
+description: how the flags app reaches TestFlight
+type: project
+---
+The release lane now runs fastlane beta from a dedicated worktree.
+MD
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed after a source file was edited but not re-migrated: $out"
+  case "$out" in
+    *ORPHANED*) fail "an edited source file was reported as an orphaned ledger key: $out" ;;
+  esac
+  case "$out" in
+    *"kept whose source file is gone"*) fail "an edited source file was counted as a lost source: $out" ;;
+  esac
+  # A file that genuinely goes away must still be reported, and must not be
+  # confused with the edited one that is still there.
+  rm "$src/-Users-x-Coding-flags/memory/signing_notes.md"
+  out=$(fm_migrate "$home" "$src" "$data" verify) \
+    || fail "verification failed after a source file disappeared alongside an edited one: $out"
+  orphans=$(printf '%s\n' "$out" | grep -c ORPHANED)
+  [ "$orphans" = "1" ] || fail "expected exactly one orphan, got $orphans: $out"
+  case "$out" in
+    *"ORPHANED products/"*signing_notes*) ;;
+    *) fail "the orphan reported is not the source file that disappeared: $out" ;;
+  esac
+  pass "fm-memory-migrate: an edited source is an update, only a vanished one is an orphan"
+}
+
 test_verify_passes_a_clean_migration() {
   skip_without_library "the verification test" && return 0
   local home src data out
@@ -1296,5 +1335,6 @@ test_a_vanished_same_stem_sibling_never_retires_its_neighbour
 test_verify_accepts_a_project_that_changed_lane
 test_verify_catches_a_misrouted_row_whose_source_file_is_gone
 test_every_check_still_fails_on_the_defect_it_exists_to_catch
+test_an_edited_source_is_never_reported_as_an_orphan
 test_verify_catches_a_memory_that_never_landed
 test_rollback_leaves_every_source_intact

@@ -1756,26 +1756,41 @@ test_the_stored_form_matches_what_the_bridge_really_stores() {
 }
 
 test_store_content_refuses_comparison_with_raw_text() {
-  local out
+  local out with_library
   # The stored form is its own type so that a consumer comparing derived text
   # straight against store content fails at the moment of the mistake rather
   # than quietly answering "no, that memory never landed".
-  out=$(python3 - "$MIGRATE" <<'PY'
+  # The guard needs nothing from the store's library, so it is exercised on
+  # every runner; that stored_form() hands back that guarded type is checked
+  # wherever the sanitizer can actually load.
+  with_library=no
+  library_available && with_library=yes
+  out=$(python3 - "$MIGRATE" "$with_library" <<'PY'
 import importlib.util, sys
 spec = importlib.util.spec_from_loader(
     "fm_memory_migrate", importlib.machinery.SourceFileLoader("fm_memory_migrate", sys.argv[1]))
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-held = module.stored_form("a memory the store holds")
-if held != module.stored_form("a memory the store holds"):
+held = module.StoredForm("a memory the store holds")
+if held != module.StoredForm("a memory the store holds"):
     print("two stored forms of one text compared unequal")
     raise SystemExit
 try:
     held == "a memory the store holds"
 except TypeError:
-    print("guarded")
+    pass
 else:
     print("a raw string comparison was answered instead of refused")
+    raise SystemExit
+if sys.argv[2] == "yes":
+    try:
+        module.stored_form("a memory the store holds") == "a memory the store holds"
+    except TypeError:
+        pass
+    else:
+        print("stored_form handed back content a raw string comparison answered")
+        raise SystemExit
+print("guarded")
 PY
 ) || fail "the stored-form guard could not be exercised: $out"
   [ "$out" = "guarded" ] || fail "store content did not refuse comparison with raw text: $out"

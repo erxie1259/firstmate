@@ -1019,7 +1019,7 @@ crew_dispatch_validate() {
       return 0
     fi
   fi
-  err=$(jq -r '
+  err=$(jq -r --argjson seats "$seat_json" '
     def verified($h): ["claude","codex","opencode","pi","pi-signed","grok","kimi","cursor","muse"] | index($h);
     def effort_ok($h; $e):
       if $e == null then true
@@ -1103,7 +1103,7 @@ crew_dispatch_validate() {
         else empty
         end
     end
-  ' --argjson seats "$seat_json" "$file" 2>/dev/null || true)
+  ' "$file" 2>/dev/null || true)
   if [ -n "$err" ]; then
     echo "CREW_DISPATCH: invalid config/crew-dispatch.json - $err"
     return 0

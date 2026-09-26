@@ -266,6 +266,8 @@ A leading `~/` expands against the home directory and any other path must be abs
 Seat names use letters, digits, `.`, `_`, and `-`, starting with a letter or digit.
 `default` is refused as a name because an absent seat already means "launch with no seat environment".
 Two seats may never name the same directory, and a seat's two stores may never be the same directory: Codex OAuth refresh tokens rotate, so two consumers reading one credential file can log each other out.
+Configured store paths should not contain shell glob metacharacters such as `[a]`, because the duplicate-store check treats those characters as patterns and may refuse an otherwise distinct valid path.
+That limit can only refuse a valid path, never allow two seats to share one credential, so use store paths without glob metacharacters.
 
 Each store keeps its own credential, and each one is signed in once by hand:
 

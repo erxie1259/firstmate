@@ -108,7 +108,7 @@ test_list_shows_each_store_and_whether_it_is_signed_in() {
 }
 
 test_malformed_seat_files_are_refused_with_their_reason() {
-  local dir out status main alias_dir
+  local dir out status main alias_dir hardlink_dir
   dir=$(new_home malformed)
   main=$(store "$dir" main)
 
@@ -175,6 +175,16 @@ test_malformed_seat_files_are_refused_with_their_reason() {
   expect_code 1 "$status" "a symlinked credential must not authorize a seat"
   assert_contains "$out" "has no credential at" \
     "the refusal did not reject a credential symlink"
+
+  hardlink_dir="$dir/stores/hardlink-selene"
+  mkdir -p "$hardlink_dir"
+  ln "$main/auth.json" "$hardlink_dir/auth.json"
+  seats "$dir" "main $main" "selene $hardlink_dir"
+  out=$(run_seat "$dir" check)
+  status=$?
+  expect_code 1 "$status" "hard-linked credentials must not authorize two seats"
+  assert_contains "$out" "shares a credential inode" \
+    "the refusal did not identify the shared credential inode"
   pass "every malformed seat file is refused with the concrete reason, never parsed loosely"
 }
 
@@ -338,6 +348,32 @@ test_mirror_shares_config_and_never_touches_a_credential() {
   pass "mirror shares only credential-free config, is idempotent, and refuses to clobber existing content"
 }
 
+test_pi_mirror_uses_only_the_required_entries() {
+  local dir out status source target
+  dir=$(new_home pimirror)
+  source="$dir/primary-pi"
+  target="$dir/stores/selene-pi"
+  mkdir -p "$source/extensions" "$source/skills" "$source/themes" "$source/prompts" "$source/bin" "$source/npm"
+  printf '{}\n' > "$source/settings.json"
+  printf '{}\n' > "$source/models.json"
+  printf 'PRIMARY-TOKEN\n' > "$source/auth.json"
+  seats "$dir" "selene $dir/stores/selene-codex $target"
+
+  out=$(FM_CODEX_SEAT_PRIMARY_PI_DIR="$source" run_seat "$dir" mirror selene pi)
+  status=$?
+  expect_code 0 "$status" "mirroring a Pi store should succeed"
+  assert_contains "$out" "linked settings.json" "the Pi mirror did not share settings.json"
+  assert_contains "$out" "linked models.json" "the Pi mirror did not share models.json"
+  assert_contains "$out" "linked extensions" "the Pi mirror did not share extensions"
+  assert_contains "$out" "linked skills" "the Pi mirror did not share skills"
+  assert_contains "$out" "linked themes" "the Pi mirror did not share themes"
+  assert_absent "$target/prompts" "the Pi mirror must not share prompts"
+  assert_absent "$target/bin" "the Pi mirror must not share bin"
+  assert_absent "$target/npm" "the Pi mirror must not share npm"
+  assert_absent "$target/auth.json" "the Pi mirror must never create or copy a credential"
+  pass "the Pi mirror shares exactly the five required credential-free entries"
+}
+
 test_mirror_refuses_a_store_that_is_the_primary_store() {
   local dir out status source
   dir=$(new_home mirrorself)
@@ -361,6 +397,7 @@ test_a_store_without_a_credential_is_never_offered_for_a_launch
 test_quota_reads_each_seat_against_its_own_store
 test_quota_json_wraps_each_seat_report
 test_mirror_shares_config_and_never_touches_a_credential
+test_pi_mirror_uses_only_the_required_entries
 test_mirror_refuses_a_store_that_is_the_primary_store
 
 echo "# all fm-codex-seats tests passed"

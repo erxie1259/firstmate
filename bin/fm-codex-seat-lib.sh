@@ -42,7 +42,9 @@ FM_CODEX_SEAT_PI_ENV=PI_CODING_AGENT_DIR
 # including every credential file and every per-seat mutable record (sessions,
 # caches, trust decisions, logs), stays the seat's own.
 FM_CODEX_SEAT_CODEX_MIRROR='config.toml AGENTS.md agents hooks hooks.json plugins rules skills'
-FM_CODEX_SEAT_PI_MIRROR='settings.json models.json extensions skills themes prompts bin npm'
+FM_CODEX_SEAT_PI_MIRROR='settings.json models.json extensions skills themes'
+# Relative resource paths configured in settings.json are deliberately not
+# mirrored; a seat that needs one must create it in that seat's own store.
 FM_CODEX_SEAT_CREDENTIAL=auth.json
 
 # fm_codex_seat_credential_present <store-dir>
@@ -121,15 +123,26 @@ fm_codex_seat_path_identity() {
   fi
 }
 
+fm_codex_seat_credential_identity() {
+  local file=$1 system
+  [ -f "$file" ] || return 1
+  [ ! -L "$file" ] || return 1
+  system=$(uname -s 2>/dev/null) || return 1
+  case "$system" in
+    Darwin) stat -f '%d:%i' "$file" 2>/dev/null ;;
+    *) stat -c '%d:%i' "$file" 2>/dev/null ;;
+  esac
+}
+
 # fm_codex_seat_records <config-dir>
 # Print one validated, TAB-separated record per configured seat:
 #     <name><TAB><codex-home><TAB><pi-agent-dir or empty>
-# Paths are expanded but NOT required to exist here: existence and credentials
-# are a per-launch check (fm_codex_seat_dir), so `list` and `check` can still
-# describe a seat whose directory has not been created yet.
+# Paths are expanded but NOT required to exist here: existence and sign-in are a
+# per-launch check (fm_codex_seat_dir), while existing credential identities are
+# checked here so `list` and `check` reject stores that share a rotating token.
 fm_codex_seat_records() {
   local config=$1 file line lineno=0 name home pi extra seen_name seen_path
-  local home_id pi_id
+  local home_id pi_id home_credential pi_credential seen_credential
   local out=''
   file=$(fm_codex_seat_config_path "$config")
   FM_CODEX_SEAT_ERROR=
@@ -139,6 +152,7 @@ fm_codex_seat_records() {
   fi
   seen_name=
   seen_path=
+  seen_credential=
   while IFS= read -r line || [ -n "$line" ]; do
     lineno=$((lineno + 1))
     line="${line#"${line%%[![:space:]]*}"}"
@@ -175,6 +189,13 @@ fm_codex_seat_records() {
       fm_codex_seat_fail "$file line $lineno: seat '$name' Codex home '$home' cannot be resolved"
       return 1
     }
+    home_credential=
+    if [ -f "$home/$FM_CODEX_SEAT_CREDENTIAL" ] && [ ! -L "$home/$FM_CODEX_SEAT_CREDENTIAL" ]; then
+      home_credential=$(fm_codex_seat_credential_identity "$home/$FM_CODEX_SEAT_CREDENTIAL") || {
+        fm_codex_seat_fail "$file line $lineno: seat '$name' Codex credential '$home/$FM_CODEX_SEAT_CREDENTIAL' cannot be identified"
+        return 1
+      }
+    fi
     if [ -n "$pi" ]; then
       pi=$(fm_codex_seat_expand_path "$pi")
       case "$pi" in
@@ -193,8 +214,16 @@ fm_codex_seat_records() {
         fm_codex_seat_fail "$file line $lineno: seat '$name' uses one directory as both its Codex home and its Pi agent dir; each store keeps its own credential file"
         return 1
       fi
+      pi_credential=
+      if [ -f "$pi/$FM_CODEX_SEAT_CREDENTIAL" ] && [ ! -L "$pi/$FM_CODEX_SEAT_CREDENTIAL" ]; then
+        pi_credential=$(fm_codex_seat_credential_identity "$pi/$FM_CODEX_SEAT_CREDENTIAL") || {
+          fm_codex_seat_fail "$file line $lineno: seat '$name' Pi credential '$pi/$FM_CODEX_SEAT_CREDENTIAL' cannot be identified"
+          return 1
+        }
+      fi
     else
       pi_id=
+      pi_credential=
     fi
     case " $seen_name " in
       *" $name "*)
@@ -216,9 +245,27 @@ fm_codex_seat_records() {
           ;;
       esac
     fi
+    if [ -n "$home_credential" ]; then
+      case "$seen_credential" in
+        *"|$home_credential|"*)
+          fm_codex_seat_fail "$file line $lineno: seat '$name' shares a credential inode with another configured store; each auth.json must be its own file"
+          return 1
+          ;;
+      esac
+    fi
+    if [ -n "$pi_credential" ]; then
+      case "$seen_credential" in
+        *"|$pi_credential|"*)
+          fm_codex_seat_fail "$file line $lineno: seat '$name' shares a credential inode with another configured store; each auth.json must be its own file"
+          return 1
+          ;;
+      esac
+    fi
     seen_name="$seen_name $name"
     seen_path="$seen_path|$home_id|"
     [ -z "$pi" ] || seen_path="$seen_path|$pi_id|"
+    [ -z "$home_credential" ] || seen_credential="$seen_credential|$home_credential|"
+    [ -z "$pi_credential" ] || seen_credential="$seen_credential|$pi_credential|"
     out="$out$name	$home	$pi
 "
   done < "$file"

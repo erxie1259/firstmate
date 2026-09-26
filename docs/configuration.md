@@ -279,7 +279,7 @@ Never copy a token from one store to another, and never touch a credential store
 
 `bin/fm-codex-seat.sh mirror <seat>` builds the rest of a seat's store: it symlinks the shared, credential-free entries of the primary store into the seat's store, creates nothing else, and refuses to replace anything already there that it did not create.
 It never reads, copies, or writes a credential, so the one-time sign-in above stays the captain's to run.
-Pi resolves relative paths in `settings.json` against the agent dir itself, which is why the mirror shares the resource directories alongside the settings file.
+Pi resolves relative paths in `settings.json` against the agent dir itself, so resources outside the five mirrored entries belong in that seat's own store.
 Per-seat mutable state - sessions, caches, trust decisions, logs - stays the seat's own and is deliberately not shared.
 
 `bin/fm-codex-seat.sh quota` reads each configured seat's own windows by running `CODEX_HOME=<seat home> quota-axi --provider codex` once per seat, and `--json` wraps each report as one `{"seat","codexHome","quota"}` line for dispatch evidence.

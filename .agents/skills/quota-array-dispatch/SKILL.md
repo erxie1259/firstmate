@@ -2,7 +2,7 @@
 name: quota-array-dispatch
 description: >-
   Agent-only decision procedure for resolving a matched crew-dispatch profile
-  array from current quota-axi output, including effective headroom and usable-runway evidence.
+  array from current quota-axi output, including effective headroom, usable-runway, and per-Codex-seat evidence.
   Load when a dispatch rule or default resolves to more than one profile candidate.
 user-invocable: false
 metadata:
@@ -22,7 +22,8 @@ Deterministic shell owns only schema, configuration, and version validation plus
 
 Run `quota-axi --json` once per intake and reuse that snapshot for every candidate.
 Do not take a second snapshot to settle a candidate, and read `quota-axi auth --json` when a candidate's credential surface is in question.
-For each candidate, preserve explicit `harness`, `model`, and `provider`; `harness-adapters` owns identity, and model/provider never infer harness:
+When any candidate carries a Codex seat, also run `bin/fm-codex-seat.sh quota --json` once at that same intake: a seat is its own quota scope, and the ambient snapshot is evidence for the ambient store only.
+For each candidate, preserve explicit `harness`, `model`, `provider`, and any `seat`; `harness-adapters` owns identity, and model/provider never infer harness:
 
 - task/profile fit and required reasoning class
 - applicable effective headroom (`effectivePercentRemaining`) from the established provider/model scope
@@ -35,6 +36,17 @@ Stale raw windows are diagnostic, never headroom or fabricated runway.
 Grok's `credits.remaining` is a prepaid balance unrelated to `percentRemaining`; never read it as exhaustion.
 Read all windows named by `boundedBy`, `limitingWindowIds`, `aheadWindowIds`, `behindWindowIds`, `onPaceWindowIds`, `unknownWindowIds`, and `unmeasurableWindowIds`.
 The compact default output intentionally omits numeric reserve, while `--json` and `--full` retain reserve diagnostics.
+
+## A Codex seat is its own quota scope
+
+`config/codex-seats` can name several seats in one Codex team workspace, and each seat has separate usage windows.
+A seated candidate's headroom, runway, and pace come from that seat's own labelled report, never from the ambient Codex snapshot and never from another seat's.
+An unseated Codex candidate is bounded by the ambient store's report.
+Account for the seat alongside harness and model whenever you name a candidate, because `harness=codex seat=main` and `harness=codex seat=selene` are two candidates with the same fit and different evidence.
+
+Two candidates differing only by seat are the intended way to express "whichever seat has headroom", so resolve them here rather than waiting on a reset: an exhausted window on one seat is not a reason to defer work when another configured seat is authenticated and has runway.
+A seat whose store or credential is missing is concrete contradictory evidence for that candidate alone - `bin/fm-spawn.sh` refuses it outright - and it never licenses substituting a different seat under the same name.
+Report the seat you selected and the per-seat evidence you selected it on, and state plainly when every seat is tight rather than downgrading the reasoning class to conserve one seat's quota.
 
 ## Establish the provider relation before reading quota
 
@@ -108,6 +120,6 @@ Never use headroom, runway, pace, or reserve to silently replace that reasoning 
    Do not select by array order, harness name, or another arbitrary identity ordering.
    Report duplicate concrete profiles as a configuration error.
 
-Account for every candidate visibly before selecting or escalating, naming its catalog evidence, provider relation, applicable quota and authentication facts, remaining uncertainty, fit and reasoning class, effective headroom, usable runway, likely-completion reasoning, and later pace or reserve evidence when used.
+Account for every candidate visibly before selecting or escalating, naming its catalog evidence, provider relation, Codex seat where one applies, applicable quota and authentication facts, remaining uncertainty, fit and reasoning class, effective headroom, usable runway, likely-completion reasoning, and later pace or reserve evidence when used.
 A blocked credential report must name `harness`, `model`, authentication surface, and concrete failure evidence; never emit a bare `Grok unauthenticated` statement.
 Never conclude with an unexplained "best quota" label.

@@ -3,7 +3,7 @@ name: harness-adapters
 description: >-
   Agent-only reference for firstmate harness operations.
   Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.
-  Contains verified facts for claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, and muse.
+  Contains verified facts for claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, and muse, including the Codex seat axis.
 user-invocable: false
 metadata:
   internal: true
@@ -14,7 +14,7 @@ metadata:
 Use this reference before any harness-specific firstmate operation: spawn, recovery, trust-dialog handling, skill invocation, interrupt, exit, resume, or adapter verification.
 
 Crewmates default to the same harness firstmate is running on unless `config/crew-harness` records an adapter name.
-Optional dispatch profiles in `config/crew-dispatch.json` can override that static default for one crewmate or scout dispatch by selecting concrete harness, model, and effort axes at intake.
+Optional dispatch profiles in `config/crew-dispatch.json` can override that static default for one crewmate or scout dispatch by selecting concrete harness, model, effort, and Codex seat axes at intake.
 When a matched rule or default is a profile array, load `quota-array-dispatch` for the completion-aware candidate choice after this skill establishes harness and model/provider facts.
 The captain may override that file at session start or later; a per-task instruction such as "run this one on codex" overrides it for that dispatch only.
 `default` means mirror firstmate's own harness.
@@ -110,7 +110,7 @@ When changing any primary watcher adapter, update `docs/supervision-protocols/`,
 
 ## Launch profile axes
 
-`bin/fm-spawn.sh` accepts concrete `--harness`, `--model`, and `--effort` values chosen by firstmate at intake.
+`bin/fm-spawn.sh` accepts concrete `--harness`, `--model`, `--effort`, and `--seat` values chosen by firstmate at intake.
 Do not make the shell scripts parse or match natural-language dispatch rules.
 
 Effort precedence is an explicit per-task captain instruction first, then any applicable standing dispatch profile or secondmate pin, then the generic fallback below.
@@ -137,6 +137,23 @@ The supported launch-profile flags below are verified locally; each row records 
 The concrete `harness` field owns adapter identity independently of the model provider: `harness=pi` with `model=xai/grok-*` is Pi using xAI, not `harness=grok`, and does not require Grok CLI login; `harness=grok` remains the standalone Grok Build CLI adapter.
 Likewise, `harness=cursor` with `model=cursor-grok-4.5-*` is Cursor Agent CLI routing a Grok model, not the xAI Grok Build `grok` harness.
 No script resolves that split for you: establish which credential store a tuple reads from the discovery surfaces below plus `quota-axi auth --json`'s per-provider sources, and show that reasoning rather than inferring it from a harness, model, or source name.
+
+### Codex seats
+
+A Codex team workspace can hold more than one subscription seat, and each seat has its own usage windows.
+`config/codex-seats` names them, and a seat is a fourth launch profile axis alongside harness, model, and effort: `bin/fm-spawn.sh --seat <name>`.
+It reaches exactly two runtimes, because those are the ones that spend a Codex seat: `harness=codex`, where it sets `CODEX_HOME`, and a `pi`/`pi-signed` launch on an `openai-codex/*` model, where it sets `PI_CODING_AGENT_DIR`.
+Every other harness or model is a refusal, not a silently dropped flag.
+`docs/configuration.md` "Codex seats" owns the file format, the one-time per-store sign-in, and the mirror helper; `bin/fm-codex-seat-lib.sh` owns the executable contract.
+
+Treat each configured seat as its own quota scope, because it is one: `quota-axi` reports a seat's windows only when pointed at that seat's store, and one seat's exhausted window says nothing about another's.
+Read them with `bin/fm-codex-seat.sh quota --json`, which runs the same producer once per seat and labels each report with its seat and store.
+When a Codex candidate's seat is tight, prefer another configured seat over waiting on a reset, and resolve the choice through `quota-array-dispatch` exactly as any other profile array.
+A dispatch profile carries the axis as an optional `"seat"` field, so two candidates differing only by seat are the ordinary way to express "whichever seat has headroom".
+
+A task records the seat it launched on as `seat=` in its metadata, and every replacement agent keeps spending that same seat unless `bin/fm-control.sh relaunch --seat <name>` names another one.
+Never copy a credential between two stores: Codex OAuth refresh tokens rotate, so a second reader of one store's `auth.json` can log the first consumer out.
+Each store is signed in on its own.
 
 ### Model support discovery
 

@@ -826,6 +826,153 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   pass "active crew-dispatch profile does not block secondmate launches"
 }
 
+# --- Codex seats -----------------------------------------------------------
+#
+# A seat is one Codex subscription seat with its own usage windows. The launch
+# command is the only place that can carry it, because the backend daemon that
+# creates the worker pane does not inherit the spawning shell's environment, so
+# these tests assert the exact launch text rather than an internal variable.
+
+# seat_store <case-dir> <name> [--no-credential] -> echoes the store directory
+seat_store() {
+  local case_dir=$1 name=$2 flag=${3:-} dir
+  dir="$case_dir/seats/$name"
+  mkdir -p "$dir"
+  [ "$flag" = --no-credential ] || printf '{"fixture":"not-a-credential"}\n' > "$dir/auth.json"
+  printf '%s\n' "$dir"
+}
+
+# write_seats <case-dir> <line...>
+write_seats() {
+  local case_dir=$1
+  shift
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' "$@" > "$case_dir/home/config/codex-seats"
+}
+
+test_codex_seat_sets_codex_home_in_the_launch() {
+  local rec id out status launch seat_dir other_dir
+  id=profile-seat-codex-z20
+  rec=$(make_spawn_case profile-seat-codex codex "$id")
+  read_case_record "$rec"
+  seat_dir=$(seat_store "$CASE_DIR" selene)
+  other_dir=$(seat_store "$CASE_DIR" main)
+  write_seats "$CASE_DIR" "main $other_dir" "selene $seat_dir"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+    --model gpt-5.5 --seat selene)
+  status=$?
+  expect_code 0 "$status" "codex spawn on a configured seat should succeed"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "CODEX_HOME='$seat_dir' codex --model 'gpt-5.5'" \
+    "the codex launch did not carry the selected seat's CODEX_HOME"
+  assert_not_contains "$launch" "$other_dir" "the codex launch named another seat's store"
+  assert_not_contains "$launch" "PI_CODING_AGENT_DIR=" "a codex launch must not set Pi's agent dir"
+  assert_grep "seat=selene" "$HOME_DIR/state/$id.meta" "meta did not record the seat the task launched on"
+  pass "a codex spawn on a named seat sets that seat's CODEX_HOME and records seat="
+}
+
+test_pi_codex_model_seat_sets_pi_agent_dir() {
+  local rec id out status launch codex_dir pi_dir
+  id=profile-seat-pi-z21
+  rec=$(make_spawn_case profile-seat-pi pi "$id")
+  read_case_record "$rec"
+  codex_dir=$(seat_store "$CASE_DIR" selene-codex)
+  pi_dir=$(seat_store "$CASE_DIR" selene-pi)
+  write_seats "$CASE_DIR" "selene $codex_dir $pi_dir"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+    --model openai-codex/gpt-5.6-sol --seat selene)
+  status=$?
+  expect_code 0 "$status" "pi spawn on a configured seat with a codex model should succeed"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "PI_CODING_AGENT_DIR='$pi_dir' FM_PI_HARNESS=pi" \
+    "the pi launch did not carry the seat's own Pi agent dir"
+  assert_not_contains "$launch" "CODEX_HOME=" \
+    "a pi launch must not point Pi at the Codex CLI's own store, whose token it would rotate"
+  assert_grep "seat=selene" "$HOME_DIR/state/$id.meta" "meta did not record the seat the task launched on"
+  pass "a pi spawn on an openai-codex model sets the seat's own PI_CODING_AGENT_DIR"
+}
+
+test_seat_refusals_never_fall_back_to_another_seat() {
+  local rec id out status seat_dir bare_dir pi_missing
+  id=profile-seat-refuse-z22
+  rec=$(make_spawn_case profile-seat-refuse codex "$id")
+  read_case_record "$rec"
+  seat_dir=$(seat_store "$CASE_DIR" selene)
+  bare_dir=$(seat_store "$CASE_DIR" unsigned --no-credential)
+  pi_missing="$CASE_DIR/seats/absent-pi"
+  write_seats "$CASE_DIR" "selene $seat_dir $pi_missing" "unsigned $bare_dir"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --seat nope)
+  status=$?
+  expect_code 1 "$status" "an unknown seat must refuse the spawn"
+  assert_contains "$out" "unknown Codex seat 'nope'" "the refusal did not name the unknown seat"
+  assert_absent "$HOME_DIR/state/$id.meta" "an unknown seat must refuse before any task record exists"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --seat unsigned)
+  status=$?
+  expect_code 1 "$status" "a seat with no credential must refuse the spawn"
+  assert_contains "$out" "has no credential at" "the refusal did not name the missing credential"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+    --harness claude --seat selene)
+  status=$?
+  expect_code 1 "$status" "a seat on a harness that uses no Codex seat must refuse the spawn"
+  assert_contains "$out" "does not use a Codex seat" "the refusal did not explain the harness mismatch"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+    --harness pi --model anthropic/claude-sonnet-5 --seat selene)
+  status=$?
+  expect_code 1 "$status" "a pi seat without an openai-codex model must refuse the spawn"
+  assert_contains "$out" "does not use a Codex seat" "the refusal did not explain the model mismatch"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+    --harness pi --model openai-codex/gpt-5.6-sol --seat selene)
+  status=$?
+  expect_code 1 "$status" "a seat whose Pi agent dir is missing must refuse the spawn"
+  assert_contains "$out" "Pi agent dir" "the refusal did not name the missing Pi agent dir"
+  pass "every unusable seat refuses the spawn instead of launching on the ambient store"
+}
+
+test_no_seat_flag_launches_exactly_as_before() {
+  local rec id out status launch seat_dir
+  id=profile-seat-absent-z23
+  rec=$(make_spawn_case profile-seat-absent codex "$id")
+  read_case_record "$rec"
+  seat_dir=$(seat_store "$CASE_DIR" selene)
+  write_seats "$CASE_DIR" "selene $seat_dir"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "a spawn without --seat should succeed even when seats are configured"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_not_contains "$launch" "CODEX_HOME=" "an unseated launch must not name any Codex store"
+  assert_no_grep "seat=" "$HOME_DIR/state/$id.meta" \
+    "an unseated task must not record a seat, so an absent line keeps meaning the ambient store"
+  pass "omitting --seat keeps the launch and the task record free of any seat"
+}
+
+test_batch_forwards_the_shared_seat() {
+  local rec first second out status launch seat_dir
+  first=profile-seat-batch-one-z24
+  second=profile-seat-batch-two-z24
+  rec=$(make_spawn_case profile-seat-batch codex "$first" "$second")
+  read_case_record "$rec"
+  seat_dir=$(seat_store "$CASE_DIR" selene)
+  write_seats "$CASE_DIR" "selene $seat_dir"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$first=$PROJ_DIR" "$second=$PROJ_DIR" --harness codex --seat selene)
+  status=$?
+  expect_code 0 "$status" "a batch on one seat should succeed"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_grep "seat=selene" "$HOME_DIR/state/$first.meta" "the first batch pair lost the shared seat"
+  assert_grep "seat=selene" "$HOME_DIR/state/$second.meta" "the second batch pair lost the shared seat"
+  assert_contains "$launch" "CODEX_HOME='$seat_dir'" "the batch launches did not carry the shared seat"
+  pass "a batch dispatch forwards one shared seat to every pair"
+}
+
 test_no_profile_keeps_claude_profile_defaults
 test_non_cursor_launch_clears_inherited_cursor_markers
 test_relative_home_overrides_launch_with_absolute_cross_process_paths
@@ -857,5 +1004,10 @@ test_claude_forwards_firstmate_config_dir_when_set
 test_claude_omits_config_dir_prefix_when_unset
 test_non_claude_harness_ignores_config_dir
 test_active_dispatch_profile_does_not_block_secondmate_launch
+test_codex_seat_sets_codex_home_in_the_launch
+test_pi_codex_model_seat_sets_pi_agent_dir
+test_seat_refusals_never_fall_back_to_another_seat
+test_no_seat_flag_launches_exactly_as_before
+test_batch_forwards_the_shared_seat
 
 echo "# all fm-spawn-dispatch-profile tests passed"

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--seat <name>] [--backend <name>]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--seat <name>] [--backend <name>]
+#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--seat <name>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
 #   per task at intake (AGENTS.md section 7); data/projects.md holds the captain's
@@ -16,7 +16,7 @@
 #   loud one-line deviation notice is printed and the spawn continues.
 #   no-mistakes-prod-only is a registry policy rather than a task mode and is
 #   refused as a flag value.
-#        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>]
+#        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>] [--seat <name>]
 #   --relaunch launches a replacement agent for an EXISTING task into that
 #   task's own recorded endpoint and worktree instead of creating either. It is
 #   the launch half of the control plane (bin/fm-control.sh relaunch), which
@@ -38,6 +38,25 @@
 #   axes chosen by firstmate at intake. They are only threaded into harnesses whose
 #   installed CLIs were verified to support that axis; unsupported axes are omitted
 #   from that harness's launch rather than guessed.
+#   --seat <name> selects one Codex subscription seat from config/codex-seats,
+#   which is how the fleet reaches a second seat's own usage windows instead of
+#   waiting on the first seat's reset. It applies to harness codex, where it sets
+#   CODEX_HOME in the launch command, and to a pi/pi-signed launch running an
+#   openai-codex/* model, where it sets PI_CODING_AGENT_DIR. Any other tuple is a
+#   refusal rather than a silently ignored flag. A missing seat, store directory,
+#   or store credential also refuses before any endpoint exists, so a spawn never
+#   falls back to another seat's quota. The resolved seat is recorded as seat= in
+#   task metadata and reused by --relaunch (and therefore by bin/fm-control.sh),
+#   so recovery keeps spending the same seat; an explicit --seat overrides it.
+#   When a relaunch moves an inherited seat onto a harness or model that uses no
+#   Codex seat, the seat is dropped with a loud notice and removed from the
+#   record rather than refusing an otherwise valid harness switch. A remote
+#   secondmate launch refuses --seat because seat paths are local to this host.
+#   Omitting --seat launches exactly as before, with no seat environment and no
+#   seat= line, and needs no config/codex-seats at all.
+#   bin/fm-codex-seat-lib.sh owns the config format, the seat-to-environment
+#   mapping, and the credential validation; bin/fm-codex-seat.sh --help is the
+#   inspectable CLI, including the per-seat quota read and the mirror helper.
 #   --backend <name> is the explicit runtime session-provider backend for this
 #   exact task only (docs/configuration.md "Runtime backend" owns when that flag
 #   is authorized). Without it, the script resolves FM_BACKEND, then
@@ -286,6 +305,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
 # shellcheck source=bin/fm-pyenv-rehash-lib.sh
 . "$SCRIPT_DIR/fm-pyenv-rehash-lib.sh"
+# shellcheck source=bin/fm-codex-seat-lib.sh
+. "$SCRIPT_DIR/fm-codex-seat-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -297,6 +318,7 @@ KIND_SET=0
 HARNESS_ARG=
 MODEL=
 EFFORT=
+SEAT=
 BACKEND_ARG=
 MODE=
 YOLO=
@@ -304,6 +326,8 @@ TRACEPARENT_ARG=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
+SEAT_SET=0
+SEAT_INHERITED=0
 BACKEND_SET=0
 MODE_SET=0
 YOLO_SET=0
@@ -320,6 +344,7 @@ for a in "$@"; do
       harness) HARNESS_ARG=$a; HARNESS_SET=1 ;;
       model) MODEL=$a; MODEL_SET=1 ;;
       effort) EFFORT=$a; EFFORT_SET=1 ;;
+      seat) SEAT=$a; SEAT_SET=1 ;;
       backend) BACKEND_ARG=$a; BACKEND_SET=1 ;;
       mode) MODE=$a; MODE_SET=1 ;;
       yolo) YOLO=$a; YOLO_SET=1 ;;
@@ -339,6 +364,8 @@ for a in "$@"; do
     --model=*) MODEL=${a#--model=}; MODEL_SET=1 ;;
     --effort) want_value=effort ;;
     --effort=*) EFFORT=${a#--effort=}; EFFORT_SET=1 ;;
+    --seat) want_value=seat ;;
+    --seat=*) SEAT=${a#--seat=}; SEAT_SET=1 ;;
     --backend) want_value=backend ;;
     --backend=*) BACKEND_ARG=${a#--backend=}; BACKEND_SET=1 ;;
     --mode) want_value=mode ;;
@@ -354,6 +381,7 @@ done
 [ "$HARNESS_SET" -eq 0 ] || [ -n "$HARNESS_ARG" ] || { echo "error: --harness requires a non-empty value" >&2; exit 1; }
 [ "$MODEL_SET" -eq 0 ] || [ -n "$MODEL" ] || { echo "error: --model requires a non-empty value" >&2; exit 1; }
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
+[ "$SEAT_SET" -eq 0 ] || [ -n "$SEAT" ] || { echo "error: --seat requires a non-empty value" >&2; exit 1; }
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
 [ "$MODE_SET" -eq 0 ] || [ -n "$MODE" ] || { echo "error: --mode requires a non-empty value" >&2; exit 1; }
 [ "$YOLO_SET" -eq 0 ] || [ -n "$YOLO" ] || { echo "error: --yolo requires a non-empty value" >&2; exit 1; }
@@ -446,6 +474,15 @@ spawn_remote_secondmate() {
     fm_lock_release "$registry_lock" || true
     fm_lock_release "$SPAWN_TASK_LOCK" || true
     return 3
+  fi
+  # A Codex seat names directories on THIS host, so it cannot be handed to a
+  # remote launch. Refusing beats delivering a path the remote side would resolve
+  # against its own filesystem.
+  if [ "$SEAT_SET" -eq 1 ]; then
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: --seat names Codex stores on this host, so it cannot be applied to a remote secondmate launch" >&2
+    return 1
   fi
   host=$(secondmate_registry_field "$DATA/secondmates.md" "$id" host)
   root=$(secondmate_registry_field "$DATA/secondmates.md" "$id" root)
@@ -807,6 +844,7 @@ spawn_abort_cleanup() {
             echo "tasktmp=${TASK_TMP:-}"
             echo "model=${MODEL:-default}"
             echo "effort=${EFFORT:-default}"
+            [ -z "${SEAT:-}" ] || echo "seat=$SEAT"
             echo "backend=orca"
             echo "orca_worktree_id=$ORCA_WORKTREE_ID"
             [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
@@ -918,6 +956,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$HARNESS_ARG" ] || shared_args+=(--harness "$HARNESS_ARG")
   [ -z "$MODEL" ] || shared_args+=(--model "$MODEL")
   [ -z "$EFFORT" ] || shared_args+=(--effort "$EFFORT")
+  [ -z "$SEAT" ] || shared_args+=(--seat "$SEAT")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
   # One delivery contract applies to every pair in a batch, exactly like the shared
   # harness. Each pair still re-validates it against its own brief, so a batch
@@ -1063,6 +1102,13 @@ if [ "$RELAUNCH" -eq 1 ]; then
     echo "error: task $ID's endpoint reads '$RELAUNCH_STATE'; a relaunch requires a positively agent-free endpoint (stop the agent first with bin/fm-control.sh $ID exit)" >&2
     exit 1
   }
+  # The seat is part of the task's identity, not a per-launch whim: a relaunch,
+  # a recovery, and a control-plane replacement all keep spending the seat the
+  # task was dispatched on unless the caller names another one.
+  if [ "$SEAT_SET" -eq 0 ]; then
+    SEAT=$(fm_meta_get "$RELAUNCH_META" seat)
+    SEAT_INHERITED=1
+  fi
   RELAUNCH_PRIOR_HARNESS=$(fm_meta_get "$RELAUNCH_META" harness)
   KIND=$(fm_meta_get "$RELAUNCH_META" kind)
   [ -n "$KIND" ] || KIND=ship
@@ -1333,6 +1379,36 @@ if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
         *) echo "warning: config/secondmate-harness effort token '$SM_EFFORT' is not one of low, medium, high, xhigh, max; ignoring" >&2 ;;
       esac
     fi
+  fi
+fi
+
+# Codex seat (config/codex-seats). A seat is one Codex subscription seat with its
+# own usage windows, so dispatch can move work to a seat that has headroom instead
+# of waiting on a reset. The launch environment is the only mechanism that can
+# carry it: a worker starts inside a backend pane created by a long-lived daemon
+# that does not inherit this process's environment, so the store has to be named
+# in the launch command itself.
+#
+# bin/fm-codex-seat-lib.sh owns the config format, the seat-to-environment
+# mapping, and the credential validation. An explicitly requested seat that cannot
+# be honored is a refusal, never a quiet fall back to the ambient store, because
+# that would spend the wrong seat's quota under the captain's chosen one.
+#
+# A seat INHERITED from the task's own record is different: a relaunch may have
+# moved the task onto a harness or model that spends no Codex seat at all, and
+# there is no seat to fall back from. That case drops the seat with a loud notice
+# and stops recording it, so the metadata keeps matching the launch.
+SEAT_ENV_PREFIX=
+if [ -n "$SEAT" ]; then
+  if SEAT_ENV_PREFIX=$(fm_codex_seat_env_prefix "$CONFIG" "$SEAT" "$HARNESS" "$MODEL"); then
+    :
+  elif [ "$SEAT_INHERITED" -eq 1 ] && ! fm_codex_seat_consumer "$HARNESS" "$MODEL" >/dev/null; then
+    echo "warning: task $ID was recorded on Codex seat '$SEAT', which harness '$HARNESS' does not use; relaunching with no seat and clearing the recorded seat" >&2
+    SEAT=
+    SEAT_ENV_PREFIX=
+  else
+    echo "error: task $ID cannot launch on Codex seat '$SEAT'" >&2
+    exit 1
   fi
 fi
 
@@ -2802,7 +2878,7 @@ fi
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort seat busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -2828,6 +2904,10 @@ META_BODY=$(
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
+  # Only a task actually launched on a named Codex seat carries seat=, so an
+  # absent line keeps meaning "the ambient Codex store", byte-identically to
+  # every task written before seats existed.
+  [ -z "$SEAT" ] || echo "seat=$SEAT"
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
   # Default-off writes no traceparent= line.
@@ -2936,6 +3016,9 @@ case "$HARNESS" in
   cursor) LAUNCH=${LAUNCH//__CURSORBIN__/"$(shell_quote "$CURSOR_BIN")"} ;;
 esac
 LAUNCH=${LAUNCH//__WORKTREE__/$sq_worktree}
+# The resolved Codex seat store, named in the launch command because the backend
+# daemon that creates the pane does not inherit this process's environment.
+[ -z "$SEAT_ENV_PREFIX" ] || LAUNCH="$SEAT_ENV_PREFIX$LAUNCH"
 case "$HARNESS" in
   claude|codex|opencode|pi|pi-signed|grok|kimi|muse)
     LAUNCH="env -u CURSOR_AGENT -u CURSOR_INVOKED_AS $LAUNCH"

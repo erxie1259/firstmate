@@ -246,6 +246,56 @@ The Kimi installer requires an existing regular non-symlink `~/.kimi-code/config
 Its `remove` action excises only the marker-delimited Firstmate region and removes Firstmate's hook files.
 For Pi and pi-signed secondmate launches, `fm-spawn.sh` starts the selected executable with `-e` pointed at the secondmate home's own tracked `.pi/extensions/fm-primary-pi-watch.ts` and `.pi/extensions/fm-primary-turnend-guard.ts`, both already present from the secondmate home's git worktree.
 
+## Codex seats (config/codex-seats)
+
+A Codex team workspace can hold more than one subscription seat, and each seat has its own usage windows.
+`config/codex-seats` is an optional local, gitignored file that names those seats so a dispatch can move work onto a seat with headroom instead of waiting on the first seat's reset.
+This section is the single owner of the file format and the operator-facing setup; [`bin/fm-codex-seat-lib.sh`](../bin/fm-codex-seat-lib.sh) owns the executable contract, and [`bin/fm-codex-seat.sh --help`](../bin/fm-codex-seat.sh) owns the inspection and mirror mechanics.
+
+With no such file, nothing changes: every launch uses the ambient Codex store exactly as before.
+
+One seat per line, whitespace-separated, with `#` comments and blank lines ignored:
+
+```
+# name    Codex CLI home     Pi agent dir (optional)
+main      ~/.codex           ~/.pi/agent
+selene    ~/.codex-selene    ~/.pi/agent-selene
+```
+
+A leading `~/` expands against the home directory and any other path must be absolute.
+Seat names use letters, digits, `.`, `_`, and `-`, starting with a letter or digit.
+`default` is refused as a name because an absent seat already means "launch with no seat environment".
+Two seats may never name the same directory, and a seat's two stores may never be the same directory: Codex OAuth refresh tokens rotate, so two consumers reading one credential file can log each other out.
+
+Each store keeps its own credential, and each one is signed in once by hand:
+
+```sh
+CODEX_HOME=~/.codex-selene codex login --device-auth
+PI_CODING_AGENT_DIR=~/.pi/agent-selene pi        # then /login, select ChatGPT Plus/Pro (Codex)
+```
+
+`/login` in an interactive session is Pi's supported subscription login, and it writes into whichever agent dir `PI_CODING_AGENT_DIR` selects.
+Never copy a token from one store to another, and never touch a credential store another tool owns, such as `~/.hermes`.
+
+`bin/fm-codex-seat.sh mirror <seat>` builds the rest of a seat's store: it symlinks the shared, credential-free entries of the primary store into the seat's store, creates nothing else, and refuses to replace anything already there that it did not create.
+It never reads, copies, or writes a credential, so the one-time sign-in above stays the captain's to run.
+Pi resolves relative paths in `settings.json` against the agent dir itself, which is why the mirror shares the resource directories alongside the settings file.
+Per-seat mutable state - sessions, caches, trust decisions, logs - stays the seat's own and is deliberately not shared.
+
+`bin/fm-codex-seat.sh quota` reads each configured seat's own windows by running `CODEX_HOME=<seat home> quota-axi --provider codex` once per seat, and `--json` wraps each report as one `{"seat","codexHome","quota"}` line for dispatch evidence.
+Codex identity comes from the store `CODEX_HOME` points at, so each seat reports its own five-hour and weekly windows; [dispatch authentication verification](verification/dispatch-auth.md#codex-seats-are-separate-quota-scopes) owns that evidence.
+`quota-array-dispatch` owns how firstmate chooses among seats, and `harness-adapters` owns the seat's place among the launch profile axes.
+
+`bin/fm-spawn.sh --seat <name>` applies a seat to one launch: for `harness=codex` it sets `CODEX_HOME` in the launch command, and for a `pi` or `pi-signed` launch running an `openai-codex/*` model it sets `PI_CODING_AGENT_DIR`.
+The launch command is the carrier because a worker starts in a pane created by a long-lived backend daemon that does not inherit the spawning shell's environment.
+Any other harness or model combination is refused rather than silently ignored, and a missing seat, store, or store credential refuses before any worker exists, so a launch never falls back to another seat's quota.
+The resolved seat is recorded as `seat=` in task metadata and reused by `fm-spawn.sh --relaunch` and therefore by `bin/fm-control.sh relaunch`, which also accepts its own `--seat` to move a task onto another seat.
+A remote secondmate launch refuses `--seat`, because seat paths are local to the host that holds them.
+
+`config/codex-seats` is not inherited into secondmate homes, because a seat names credential stores on the host that holds them; a secondmate home that should dispatch on seats gets its own file and its own signed-in stores.
+
+The shared `no-mistakes` review daemon keeps its current configuration and is out of scope here: it is one instance serving every lane and home, so per-seat routing for it would have to be designed separately.
+
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
 `config/crew-dispatch.json` is an optional local, gitignored file containing natural-language rules that firstmate reads before dispatching a crewmate or scout.
@@ -262,13 +312,13 @@ This section is the single owner of the canonical schema and its per-field seman
     {
       "when": "<natural-language condition describing a kind of task>",
       "use": [
-        { "harness": "<adapter>", "model": "<optional model>", "effort": "<low|medium|high|xhigh|max, optional>" }
+        { "harness": "<adapter>", "model": "<optional model>", "effort": "<low|medium|high|xhigh|max, optional>", "seat": "<optional Codex seat name>" }
       ],
       "why": "<optional rationale that helps firstmate choose>"
     }
   ],
   "default": [
-    { "harness": "<adapter>", "model": "<optional model>", "effort": "<optional effort>" }
+    { "harness": "<adapter>", "model": "<optional model>", "effort": "<optional effort>", "seat": "<optional Codex seat name>" }
   ]
 }
 ```
@@ -276,15 +326,17 @@ This section is the single owner of the canonical schema and its per-field seman
 Per rule, `when` and `use` are required.
 Both `use` and the optional top-level `default` accept either one profile object or a non-empty array of profile objects.
 The single-object form stays fully backward-compatible, and every profile needs `harness`.
-Profile `model` and `effort` fields and rule `why` are optional.
+Profile `model`, `effort`, and `seat` fields and rule `why` are optional.
 An omitted model or effort means the selected harness uses its own default for that axis.
+An omitted `seat` means the launch uses the ambient Codex store; a named `seat` must exist in `config/codex-seats` and must belong to a profile that actually spends a Codex seat, which is `harness: codex` or a `pi`/`pi-signed` profile with an `openai-codex/*` model.
+Two candidates that differ only by seat are the intended way to let one rule pick whichever seat still has headroom.
 Every profile array is an implicit quota-aware choice resolved through `quota-array-dispatch`.
 If no dispatch rule fits, firstmate resolves `default` through the same object-or-array path before falling back to `config/crew-harness`.
 If a selected profile carries an effort value the chosen harness does not accept, `fm-spawn.sh` records the requested `effort=` in task meta for traceability but omits the launch flag, and bootstrap reports the invalid harness/effort pair as a `CREW_DISPATCH` diagnostic when it is visible in the file.
 See [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) for a starting point to copy into local `config/crew-dispatch.json`.
 When the file exists, bootstrap validates it with `jq`.
 Valid files stay silent by default; with `FM_BOOTSTRAP_VERBOSE_FACTS=1`, bootstrap emits `BOOTSTRAP_INFO: crew dispatch active config/crew-dispatch.json`, one `BOOTSTRAP_INFO:` fact per rule, and one fact for the optional default profile set.
-Malformed JSON, an empty or malformed rule/default array, an unverified harness, or an effort value unsupported by that harness is reported as `CREW_DISPATCH: invalid config/crew-dispatch.json - ...`; missing `jq` is reported through the normal `MISSING: jq` install-consent flow.
+Malformed JSON, an empty or malformed rule/default array, an unverified harness, an effort value unsupported by that harness, a seat a profile cannot use, an unknown seat name, or a `config/codex-seats` file whose seat names cannot be read is reported as `CREW_DISPATCH: invalid config/crew-dispatch.json - ...`; missing `jq` is reported through the normal `MISSING: jq` install-consent flow.
 While the file remains present, no crewmate or scout spawn may proceed without an explicit resolved harness; malformed configuration must be reported and corrected rather than selected around.
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
 

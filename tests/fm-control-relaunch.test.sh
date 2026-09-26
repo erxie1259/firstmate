@@ -757,6 +757,115 @@ test_explicit_secondmate_harness_ignores_configured_profile_axes() {
   pass "fm-control relaunch: explicit secondmate harness resets unnamed profile axes"
 }
 
+# --- Codex seats across a relaunch -----------------------------------------
+#
+# The seat a task was dispatched on is part of its identity: a replacement agent
+# must keep spending the same seat's quota unless the caller says otherwise. The
+# launch command is the only carrier, so these cases assert the literal text the
+# replacement pane receives.
+
+# seat_dir <case-dir> <name> -> echoes a signed-in seat store
+seat_dir() {
+  local dir="$1/seats/$2"
+  mkdir -p "$dir"
+  printf '{"fixture":"not-a-credential"}\n' > "$dir/auth.json"
+  printf '%s\n' "$dir"
+}
+
+# configure_seats <case-dir> <name...>
+configure_seats() {
+  local dir=$1 name lines=()
+  shift
+  for name in "$@"; do
+    lines+=("$name $(seat_dir "$dir" "$name")")
+  done
+  mkdir -p "$dir/home/config"
+  printf '%s\n' "${lines[@]}" > "$dir/home/config/codex-seats"
+}
+
+record_seat() {  # <case-dir> <id> <seat>
+  printf 'seat=%s\n' "$3" >> "$1/home/state/$2.meta"
+}
+
+test_spawn_relaunch_keeps_the_recorded_codex_seat() {
+  local dir out launch
+  dir=$(new_case seatkeep rl40)
+  add_ship_task "$dir" rl40 codex
+  configure_seats "$dir" main selene
+  record_seat "$dir" rl40 selene
+  printf 'zsh' > "$dir/fake/command"
+  printf 'codex' > "$dir/fake/becomes"
+
+  out=$(run_spawn "$dir" rl40 --relaunch)
+  assert_contains "$out" "spawned rl40 harness=codex" "the seated relaunch did not report a launch"
+  [ "$(meta_field "$dir" rl40 seat)" = selene ] \
+    || fail "a relaunch must keep the task's recorded seat, got '$(meta_field "$dir" rl40 seat)'"
+  launch=$(cat "$dir/fake/literal")
+  assert_contains "$launch" "CODEX_HOME='$dir/seats/selene'" \
+    "the replacement launch did not carry the recorded seat's store"
+  assert_not_contains "$launch" "$dir/seats/main" "the replacement launch moved onto another seat"
+  pass "fm-spawn --relaunch: a replacement keeps spending the seat the task was dispatched on"
+}
+
+test_spawn_relaunch_drops_an_inherited_seat_the_new_harness_cannot_use() {
+  local dir out launch
+  dir=$(new_case seatdrop rl41)
+  add_ship_task "$dir" rl41 codex
+  configure_seats "$dir" selene
+  record_seat "$dir" rl41 selene
+  printf 'zsh' > "$dir/fake/command"
+  printf 'claude' > "$dir/fake/becomes"
+
+  out=$(run_spawn "$dir" rl41 --relaunch --harness claude)
+  assert_contains "$out" "spawned rl41 harness=claude" "the harness switch did not launch"
+  assert_contains "$out" "which harness 'claude' does not use" \
+    "dropping an unusable inherited seat must say so rather than doing it quietly"
+  [ -z "$(meta_field "$dir" rl41 seat)" ] \
+    || fail "the record must stop naming a seat the launch no longer uses, got '$(meta_field "$dir" rl41 seat)'"
+  launch=$(cat "$dir/fake/literal")
+  assert_not_contains "$launch" "CODEX_HOME=" "a claude launch must carry no Codex seat store"
+  pass "fm-spawn --relaunch: an inherited seat the new harness cannot use is dropped loudly, not silently kept"
+}
+
+test_control_relaunch_moves_the_task_onto_a_named_seat() {
+  local dir out launch
+  dir=$(new_case seatmove rl42)
+  add_ship_task "$dir" rl42 codex
+  configure_seats "$dir" main selene
+  record_seat "$dir" rl42 main
+  printf 'codex' > "$dir/fake/command"
+  printf 'codex' > "$dir/fake/becomes"
+
+  out=$(run_control "$dir" rl42 relaunch --seat selene --note "moving to the seat with headroom")
+  assert_contains "$out" "harness=codex" "the seat move did not relaunch on the recorded harness"
+  [ "$(meta_field "$dir" rl42 seat)" = selene ] \
+    || fail "an explicit --seat must move the task, got '$(meta_field "$dir" rl42 seat)'"
+  launch=$(cat "$dir/fake/literal")
+  assert_contains "$launch" "CODEX_HOME='$dir/seats/selene'" \
+    "the replacement launch did not move onto the named seat's store"
+  pass "fm-control relaunch: --seat moves an existing task onto another Codex seat"
+}
+
+test_control_relaunch_refuses_an_invalid_seat_before_stopping() {
+  local dir out rc
+  dir=$(new_case seatpreflight rl43)
+  add_ship_task "$dir" rl43 codex
+  configure_seats "$dir" main
+  record_seat "$dir" rl43 main
+  printf 'codex' > "$dir/fake/command"
+  printf 'codex' > "$dir/fake/becomes"
+
+  out=$(run_control "$dir" rl43 relaunch --seat missing --note "do not stop for an invalid seat"); rc=$?
+  expect_code 1 "$rc" "an invalid control-plane seat must refuse before stopping the task"
+  assert_contains "$out" "unknown Codex seat 'missing'" \
+    "the preflight refusal did not name the invalid seat"
+  [ "$(cat "$dir/fake/command")" = codex ] \
+    || fail "an invalid seat relaunch stopped the existing agent before refusing"
+  [ "$(meta_field "$dir" rl43 seat)" = main ] \
+    || fail "an invalid seat relaunch changed the task record"
+  pass "fm-control relaunch validates the replacement seat before stopping the existing agent"
+}
+
 test_ship_relaunch_ignores_the_crew_harness_config() {
   local dir out
   dir=$(new_case crewcfg rl20)
@@ -1358,3 +1467,7 @@ test_spawn_relaunch_refuses_a_live_agent
 test_spawn_relaunch_refuses_contradicting_flags
 test_spawn_relaunch_refuses_an_unrecorded_task
 test_spawn_relaunch_refuses_a_pane_outside_the_worktree
+test_spawn_relaunch_keeps_the_recorded_codex_seat
+test_spawn_relaunch_drops_an_inherited_seat_the_new_harness_cannot_use
+test_control_relaunch_moves_the_task_onto_a_named_seat
+test_control_relaunch_refuses_an_invalid_seat_before_stopping

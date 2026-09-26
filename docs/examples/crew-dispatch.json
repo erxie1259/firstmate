@@ -17,6 +17,14 @@
         { "harness": "codex", "model": "gpt-5.5", "effort": "high" }
       ],
       "why": "Use a strong coding profile for big, ambiguous work; resolve the alternatives through quota-array-dispatch."
+    },
+    {
+      "when": "The task is ordinary Codex work and the fleet should use whichever Codex seat still has headroom.",
+      "use": [
+        { "harness": "codex", "model": "gpt-5.5", "effort": "medium", "seat": "main" },
+        { "harness": "codex", "model": "gpt-5.5", "effort": "medium", "seat": "selene" }
+      ],
+      "why": "Each seat has its own usage windows, so read both with bin/fm-codex-seat.sh quota --json and pick the one with headroom instead of waiting on a reset. Seat names must exist in config/codex-seats."
     }
   ],
   "default": [

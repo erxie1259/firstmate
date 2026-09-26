@@ -5,7 +5,7 @@
 # Usage: fm-control.sh <task-id> interrupt
 #        fm-control.sh <task-id> exit
 #        fm-control.sh <task-id> relaunch [--harness <name>] [--model <name>]
-#                                         [--effort <level>]
+#                                         [--effort <level>] [--seat <name>]
 #                                         (--note <text> | --note-file <path>)
 #
 # Why this exists, and how it differs from fm-send.sh. bin/fm-send.sh is the
@@ -40,6 +40,11 @@
 #              a ship or scout keeps the exact adapter already recorded for it.
 #              A prefixed raw-command basename cannot reconstruct its launch
 #              command, so relaunch requires an explicit --harness for it.
+#              --seat names a Codex seat from config/codex-seats for the
+#              replacement, which is how a task moves onto a seat that still has
+#              headroom. Without it the replacement keeps the seat recorded for
+#              the task, so a relaunch never silently changes whose quota the work
+#              spends; bin/fm-spawn.sh owns seat resolution and its refusals.
 #              --note is required for a ship or scout, whose replacement
 #              inherits the local copy but none of the conversation; a
 #              secondmate reconciles its own home's records at startup, so its
@@ -119,6 +124,7 @@ fi
 }
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
+CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 [ -d "$STATE" ] || {
   echo "error: state dir '$STATE' is missing; fm-control cannot resolve tasks for FM_HOME '$FM_HOME'" >&2
   exit 1
@@ -134,6 +140,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-codex-seat-lib.sh
+. "$SCRIPT_DIR/fm-codex-seat-lib.sh"
 
 POLL=${FM_CONTROL_POLL:-0.5}
 SETTLE_WAIT=${FM_CONTROL_SETTLE_WAIT:-5}
@@ -187,9 +195,11 @@ fi
 NEW_HARNESS=
 NEW_MODEL=
 NEW_EFFORT=
+NEW_SEAT=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
+SEAT_SET=0
 NOTE=
 NOTE_SET=0
 want_value=
@@ -202,6 +212,7 @@ for a in "$@"; do
       harness) NEW_HARNESS=$a; HARNESS_SET=1 ;;
       model) NEW_MODEL=$a; MODEL_SET=1 ;;
       effort) NEW_EFFORT=$a; EFFORT_SET=1 ;;
+      seat) NEW_SEAT=$a; SEAT_SET=1 ;;
       note) NOTE=$a; NOTE_SET=1 ;;
       note-file)
         [ -f "$a" ] || die "--note-file '$a' is not a readable file"
@@ -219,6 +230,8 @@ for a in "$@"; do
     --model=*) NEW_MODEL=${a#--model=}; MODEL_SET=1 ;;
     --effort) want_value=effort ;;
     --effort=*) NEW_EFFORT=${a#--effort=}; EFFORT_SET=1 ;;
+    --seat) want_value=seat ;;
+    --seat=*) NEW_SEAT=${a#--seat=}; SEAT_SET=1 ;;
     --note) want_value=note ;;
     --note=*) NOTE=${a#--note=}; NOTE_SET=1 ;;
     --note-file) want_value=note-file ;;
@@ -233,12 +246,14 @@ done
 [ -z "$want_value" ] || die "--$want_value requires a value"
 
 if [ "$VERB" != relaunch ]; then
-  [ "$HARNESS_SET" = 0 ] && [ "$MODEL_SET" = 0 ] && [ "$EFFORT_SET" = 0 ] && [ "$NOTE_SET" = 0 ] \
-    || die "--harness, --model, --effort, and --note apply to 'relaunch' only"
+  [ "$HARNESS_SET" = 0 ] && [ "$MODEL_SET" = 0 ] && [ "$EFFORT_SET" = 0 ] \
+    && [ "$SEAT_SET" = 0 ] && [ "$NOTE_SET" = 0 ] \
+    || die "--harness, --model, --effort, --seat, and --note apply to 'relaunch' only"
 fi
 [ "$HARNESS_SET" = 0 ] || [ -n "$NEW_HARNESS" ] || die "--harness requires a non-empty value"
 [ "$MODEL_SET" = 0 ] || [ -n "$NEW_MODEL" ] || die "--model requires a non-empty value"
 [ "$EFFORT_SET" = 0 ] || [ -n "$NEW_EFFORT" ] || die "--effort requires a non-empty value"
+[ "$SEAT_SET" = 0 ] || [ -n "$NEW_SEAT" ] || die "--seat requires a non-empty value"
 case "$NEW_EFFORT" in
   ''|low|medium|high|xhigh|max) ;;
   *) die "--effort must be one of low, medium, high, xhigh, max" ;;
@@ -509,6 +524,7 @@ PRIOR_EFFORT=
 TARGET_HARNESS=$HARNESS
 TARGET_MODEL=
 TARGET_EFFORT=
+PRIOR_SEAT=
 
 journal_write() {  # <phase> [extra-line]...
   local phase=$1
@@ -602,6 +618,7 @@ resolve_relaunch_profile() {
   PRIOR_RECORDED_HARNESS=$RECORDED_HARNESS
   PRIOR_MODEL=$(fm_meta_get "$META" model)
   PRIOR_EFFORT=$(fm_meta_get "$META" effort)
+  PRIOR_SEAT=$(fm_meta_get "$META" seat)
   [ -n "$PRIOR_MODEL" ] || PRIOR_MODEL=default
   [ -n "$PRIOR_EFFORT" ] || PRIOR_EFFORT=default
   if [ "$HARNESS_SET" = 0 ] \
@@ -667,6 +684,16 @@ resolve_relaunch_profile() {
     TARGET_EFFORT=$PRIOR_EFFORT
   else
     TARGET_EFFORT=default
+  fi
+  local target_seat=
+  if [ "$SEAT_SET" = 1 ]; then
+    target_seat=$NEW_SEAT
+  elif [ -n "$PRIOR_SEAT" ] && fm_codex_seat_consumer "$TARGET_HARNESS" "$TARGET_MODEL" >/dev/null; then
+    target_seat=$PRIOR_SEAT
+  fi
+  if [ -n "$target_seat" ]; then
+    fm_codex_seat_env_prefix "$CONFIG" "$target_seat" "$TARGET_HARNESS" "$TARGET_MODEL" >/dev/null \
+      || die "relaunch target cannot use Codex seat '$target_seat'"
   fi
 }
 
@@ -814,6 +841,10 @@ do_relaunch() {
   spawn_args=("$ID" --relaunch --harness "$TARGET_HARNESS")
   [ "$TARGET_MODEL" = default ] || spawn_args+=(--model "$TARGET_MODEL")
   [ "$TARGET_EFFORT" = default ] || spawn_args+=(--effort "$TARGET_EFFORT")
+  # No explicit --seat leaves the flag off entirely, so fm-spawn --relaunch reads
+  # the seat from the task's own record; that is what keeps a replacement on the
+  # same seat's quota without this script restating the resolution.
+  [ "$SEAT_SET" = 0 ] || spawn_args+=(--seat "$NEW_SEAT")
   if FM_CONTROL_RELAUNCH_TX="$RELAUNCH_TX" \
       "$SCRIPT_DIR/fm-spawn.sh" "${spawn_args[@]}" >/dev/null; then
     RELAUNCH_META_PUBLISHED=1

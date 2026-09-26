@@ -168,11 +168,54 @@ These discriminator strings are un-owned vendor UI text.
 `bin/fm-vendor-auth-probe.sh` pins the verified version, reports `versionVerified=no` when the running CLI differs, and classifies any unrecognized first line as `indeterminate` rather than authenticated.
 Re-run the two commands above and update this section and the pinned version together when the vendor CLI changes.
 
+## Codex seats are separate quota scopes
+
+Verified 2026-09-25 on quota-axi 0.1.28, codex-cli, and Pi 0.83.0, against a two-seat Codex team workspace.
+
+A Codex seat's identity comes from the credential store `CODEX_HOME` points at, so one seat's windows are read by pointing the same command at that seat's store:
+
+```sh
+quota-axi --provider codex --json                        # the ambient store
+CODEX_HOME=~/.codex-selene quota-axi --provider codex --json
+```
+
+The two reads returned different windows from the same account and plan in one snapshot:
+
+| Store | `plan` | `five_hour` | `weekly` | `all_models` effective |
+|---|---|---|---|---|
+| ambient `~/.codex` | team | 0 | 38 | 0 |
+| `~/.codex-selene` | team | 100 | 93 | 93 |
+
+Three properties follow and are load-bearing for seat-aware dispatch:
+
+- A seat is its own quota scope.
+  One seat's exhausted five-hour window says nothing about another seat's, so a seated candidate's headroom must be read from that seat's own store and never from the ambient one.
+- `quota-axi` honors `CODEX_HOME` and needs no seat-specific flag, which is why `bin/fm-codex-seat.sh quota` is a thin per-seat loop over the same producer rather than a new evidence source.
+- No credential appears in the report.
+  The observed keys are `generatedAt`, `providers`, and `schemaVersion`, and each provider carries `credits`, `label`, `plan`, `provider`, `quotaSemantics`, `source`, `state`, and `windows`.
+
+Pi selects its own store independently of the Codex CLI:
+
+```sh
+pi --offline --list-models | grep -c openai-codex                                   # 10
+PI_CODING_AGENT_DIR=<empty dir> pi --offline --list-models | grep -c openai-codex   # 0
+CODEX_HOME=~/.codex-selene PI_CODING_AGENT_DIR=<empty dir> pi --list-models | grep -c openai-codex   # 0
+```
+
+- `PI_CODING_AGENT_DIR` moves Pi's whole agent dir, including its `auth.json`.
+  A fresh dir gets a newly created `auth.json` holding exactly `{}` rather than an inherited credential, which is why an empty JSON object must not be read as a completed sign-in.
+- Pi 0.83.0 does NOT bootstrap an `openai-codex` credential from `CODEX_HOME`, so pointing Pi at a seat requires that seat's own Pi login (`/login` in an interactive session, per Pi's `docs/providers.md` "Subscriptions").
+  This is why a seat's two stores are separate and why no token is ever copied between them: each consumer refreshes its own rotating OAuth token.
+
+Re-run the commands above and update this section when either vendor CLI changes.
+
 ## Regression coverage
 
 `tests/fm-vendor-auth-probe.test.sh` drives the real script against a fake vendor CLI that records every invocation's argv and anything readable on stdin.
 It asserts that the script accepts no harness, model, or provider input, never calls `quota-axi`, exits alike for every probe result because it renders no verdict, invokes only the two fixed non-destructive argv forms with stdin closed, holds a real bound even when the configured bound is zero or malformed, and never echoes raw vendor output.
-`tests/fm-spawn-dispatch-profile.test.sh` owns spawn's deterministic profile and harness refusals.
+`tests/fm-spawn-dispatch-profile.test.sh` owns spawn's deterministic profile, seat, and harness refusals, asserting the literal launch command each seat produces.
+`tests/fm-codex-seats.test.sh` owns the `config/codex-seats` contract, the per-seat quota read against a fake producer, and the credential-free mirror.
+`tests/fm-control-relaunch.test.sh` owns seat continuity across a replacement agent.
 `tests/fm-bootstrap.test.sh` owns the quota-axi version-floor diagnostic.
 `tests/fm-quota-array-dispatch-live-e2e.test.sh` drives the public Pi skill-loading interface against one fake `quota-axi --json` snapshot per case.
 It covers the Claude 1 percent versus Codex 55 percent reserve regression, explicit accounting for unmeasurable runway, and the strongest-reasoning constraint.

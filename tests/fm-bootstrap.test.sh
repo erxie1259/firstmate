@@ -1137,15 +1137,67 @@ default array is accepted^{"default":[{"harness":"pi","model":"anthropic/claude-
 one-element default array is accepted^{"default":[{"harness":"codex"}]}^empty^
 empty array use is flagged^{"rules":[{"when":"big feature","use":[]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - each rule needs at least one use profile
 array profile without harness is flagged^{"rules":[{"when":"big feature","use":[{"model":"gpt-5.5"}]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - each use profile needs harness
-array profile with malformed model is flagged^{"rules":[{"when":"big feature","use":[{"harness":"codex","model":5}]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - use profile model and effort must be non-empty strings when present
+array profile with malformed model is flagged^{"rules":[{"when":"big feature","use":[{"harness":"codex","model":5}]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - use profile model, effort, and seat must be non-empty strings when present
 unknown select is flagged^{"rules":[{"when":"big feature","use":[{"harness":"claude"},{"harness":"codex"}],"select":"mystery"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - unknown select: mystery
 array profile unsupported effort is flagged^{"rules":[{"when":"big feature","use":[{"harness":"codex","effort":"max"}]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: codex:max
 empty default array is flagged^{"default":[]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - default needs at least one profile
 non-object default array entry is flagged^{"default":["codex"]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - each default profile must be an object
 default array profile without harness is flagged^{"default":[{"model":"gpt-5.5"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - each default profile needs harness
-default array malformed effort is flagged^{"default":[{"harness":"codex","effort":3}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - default profile model and effort must be non-empty strings when present
+default array malformed effort is flagged^{"default":[{"harness":"codex","effort":3}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - default profile model, effort, and seat must be non-empty strings when present
+malformed seat is flagged^{"rules":[{"when":"seat work","use":{"harness":"codex","seat":7}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - use profile model, effort, and seat must be non-empty strings when present
+seat on a harness that cannot use one is flagged^{"rules":[{"when":"seat work","use":{"harness":"claude","seat":"selene"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - seat is not used by that harness/model: claude:selene
+seat on pi without a codex model is flagged^{"rules":[{"when":"seat work","use":{"harness":"pi","model":"anthropic/claude-sonnet-5","seat":"selene"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - seat is not used by that harness/model: pi/anthropic/claude-sonnet-5:selene
+seat without a seat file is flagged^{"rules":[{"when":"seat work","use":{"harness":"codex","seat":"selene"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - seat named with no config/codex-seats: selene
 ROWS
+  case_dir="$TMP_ROOT/dispatch-seat-concrete"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' "selene relative/path" > "$case_dir/home/config/codex-seats"
+  printf '%s\n' '{"rules":[{"when":"seat work","use":{"harness":"codex","seat":"selene"}}]}' > "$case_dir/home/config/crew-dispatch.json"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  add_real_jq "$fakebin"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh" 2>&1)
+  assert_contains "$out" "codex-seat:" \
+    "bootstrap hid the concrete seat-config diagnostic"
+  assert_contains "$out" "relative/path" \
+    "bootstrap did not preserve the seat-config failure reason"
   pass "bootstrap validates crew-dispatch.json and reports malformed or unverified configs"
+}
+
+# A dispatch profile may name a Codex seat, so config/codex-seats is part of what
+# decides whether crew-dispatch.json is valid. These cases pair the two files.
+test_crew_dispatch_seat_validation() {
+  local label seats body mode expect case_dir fakebin out n
+  n=0
+  while IFS='^' read -r label seats body mode expect; do
+    [ -n "$label" ] || continue
+    n=$((n + 1))
+    case_dir="$TMP_ROOT/dispatch-seat-$n"
+    mkdir -p "$case_dir/home/config"
+    printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+    printf '%b\n' "$seats" > "$case_dir/home/config/codex-seats"
+    printf '%s\n' "$body" > "$case_dir/home/config/crew-dispatch.json"
+    fakebin=$(make_fake_toolchain "$case_dir")
+    add_real_jq "$fakebin"
+    out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+      FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+    case "$mode" in
+      empty)
+        [ -z "$out" ] || fail "$label: expected silence, got: $out" ;;
+      exact)
+        [ "$out" = "$expect" ] || fail "$label: expected '$expect', got: $out" ;;
+      grep)
+        printf '%s\n' "$out" | grep -F "$expect" >/dev/null || fail "$label: missing '$expect' (got: $out)" ;;
+    esac
+  done <<'ROWS'
+configured seat on codex is accepted^main /tmp/seat-main\nselene /tmp/seat-selene^{"rules":[{"when":"seat work","use":{"harness":"codex","seat":"selene"}}]}^empty^
+configured seat on a codex-model pi is accepted^selene /tmp/seat-selene /tmp/seat-selene-pi^{"rules":[{"when":"seat work","use":{"harness":"pi","model":"openai-codex/gpt-5.6-sol","seat":"selene"}}]}^empty^
+unknown seat name is flagged^main /tmp/seat-main^{"rules":[{"when":"seat work","use":{"harness":"codex","seat":"selene"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - unknown seat: selene
+unreadable seat file blocks seat validation^selene relative/path^{"rules":[{"when":"seat work","use":{"harness":"codex","seat":"selene"}}]}^grep^CREW_DISPATCH: invalid config/crew-dispatch.json - seat names cannot be validated:
+duplicate seat directories block seat validation^main /tmp/seat-main\nselene /tmp/seat-main^{"rules":[{"when":"seat work","use":{"harness":"codex","seat":"selene"}}]}^grep^CREW_DISPATCH: invalid config/crew-dispatch.json - seat names cannot be validated:
+ROWS
+  pass "bootstrap validates crew-dispatch seats against config/codex-seats"
 }
 
 test_bootstrap_reporting
@@ -1176,3 +1228,4 @@ test_network_phases_record_per_step_elapsed_times
 test_tasks_axi_verdict_handoff_is_consumed_once
 test_crew_dispatch_active_rules_are_verbose_bootstrap_info
 test_crew_dispatch_validation
+test_crew_dispatch_seat_validation

@@ -225,6 +225,10 @@ fm_codex_seat_records() {
       pi_id=
       pi_credential=
     fi
+    if [ -n "$home_credential" ] && [ "$home_credential" = "$pi_credential" ]; then
+      fm_codex_seat_fail "$file line $lineno: seat '$name' uses one credential inode for its Codex home and Pi agent dir; each auth.json must be its own file"
+      return 1
+    fi
     case " $seen_name " in
       *" $name "*)
         fm_codex_seat_fail "$file line $lineno: seat '$name' is declared more than once"

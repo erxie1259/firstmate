@@ -108,7 +108,7 @@ test_list_shows_each_store_and_whether_it_is_signed_in() {
 }
 
 test_malformed_seat_files_are_refused_with_their_reason() {
-  local dir out status main alias_dir hardlink_dir
+  local dir out status main alias_dir hardlink_dir pi_dir
   dir=$(new_home malformed)
   main=$(store "$dir" main)
 
@@ -149,6 +149,16 @@ test_malformed_seat_files_are_refused_with_their_reason() {
   expect_code 1 "$status" "one directory used as both stores of a seat must be refused"
   assert_contains "$out" "each store keeps its own credential file" \
     "the refusal did not explain why the two stores of a seat must differ"
+
+  pi_dir="$dir/stores/main-pi"
+  mkdir -p "$pi_dir"
+  ln "$main/auth.json" "$pi_dir/auth.json"
+  seats "$dir" "main $main $pi_dir"
+  out=$(run_seat "$dir" check)
+  status=$?
+  expect_code 1 "$status" "a seat must not use one credential inode for Codex and Pi"
+  assert_contains "$out" "uses one credential inode" \
+    "the refusal did not identify the same-seat credential inode"
 
   alias_dir="$dir/stores/alias"
   ln -s "$main" "$alias_dir"

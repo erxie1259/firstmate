@@ -1007,7 +1007,7 @@ crew_dispatch_validate() {
   # profile whose seat cannot be resolved.
   seat_json='[]'
   if fm_codex_seat_configured "$CONFIG"; then
-    if seats=$(fm_codex_seat_names "$CONFIG" 2>/dev/null); then
+    if seats=$(fm_codex_seat_names "$CONFIG"); then
       seat_json=$(printf '%s\n' "$seats" | jq -R -s 'split("\n") | map(select(length > 0))')
       if [ -z "$seat_json" ]; then
         echo "CREW_DISPATCH: invalid config/crew-dispatch.json - seat names cannot be validated: config/codex-seats could not be encoded for validation"

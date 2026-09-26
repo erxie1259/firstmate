@@ -108,7 +108,7 @@ test_list_shows_each_store_and_whether_it_is_signed_in() {
 }
 
 test_malformed_seat_files_are_refused_with_their_reason() {
-  local dir out status main
+  local dir out status main alias_dir
   dir=$(new_home malformed)
   main=$(store "$dir" main)
 
@@ -149,6 +149,32 @@ test_malformed_seat_files_are_refused_with_their_reason() {
   expect_code 1 "$status" "one directory used as both stores of a seat must be refused"
   assert_contains "$out" "each store keeps its own credential file" \
     "the refusal did not explain why the two stores of a seat must differ"
+
+  alias_dir="$dir/stores/alias"
+  ln -s "$main" "$alias_dir"
+  seats "$dir" "main $main" "selene $alias_dir"
+  out=$(run_seat "$dir" check)
+  status=$?
+  expect_code 1 "$status" "two seats that resolve to one directory must be refused"
+  assert_contains "$out" "would log each other out" \
+    "the refusal did not compare existing stores by their resolved directory"
+
+  seats "$dir" "main $main" "selene $main/../main"
+  out=$(run_seat "$dir" check)
+  status=$?
+  expect_code 1 "$status" "two seats that resolve through dot segments to one directory must be refused"
+  assert_contains "$out" "would log each other out" \
+    "the refusal did not normalize dot segments in existing stores"
+
+  ln -s "$main/auth.json" "$dir/stores/shared-auth.json"
+  mkdir -p "$dir/stores/selene"
+  ln -s "$dir/stores/shared-auth.json" "$dir/stores/selene/auth.json"
+  seats "$dir" "main $main" "selene $dir/stores/selene"
+  out=$(run_seat "$dir" path selene codex)
+  status=$?
+  expect_code 1 "$status" "a symlinked credential must not authorize a seat"
+  assert_contains "$out" "has no credential at" \
+    "the refusal did not reject a credential symlink"
   pass "every malformed seat file is refused with the concrete reason, never parsed loosely"
 }
 

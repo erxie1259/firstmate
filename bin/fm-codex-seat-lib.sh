@@ -54,6 +54,7 @@ FM_CODEX_SEAT_CREDENTIAL=auth.json
 fm_codex_seat_credential_present() {
   local file=$1/$FM_CODEX_SEAT_CREDENTIAL body
   [ -s "$file" ] || return 1
+  [ ! -L "$file" ] || return 1
   body=$(tr -d '[:space:]' < "$file" 2>/dev/null) || return 1
   case "$body" in
     ''|'{}'|'null') return 1 ;;
@@ -110,6 +111,16 @@ fm_codex_seat_expand_path() {
   esac
 }
 
+fm_codex_seat_path_identity() {
+  local path=$1 resolved
+  if [ -d "$path" ]; then
+    resolved=$(CDPATH='' cd -- "$path" 2>/dev/null && pwd -P) || return 1
+    printf '%s\n' "$resolved"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
 # fm_codex_seat_records <config-dir>
 # Print one validated, TAB-separated record per configured seat:
 #     <name><TAB><codex-home><TAB><pi-agent-dir or empty>
@@ -118,6 +129,7 @@ fm_codex_seat_expand_path() {
 # describe a seat whose directory has not been created yet.
 fm_codex_seat_records() {
   local config=$1 file line lineno=0 name home pi extra seen_name seen_path
+  local home_id pi_id
   local out=''
   file=$(fm_codex_seat_config_path "$config")
   FM_CODEX_SEAT_ERROR=
@@ -159,6 +171,10 @@ fm_codex_seat_records() {
         ;;
     esac
     home=${home%/}
+    home_id=$(fm_codex_seat_path_identity "$home") || {
+      fm_codex_seat_fail "$file line $lineno: seat '$name' Codex home '$home' cannot be resolved"
+      return 1
+    }
     if [ -n "$pi" ]; then
       pi=$(fm_codex_seat_expand_path "$pi")
       case "$pi" in
@@ -169,10 +185,16 @@ fm_codex_seat_records() {
           ;;
       esac
       pi=${pi%/}
-      if [ "$pi" = "$home" ]; then
+      pi_id=$(fm_codex_seat_path_identity "$pi") || {
+        fm_codex_seat_fail "$file line $lineno: seat '$name' Pi agent dir '$pi' cannot be resolved"
+        return 1
+      }
+      if [ "$pi_id" = "$home_id" ]; then
         fm_codex_seat_fail "$file line $lineno: seat '$name' uses one directory as both its Codex home and its Pi agent dir; each store keeps its own credential file"
         return 1
       fi
+    else
+      pi_id=
     fi
     case " $seen_name " in
       *" $name "*)
@@ -181,22 +203,22 @@ fm_codex_seat_records() {
         ;;
     esac
     case "$seen_path" in
-      *"|$home|"*)
+      *"|$home_id|"*)
         fm_codex_seat_fail "$file line $lineno: seat '$name' reuses directory '$home' already claimed by another seat; two seats sharing one credential file would log each other out"
         return 1
         ;;
     esac
     if [ -n "$pi" ]; then
       case "$seen_path" in
-        *"|$pi|"*)
+        *"|$pi_id|"*)
           fm_codex_seat_fail "$file line $lineno: seat '$name' reuses directory '$pi' already claimed by another seat; two seats sharing one credential file would log each other out"
           return 1
           ;;
       esac
     fi
     seen_name="$seen_name $name"
-    seen_path="$seen_path|$home|"
-    [ -z "$pi" ] || seen_path="$seen_path|$pi|"
+    seen_path="$seen_path|$home_id|"
+    [ -z "$pi" ] || seen_path="$seen_path|$pi_id|"
     out="$out$name	$home	$pi
 "
   done < "$file"

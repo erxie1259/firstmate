@@ -1149,6 +1149,19 @@ seat on a harness that cannot use one is flagged^{"rules":[{"when":"seat work","
 seat on pi without a codex model is flagged^{"rules":[{"when":"seat work","use":{"harness":"pi","model":"anthropic/claude-sonnet-5","seat":"selene"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - seat is not used by that harness/model: pi/anthropic/claude-sonnet-5:selene
 seat without a seat file is flagged^{"rules":[{"when":"seat work","use":{"harness":"codex","seat":"selene"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - seat named with no config/codex-seats: selene
 ROWS
+  case_dir="$TMP_ROOT/dispatch-seat-concrete"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' "selene relative/path" > "$case_dir/home/config/codex-seats"
+  printf '%s\n' '{"rules":[{"when":"seat work","use":{"harness":"codex","seat":"selene"}}]}' > "$case_dir/home/config/crew-dispatch.json"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  add_real_jq "$fakebin"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh" 2>&1)
+  assert_contains "$out" "codex-seat:" \
+    "bootstrap hid the concrete seat-config diagnostic"
+  assert_contains "$out" "relative/path" \
+    "bootstrap did not preserve the seat-config failure reason"
   pass "bootstrap validates crew-dispatch.json and reports malformed or unverified configs"
 }
 

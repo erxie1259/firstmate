@@ -124,6 +124,7 @@ fi
 }
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
+CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 [ -d "$STATE" ] || {
   echo "error: state dir '$STATE' is missing; fm-control cannot resolve tasks for FM_HOME '$FM_HOME'" >&2
   exit 1
@@ -139,6 +140,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-codex-seat-lib.sh
+. "$SCRIPT_DIR/fm-codex-seat-lib.sh"
 
 POLL=${FM_CONTROL_POLL:-0.5}
 SETTLE_WAIT=${FM_CONTROL_SETTLE_WAIT:-5}
@@ -521,6 +524,7 @@ PRIOR_EFFORT=
 TARGET_HARNESS=$HARNESS
 TARGET_MODEL=
 TARGET_EFFORT=
+PRIOR_SEAT=
 
 journal_write() {  # <phase> [extra-line]...
   local phase=$1
@@ -614,6 +618,7 @@ resolve_relaunch_profile() {
   PRIOR_RECORDED_HARNESS=$RECORDED_HARNESS
   PRIOR_MODEL=$(fm_meta_get "$META" model)
   PRIOR_EFFORT=$(fm_meta_get "$META" effort)
+  PRIOR_SEAT=$(fm_meta_get "$META" seat)
   [ -n "$PRIOR_MODEL" ] || PRIOR_MODEL=default
   [ -n "$PRIOR_EFFORT" ] || PRIOR_EFFORT=default
   if [ "$HARNESS_SET" = 0 ] \
@@ -679,6 +684,16 @@ resolve_relaunch_profile() {
     TARGET_EFFORT=$PRIOR_EFFORT
   else
     TARGET_EFFORT=default
+  fi
+  local target_seat=
+  if [ "$SEAT_SET" = 1 ]; then
+    target_seat=$NEW_SEAT
+  elif [ -n "$PRIOR_SEAT" ] && fm_codex_seat_consumer "$TARGET_HARNESS" "$TARGET_MODEL" >/dev/null; then
+    target_seat=$PRIOR_SEAT
+  fi
+  if [ -n "$target_seat" ]; then
+    fm_codex_seat_env_prefix "$CONFIG" "$target_seat" "$TARGET_HARNESS" "$TARGET_MODEL" >/dev/null \
+      || die "relaunch target cannot use Codex seat '$target_seat'"
   fi
 }
 

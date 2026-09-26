@@ -846,6 +846,26 @@ test_control_relaunch_moves_the_task_onto_a_named_seat() {
   pass "fm-control relaunch: --seat moves an existing task onto another Codex seat"
 }
 
+test_control_relaunch_refuses_an_invalid_seat_before_stopping() {
+  local dir out rc
+  dir=$(new_case seatpreflight rl43)
+  add_ship_task "$dir" rl43 codex
+  configure_seats "$dir" main
+  record_seat "$dir" rl43 main
+  printf 'codex' > "$dir/fake/command"
+  printf 'codex' > "$dir/fake/becomes"
+
+  out=$(run_control "$dir" rl43 relaunch --seat missing --note "do not stop for an invalid seat"); rc=$?
+  expect_code 1 "$rc" "an invalid control-plane seat must refuse before stopping the task"
+  assert_contains "$out" "unknown Codex seat 'missing'" \
+    "the preflight refusal did not name the invalid seat"
+  [ "$(cat "$dir/fake/command")" = codex ] \
+    || fail "an invalid seat relaunch stopped the existing agent before refusing"
+  [ "$(meta_field "$dir" rl43 seat)" = main ] \
+    || fail "an invalid seat relaunch changed the task record"
+  pass "fm-control relaunch validates the replacement seat before stopping the existing agent"
+}
+
 test_ship_relaunch_ignores_the_crew_harness_config() {
   local dir out
   dir=$(new_case crewcfg rl20)
@@ -1450,3 +1470,4 @@ test_spawn_relaunch_refuses_a_pane_outside_the_worktree
 test_spawn_relaunch_keeps_the_recorded_codex_seat
 test_spawn_relaunch_drops_an_inherited_seat_the_new_harness_cannot_use
 test_control_relaunch_moves_the_task_onto_a_named_seat
+test_control_relaunch_refuses_an_invalid_seat_before_stopping

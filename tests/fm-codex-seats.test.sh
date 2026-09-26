@@ -108,7 +108,7 @@ test_list_shows_each_store_and_whether_it_is_signed_in() {
 }
 
 test_malformed_seat_files_are_refused_with_their_reason() {
-  local dir out status main alias_dir hardlink_dir pi_dir
+  local dir out status main alias_dir hardlink_dir pi_dir missing_dir
   dir=$(new_home malformed)
   main=$(store "$dir" main)
 
@@ -149,6 +149,14 @@ test_malformed_seat_files_are_refused_with_their_reason() {
   expect_code 1 "$status" "one directory used as both stores of a seat must be refused"
   assert_contains "$out" "each store keeps its own credential file" \
     "the refusal did not explain why the two stores of a seat must differ"
+
+  missing_dir="$dir/stores/not-yet-created"
+  seats "$dir" "main $missing_dir/../not-yet-created" "selene $dir/stores/./not-yet-created"
+  out=$(run_seat "$dir" check)
+  status=$?
+  expect_code 1 "$status" "two seats that lexically resolve to one missing directory must be refused"
+  assert_contains "$out" "would log each other out" \
+    "the refusal did not normalize aliases for missing stores"
 
   pi_dir="$dir/stores/main-pi"
   mkdir -p "$pi_dir"

@@ -114,12 +114,33 @@ fm_codex_seat_expand_path() {
 }
 
 fm_codex_seat_path_identity() {
-  local path=$1 resolved
+  local path=$1 lexical resolved
+  lexical=$(printf '%s\n' "$path" | awk '
+    {
+      normalized = "/"
+      count = split($0, component, "/")
+      for (i = 1; i <= count; i++) {
+        if (component[i] == "" || component[i] == ".") continue
+        if (component[i] == "..") {
+          if (normalized != "/") {
+            sub("/[^/]*$", "", normalized)
+            if (normalized == "") normalized = "/"
+          }
+        } else if (normalized == "/") {
+          normalized = normalized component[i]
+        } else {
+          normalized = normalized "/" component[i]
+        }
+      }
+      print normalized
+    }
+  ') || return 1
+  [ -n "$lexical" ] || return 1
   if [ -d "$path" ]; then
     resolved=$(CDPATH='' cd -- "$path" 2>/dev/null && pwd -P) || return 1
     printf '%s\n' "$resolved"
   else
-    printf '%s\n' "$path"
+    printf '%s\n' "$lexical"
   fi
 }
 

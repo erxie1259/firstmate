@@ -1368,7 +1368,14 @@ test_spawn_survives_agent_rename_failure() {
   id=flags-l10n-q7
   : > "$log"
   mkdir -p "$home/data/$id" "$home/state" "$home/config" "$home/projects"
-  printf 'brief\n' > "$home/data/$id/brief.md"
+  cat > "$home/data/$id/brief.md" <<EOF
+# Task
+## Captain's intent
+Exercise a cosmetic Herdr agent-rename failure during spawn for $id.
+
+## Firstmate spec
+Launch, warn about the rename, and publish metadata anyway.
+EOF
   touch "$home/state/.last-watcher-beat"
   fm_git_worktree "$proj" "$wt" spawn-agent-name
   fm_fake_exit0 "$fakebin" treehouse

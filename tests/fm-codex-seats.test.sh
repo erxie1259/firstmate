@@ -407,6 +407,23 @@ test_mirror_refuses_a_store_that_is_the_primary_store() {
   pass "a seat whose store is the primary store is reported as needing no mirror"
 }
 
+test_mirror_refuses_a_nested_target_before_creating_it() {
+  local dir out status source target
+  dir=$(new_home mirrornested)
+  source="$dir/primary"
+  target="$source/seat"
+  mkdir -p "$source"
+  printf 'x\n' > "$source/config.toml"
+  seats "$dir" "selene $target"
+
+  out=$(FM_CODEX_SEAT_PRIMARY_CODEX_HOME="$source" run_seat "$dir" mirror selene codex)
+  status=$?
+  expect_code 1 "$status" "a mirror target below the primary store must refuse"
+  assert_contains "$out" "inside source" "the nested-target refusal must identify the protected source boundary"
+  assert_absent "$target" "a rejected nested target must not be created inside the primary store"
+  pass "the mirror refuses nested targets before touching the primary store"
+}
+
 test_absent_seat_file_is_the_ordinary_single_seat_home
 test_list_shows_each_store_and_whether_it_is_signed_in
 test_malformed_seat_files_are_refused_with_their_reason
@@ -417,5 +434,6 @@ test_quota_json_wraps_each_seat_report
 test_mirror_shares_config_and_never_touches_a_credential
 test_pi_mirror_uses_only_the_required_entries
 test_mirror_refuses_a_store_that_is_the_primary_store
+test_mirror_refuses_a_nested_target_before_creating_it
 
 echo "# all fm-codex-seats tests passed"

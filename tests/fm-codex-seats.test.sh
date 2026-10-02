@@ -443,6 +443,42 @@ test_mirror_refuses_a_symlinked_parent_target_before_creating_it() {
   pass "the mirror resolves symlinked parents before checking containment"
 }
 
+test_mirror_refuses_a_nested_target_with_an_absent_parent() {
+  local dir out status source target
+  dir=$(new_home mirrorabsentparent)
+  source="$dir/primary"
+  target="$source/new/seat"
+  mkdir -p "$source"
+  printf 'x\n' > "$source/config.toml"
+  seats "$dir" "selene $target"
+
+  out=$(FM_CODEX_SEAT_PRIMARY_CODEX_HOME="$source" run_seat "$dir" mirror selene codex)
+  status=$?
+  expect_code 1 "$status" "a mirror target with an absent parent inside the primary store must refuse"
+  assert_contains "$out" "inside source" "the absent-parent refusal must identify the protected source boundary"
+  assert_absent "$source/new" "a rejected target must not create its absent parent in the primary store"
+  pass "the mirror refuses nested targets with absent parents before touching the primary store"
+}
+
+test_mirror_refuses_a_symlinked_ancestor_with_an_absent_tail() {
+  local dir out status source alias target
+  dir=$(new_home mirrorsymlinkdeep)
+  source="$dir/primary"
+  alias="$dir/alias"
+  target="$alias/new/seat"
+  mkdir -p "$source"
+  ln -s "$source" "$alias"
+  printf 'x\n' > "$source/config.toml"
+  seats "$dir" "selene $target"
+
+  out=$(FM_CODEX_SEAT_PRIMARY_CODEX_HOME="$source" run_seat "$dir" mirror selene codex)
+  status=$?
+  expect_code 1 "$status" "a mirror target with an absent tail below a symlinked source must refuse"
+  assert_contains "$out" "inside source" "the deep symlink refusal must identify the protected source boundary"
+  assert_absent "$source/new" "a rejected deep symlink target must not create its missing tail in the primary store"
+  pass "the mirror resolves deep symlinked ancestors before checking containment"
+}
+
 test_absent_seat_file_is_the_ordinary_single_seat_home
 test_list_shows_each_store_and_whether_it_is_signed_in
 test_malformed_seat_files_are_refused_with_their_reason
@@ -455,5 +491,7 @@ test_pi_mirror_uses_only_the_required_entries
 test_mirror_refuses_a_store_that_is_the_primary_store
 test_mirror_refuses_a_nested_target_before_creating_it
 test_mirror_refuses_a_symlinked_parent_target_before_creating_it
+test_mirror_refuses_a_nested_target_with_an_absent_parent
+test_mirror_refuses_a_symlinked_ancestor_with_an_absent_tail
 
 echo "# all fm-codex-seats tests passed"

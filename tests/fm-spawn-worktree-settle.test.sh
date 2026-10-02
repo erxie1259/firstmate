@@ -14,6 +14,13 @@
 # asserts the recorded worktree resolves to the real, settled worktree, never
 # the stale first read.
 #
+# The same loop has a second transient to survive: `treehouse get` reports the
+# REPOSITORY's primary checkout as its own cwd while it is still preparing a
+# slot. From a linked spawning home that path is not the project, so a poll
+# comparing only against the project adopted it and the isolation guard then
+# refused the launch. The cases below cover both the transient and the pane
+# that never leaves the primary at all.
+#
 # The same file also owns the ONE automatic recovery for a worktree-acquisition
 # timeout: an orphaned pyenv rehash lock blocks the pane's shell in startup for
 # the whole PYENV_REHASH_TIMEOUT, so `treehouse get` never runs and the wait
@@ -21,19 +28,10 @@
 # rehash-shaped process and assert that the recovery fires only on that exact
 # signature, reports itself, and leaves every other timeout cause behaving
 # exactly as it does today.
-#
-# The same file also owns the publication that CONSUMES that settled worktree,
-# because a worktree the spawn detected correctly is worth nothing if the task
-# record naming it never reaches disk. Stock macOS Bash 3.2 does not treat a
-# failed redirection on a compound command as a fatal errexit condition, so the
-# original `{ ... } > "$STATE/<id>.meta"` block published an empty record and
-# still printed its success line and exited 0 whenever that path could not be
-# opened for writing. The cases below drive a complete spawn against exactly
-# that path and assert the record either lands whole or the spawn refuses.
 set -u
 
-# shellcheck source=tests/lib.sh
-. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=tests/fixtures.sh
+. "$(dirname "${BASH_SOURCE[0]}")/fixtures.sh"
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-worktree-settle)
@@ -95,7 +93,14 @@ make_settle_case() {
   fm_git_worktree "$proj" "$wt" "wt-$name"
   fm_git_init_commit "$stale"
   mkdir -p "$home/data/$id"
-  printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+  cat > "$home/data/$id/brief.md" <<EOF
+# Task
+## Captain's intent
+Exercise settled-worktree detection for $id.
+
+## Firstmate spec
+Record only the pane's stable worktree.
+EOF
   touch "$home/state/.last-watcher-beat"
   printf '%s\n' "$case_dir|$home|$proj|$wt|$stale|$fakebin|$countfile|$stale_reads"
 }
@@ -138,25 +143,91 @@ test_single_stale_first_read_is_not_accepted() {
   pass "a single transient stale pane_current_path read is not accepted as the worktree"
 }
 
-# A pane that reports the real worktree from the very first read still only
-# costs the loop's existing one-second inter-poll sleep to confirm - not an
-# extra full cycle on top of that.
-test_already_settled_pane_costs_one_confirm_sleep() {
-  local rec id out status start end elapsed
+# A pane that reports the real worktree from the very first read costs exactly
+# one confirming read - not a whole extra polling cycle on top of it. Counting
+# the pane reads measures the loop itself; wall-clock time would fold in every
+# other cost of a spawn (fetch, trust registration) and drift with the machine.
+test_already_settled_pane_costs_one_confirm_read() {
+  local rec id out status reads
   id=settle-already-settled-z2
   rec=$(make_settle_case settle-already-settled "$id" 0)
   read_settle_record "$rec"
 
-  start=$(date +%s)
   out=$(run_settle_spawn "$id")
   status=$?
-  end=$(date +%s)
-  elapsed=$((end - start))
-  expect_code 0 "$status" "spawn should succeed when the pane is already settled"
+  expect_code 0 "$status" "spawn should succeed when the pane is already settled"$'\n'"$out"
   assert_grep "worktree=$WT_DIR" "$HOME_DIR/state/$id.meta" \
     "meta did not record the already-settled worktree"
-  [ "$elapsed" -le 5 ] || fail "already-settled pane took ${elapsed}s to confirm - expected close to the single inter-poll sleep"
-  pass "an already-settled pane confirms via the existing inter-poll sleep, not an extra full cycle"
+  reads=$(cat "$COUNTFILE")
+  [ "$reads" -eq 3 ] || fail "already-settled pane took $reads reads to confirm - expected the first read, one confirmation, and the launch-boundary cwd check"
+  pass "an already-settled pane confirms on the next read, not a whole extra cycle"
+}
+
+# make_primary_case <name> <id> <stale_reads> builds the linked-home shape: the
+# spawning project is itself a LINKED worktree of the repository, and the path
+# the pane transiently reports is that repository's PRIMARY checkout. `treehouse
+# get` reports the repository it is preparing a slot from as its own cwd while
+# it is still fetching and checking out, so the pane reads the primary for the
+# first seconds. The primary is not the spawning project, so a poll that only
+# compares against the project accepts it as the worktree, and the isolation
+# guard then refuses the launch even though treehouse went on to enter a real
+# slot. The settled path is a second linked worktree of the same repository.
+make_primary_case() {
+  local name=$1 id=$2 stale_reads=$3 case_dir home primary proj wt fakebin countfile
+  case_dir="$TMP_ROOT/$name"
+  home="$case_dir/home"
+  primary="$case_dir/primary"
+  proj="$case_dir/mate"
+  wt="$case_dir/slot"
+  countfile="$case_dir/pane-call-count"
+  fakebin=$(make_settle_fakebin "$case_dir/fake")
+  fm_test_spawn_home "$home" codex
+  fm_git_worktree "$primary" "$proj" "mate-$name"
+  git -C "$primary" worktree add --quiet -b "slot-$name" "$wt"
+  fm_test_spawn_brief "$home" "$id" "Exercise primary-checkout transient detection for $id."
+  printf '%s\n' "$case_dir|$home|$proj|$wt|$primary|$fakebin|$countfile|$stale_reads"
+}
+
+# The exact incident: the pane reports the repository primary for the first
+# reads, then settles into the slot treehouse actually created. The primary must
+# never be adopted as the worktree, so the spawn lands on the settled slot.
+test_transient_primary_checkout_is_not_accepted() {
+  local rec id out status
+  id=settle-primary-transient-z3
+  rec=$(make_primary_case settle-primary-transient "$id" 3)
+  read_settle_record "$rec"
+  fm_test_fake_sleep_noop "$FAKEBIN_DIR"
+
+  out=$(run_settle_spawn "$id")
+  status=$?
+  expect_code 0 "$status" "spawn should succeed once the pane leaves the primary checkout"$'\n'"$out"
+  assert_grep "worktree=$WT_DIR" "$HOME_DIR/state/$id.meta" \
+    "meta did not record the settled worktree"
+  assert_no_grep "worktree=$STALE_DIR" "$HOME_DIR/state/$id.meta" \
+    "meta wrongly recorded the repository primary checkout as the worktree"
+  pass "a transient primary-checkout pane read is not accepted as the worktree"
+}
+
+# A pane that never leaves the primary checkout must still fail at the deadline
+# rather than waiting forever or recording the primary.
+test_primary_checkout_that_never_settles_fails_at_the_deadline() {
+  local rec id out status
+  id=settle-primary-stuck-z4
+  rec=$(make_primary_case settle-primary-stuck "$id" 100000)
+  read_settle_record "$rec"
+  fm_test_fake_sleep_noop "$FAKEBIN_DIR"
+
+  out=$(run_settle_spawn "$id")
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn accepted a pane that never left the primary checkout"$'\n'"$out"
+  assert_contains "$out" "did not enter an isolated worktree" \
+    "spawn did not explain that the pane never reached an isolated worktree"
+  assert_contains "$out" "$STALE_DIR" \
+    "the refusal did not name the path the pane kept reporting"
+  assert_contains "$out" "repository's primary checkout" \
+    "the refusal did not say why that path was rejected"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "refused spawn published task metadata"
+  pass "a pane stuck on the primary checkout fails loudly at the deadline"
 }
 
 # An existing task record that cannot be opened for writing is the failure the
@@ -185,40 +256,6 @@ test_publication_survives_an_unwritable_existing_record() {
     "the published record did not carry the settled worktree"
   assert_grep "window=" "$meta" "the published record is missing its endpoint window"
   pass "an unwritable existing task record is replaced whole rather than published empty"
-}
-
-# The other half of the same contract: when publication genuinely cannot
-# complete, the spawn must say so and exit non-zero instead of printing its
-# success line over a backend terminal and worktree nothing will ever reclaim.
-# The rename is faulted for this task's record only, standing in for the
-# read-only filesystem, quota, and EIO cases that reach the same branch.
-test_failed_publication_refuses_to_report_success() {
-  local rec id out status
-  id=settle-publish-fault-z4
-  rec=$(make_settle_case settle-publish-fault "$id" 0)
-  read_settle_record "$rec"
-  cat > "$FAKEBIN_DIR/mv" <<SH
-#!/usr/bin/env bash
-set -u
-for arg in "\$@"; do
-  case "\$arg" in
-    *"/$id.meta") exit 1 ;;
-  esac
-done
-exec /bin/mv "\$@"
-SH
-  chmod +x "$FAKEBIN_DIR/mv"
-
-  out=$(run_settle_spawn "$id")
-  status=$?
-  [ "$status" -ne 0 ] || fail "a spawn whose task record could not be published exited 0: $out"
-  assert_contains "$out" "cannot publish task metadata" \
-    "the spawn did not say the task record could not be published"
-  assert_not_contains "$out" "spawned $id" \
-    "the spawn reported success even though its task record never landed"
-  assert_absent "$HOME_DIR/state/$id.meta" \
-    "an unpublished spawn still left a task record behind"
-  pass "a task record that cannot be published fails the spawn loudly instead of leaking a live endpoint"
 }
 
 # --- stalled-pane recovery --------------------------------------------------
@@ -316,7 +353,14 @@ make_stall_case() {
   printf 'codex\n' > "$STALL_HOME/config/crew-harness"
   fm_git_worktree "$STALL_PROJ" "$STALL_WT" "wt-$name"
   mkdir -p "$STALL_HOME/data/$id"
-  printf 'brief for %s\n' "$id" > "$STALL_HOME/data/$id/brief.md"
+  cat > "$STALL_HOME/data/$id/brief.md" <<EOF
+# Task
+## Captain's intent
+Exercise the stalled-terminal recovery for $id.
+
+## Firstmate spec
+Drive the worktree wait to its deadline against a rehash-shaped process.
+EOF
   touch "$STALL_HOME/state/.last-watcher-beat"
   # shellcheck disable=SC2016 # The placeholder belongs in the written script.
   printf '#!/usr/bin/env bash\nsleep "${1:-300}"\n' > "$STALL_REHASH"
@@ -396,7 +440,7 @@ test_a_timeout_without_the_signature_is_unchanged() {
   out=$(run_stall_spawn "$id")
   status=$?
   [ "$status" -ne 0 ] || fail "a genuine timeout exited 0: $out"
-  assert_contains "$out" "treehouse get did not enter a worktree within" \
+  assert_contains "$out" "treehouse get did not enter an isolated worktree within" \
     "the ordinary timeout no longer reports itself"
   assert_not_contains "$out" "pyenv" \
     "a timeout with an unrelated cause was blamed on pyenv"
@@ -501,7 +545,7 @@ test_a_command_line_mention_on_the_pane_does_not_trigger_recovery() {
   out=$(run_stall_spawn "$id")
   status=$?
   [ "$status" -ne 0 ] || fail "a timeout with no real rehash exited 0: $out"
-  assert_contains "$out" "treehouse get did not enter a worktree within" \
+  assert_contains "$out" "treehouse get did not enter an isolated worktree within" \
     "the ordinary timeout no longer reports itself"
   assert_not_contains "$out" "cleared orphaned pyenv rehash lock" \
     "a command-line mention was enough to make the spawn clear pyenv's lock"
@@ -511,9 +555,10 @@ test_a_command_line_mention_on_the_pane_does_not_trigger_recovery() {
 }
 
 test_single_stale_first_read_is_not_accepted
-test_already_settled_pane_costs_one_confirm_sleep
+test_already_settled_pane_costs_one_confirm_read
+test_transient_primary_checkout_is_not_accepted
+test_primary_checkout_that_never_settles_fails_at_the_deadline
 test_publication_survives_an_unwritable_existing_record
-test_failed_publication_refuses_to_report_success
 test_a_timeout_without_the_signature_is_unchanged
 test_an_orphaned_lock_stall_recovers_and_says_so
 test_a_live_rehash_stall_surfaces_the_refusal

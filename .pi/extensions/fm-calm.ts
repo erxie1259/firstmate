@@ -1,15 +1,15 @@
 // Firstmate's home-persistent Pi transcript presentation toggle.
 //
-// Verified against Pi 0.81.1 and 0.82.0, which expose built-in ToolDefinitions, per-slot
+// Verified against Pi 0.81.1, 0.82.0, and 0.84.4, which expose built-in ToolDefinitions, per-slot
 // renderers, renderShell: "self", session_start replacement reasons, agent_start and
 // agent_settled, ExtensionUIContext.setToolsExpanded(), setWorkingVisible(), setWidget()
 // with a disposable component factory, and setHiddenThinkingLabel().
 // ./lib/fm-calm-working-ship.ts owns the animated working presentation this file
 // installs. The focused tests pin those assumptions but never reject a
-// newer Pi solely for its version. The collapsed-thinking and operational-user
-// presentation adapters probe the exact API they patch and degrade independently with a
-// diagnostic (see installCalmPresentationAdapter below) if a future Pi removes it; Pi
-// still exposes no global renderer for arbitrary built-in or custom rows.
+// newer Pi solely for its version. The collapsed-thinking, operational-user, and
+// queued-operational presentation adapters probe the exact API they patch and degrade
+// independently with a diagnostic (see installCalmPresentationAdapter below) if a future
+// Pi removes it; Pi still exposes no global renderer for arbitrary built-in or custom rows.
 // docs/configuration.md owns the home-local Calm preference contract.
 //
 // Pi has one first-registration-wins ToolDefinition per tool name, with no merge or
@@ -50,15 +50,17 @@ import type { TSchema } from "typebox";
 import { installCalmAssistantLayout } from "./lib/fm-calm-assistant-layout.ts";
 import { installCalmOperationalUserLayout } from "./lib/fm-calm-operational-user-layout.ts";
 import {
+  installCalmPendingOperationalLayout,
+  refreshCalmPendingOperationalRows,
+} from "./lib/fm-calm-pending-operational-layout.ts";
+import {
   CALM_WORKING_SHIP_WIDGET_KEY,
   createCalmWorkingShipAnimation,
   createCalmWorkingShipWidget,
 } from "./lib/fm-calm-working-ship.ts";
 import {
-  type CalmPresentationLevel,
   calmPresentationHides,
   calmPresentationIsActive,
-  calmPresentationLevel,
   FIRSTMATE_CALM_PRESENTATION_EVENT,
   registerFirstmateSyntheticPresentation,
   setCalmPresentation,
@@ -121,22 +123,10 @@ function installCalmPresentationAdapter(name: string, install: () => void): void
   }
 }
 
-// /calm keeps its plain no-argument cycle and recognizes one argument, "max", which
-// selects the level that also hides mid-turn assistant working notes. A plain /calm
-// steps max back to ordinary Calm; any other argument keeps the existing on/off cycle
-// rather than failing a command that has always accepted whatever followed it.
-function nextCalmLevel(
-  current: CalmPresentationLevel,
-  args: string,
-): CalmPresentationLevel {
-  if (args.trim().toLowerCase() === "max") return "max";
-  if (current === "max") return "on";
-  return current === "on" ? "off" : "on";
-}
-
 export default function (pi: ExtensionAPI) {
   installCalmPresentationAdapter("collapsed-thinking", installCalmAssistantLayout);
   installCalmPresentationAdapter("operational-user-row", installCalmOperationalUserLayout);
+  installCalmPresentationAdapter("queued-operational-row", installCalmPendingOperationalLayout);
 
   let exportRendering = false;
   let removeTerminalInputHandler: (() => void) | undefined;
@@ -174,25 +164,23 @@ export default function (pi: ExtensionAPI) {
   const fmHome = process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || root;
   const configDirectory = process.env.FM_CONFIG_OVERRIDE || resolve(fmHome, "config");
   const calmPreferencePath = resolve(configDirectory, "calm");
-  // Every level the command can persist round-trips through this reader, so a session
-  // start, resume, fork, or reload restores the stored level instead of dropping an
-  // unrecognized one to off. docs/configuration.md owns the persisted value schema.
-  const loadCalmPreference = (): CalmPresentationLevel => {
+  // "max" is the legacy value written by the removed third presentation level, whose
+  // behavior is now ordinary Calm; a home upgraded from it restores as on rather than
+  // dropping to off. docs/configuration.md owns the persisted value schema.
+  const loadCalmPreference = (): boolean => {
     let stored: string;
     try {
       stored = readFileSync(calmPreferencePath, "utf8").trim();
     } catch {
-      return "off";
+      return false;
     }
-    if (stored === "on") return "on";
-    if (stored === "max") return "max";
-    return "off";
+    return stored === "on" || stored === "max";
   };
-  const persistCalmPreference = (level: CalmPresentationLevel): void => {
+  const persistCalmPreference = (active: boolean): void => {
     mkdirSync(dirname(calmPreferencePath), { recursive: true });
     const temporaryPath = `${calmPreferencePath}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      writeFileSync(temporaryPath, `${level}\n`, {
+      writeFileSync(temporaryPath, active ? "on\n" : "off\n", {
         encoding: "utf8",
         flag: "wx",
         mode: 0o600,
@@ -211,6 +199,22 @@ export default function (pi: ExtensionAPI) {
   };
 
   registerFirstmateSyntheticPresentation(pi);
+
+  // Every on-screen tool row Calm currently presents, keyed by the row-local state Pi
+  // hands its render slots, so Calm can repaint exactly those rows without touching
+  // Pi's transcript. Pi can re-render a row at any time - the built-in edit row
+  // invalidates itself once its diff is ready - so a row can be redrawn during the
+  // window where /export forces stock rendering and keep that stock content
+  // afterwards. Rows Pi's exporter renders are excluded: those use throwaway state
+  // and never appear on screen. Cleared per session lifetime, which rebuilds the rows.
+  const calmToolRowRepaints = new Map<object, () => void>();
+  const rememberCalmToolRow = (state: object, invalidate: unknown): void => {
+    if (exportRendering || typeof invalidate !== "function") return;
+    calmToolRowRepaints.set(state, invalidate as () => void);
+  };
+  const repaintCalmToolRows = (): void => {
+    for (const invalidate of calmToolRowRepaints.values()) invalidate();
+  };
 
   function wrapBuiltIn<TParams extends TSchema, TDetails, TState>(
     factory: DefinitionFactory<TParams, TDetails, TState>,
@@ -279,6 +283,7 @@ export default function (pi: ExtensionAPI) {
         theme: RenderTheme<TParams, TDetails, TState>,
         context: RenderContext<TParams, TDetails, TState>,
       ) {
+        rememberCalmToolRow(context.state as object, context.invalidate);
         if (exportRendering) return originalRenderCall(args, theme, context);
         if (calmPresentationHides("assistant-tool-call")) return new Container();
         if (originalSelfShell) return originalRenderCall(args, theme, context);
@@ -297,6 +302,7 @@ export default function (pi: ExtensionAPI) {
         theme: RenderTheme<TParams, TDetails, TState>,
         context: RenderContext<TParams, TDetails, TState>,
       ) {
+        rememberCalmToolRow(context.state as object, context.invalidate);
         if (exportRendering) return originalRenderResult(result, options, theme, context);
         if (calmPresentationHides("tool-result")) return new Container();
         if (originalSelfShell) return originalRenderResult(result, options, theme, context);
@@ -334,7 +340,7 @@ export default function (pi: ExtensionAPI) {
   // unconditional here (see file header): a foreign-claim check is not reachable at
   // this point, while deferral would make restored rows capture the wrong definition.
   // A Calm-off session or reload registers nothing and creates no collision exposure.
-  if (loadCalmPreference() !== "off") {
+  if (loadCalmPreference()) {
     for (const tool of wrappedBuiltIns) pi.registerTool(tool);
     builtInsRegistered = true;
   }
@@ -409,6 +415,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     reportBuiltInLosses();
+    calmToolRowRepaints.clear();
     exportRendering = false;
     setCalmPresentation(loadCalmPreference());
     setCalmStockExportRendering(false);
@@ -422,7 +429,7 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("firstmate-calm", undefined);
     removeTerminalInputHandler?.();
     removeTerminalInputHandler = ctx.ui.onTerminalInput((data) => {
-      if (!getKeybindings().matches(data, "tui.input.submit")) return;
+      if (!getKeybindings().matches(data, "tui.input.submit")) return undefined;
 
       const input = ctx.ui.getEditorText().trim();
       if (
@@ -430,7 +437,7 @@ export default function (pi: ExtensionAPI) {
         input !== "/export" &&
         !input.startsWith("/export ")
       ) {
-        return;
+        return undefined;
       }
 
       exportRendering = true;
@@ -440,10 +447,19 @@ export default function (pi: ExtensionAPI) {
         exportRendering = false;
         setCalmStockExportRendering(false);
         publishPresentationState();
-        const expanded = ctx.ui.getToolsExpanded();
-        ctx.ui.setToolsExpanded(!expanded);
-        ctx.ui.setToolsExpanded(expanded);
+        // Repaint the rows Calm presents, never the whole transcript. Pi's export
+        // prints "Session exported to: <path>" immediately before this runs, and
+        // since Pi 0.83.0 setToolsExpanded() emits its own status line; consecutive
+        // status lines coalesce, so a tools-expanded round-trip here silently
+        // overwrote the confirmation and left the captain no record of where their
+        // export landed. Invalidating the rows individually repaints the same
+        // content with no status line of its own, and setStatus adds the redraw the
+        // rows that consult Calm live in render(), such as operational user rows,
+        // need without appending anything to the transcript.
+        repaintCalmToolRows();
+        ctx.ui.setStatus("firstmate-calm", undefined);
       }, 0);
+      return undefined;
     });
   });
 
@@ -465,18 +481,18 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("calm", {
     description: "Toggle Firstmate's supported conversation-only transcript presentation.",
-    handler: async (args, ctx) => {
-      const level = nextCalmLevel(calmPresentationLevel(), args ?? "");
-      const active = level !== "off";
-      persistCalmPreference(level);
-      setCalmPresentation(level);
+    handler: async (_args, ctx) => {
+      const active = !calmPresentationIsActive();
+      persistCalmPreference(active);
+      setCalmPresentation(active);
       if (active) activateBuiltInsIfNeeded(ctx.ui);
       publishPresentationState();
       applyWorkingPresentation(ctx.ui, true);
       // Pi re-runs every assistant row's layout from this call even when the label is
-      // unchanged, which is what makes a level change apply to rows already on screen.
+      // unchanged, which is what makes a toggle apply to rows already on screen.
       ctx.ui.setHiddenThinkingLabel(active ? "" : undefined);
       ctx.ui.setStatus("firstmate-calm", undefined);
+      refreshCalmPendingOperationalRows();
 
       const expanded = ctx.ui.getToolsExpanded();
       ctx.ui.setToolsExpanded(!expanded);

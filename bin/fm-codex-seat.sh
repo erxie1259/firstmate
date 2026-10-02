@@ -57,6 +57,10 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 . "$SCRIPT_DIR/fm-codex-seat-lib.sh"
 # shellcheck source=bin/fm-quota-axi-lib.sh
 . "$SCRIPT_DIR/fm-quota-axi-lib.sh"
+# fm_quota_axi_compatible's bounded form requires fm_run_timed to be defined,
+# and refuses rather than falling back to an unbounded probe without it.
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
 
 usage() {
   awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0" >&2

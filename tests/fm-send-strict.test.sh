@@ -231,34 +231,6 @@ test_key_send_exit_status_follows_delivery() {
   pass "fm-send --key: exit status follows delivery, and an undelivered key never reports success"
 }
 
-# A --key send is how firstmate interrupts a worker, so its exit status is the
-# only signal that the interrupt actually landed.
-# Reporting success for a key that was never delivered would leave supervision
-# believing a runaway worker had been stopped, so the failing case must exit
-# nonzero and name the key.
-# Both directions are asserted from one stub so the failing case cannot go
-# quietly vacuous if the key ever stops being delivered at all.
-test_key_send_exit_status_follows_delivery() {
-  local dir fb home err log rc
-  dir="$TMP_ROOT/key-exit"; mkdir -p "$dir"
-  fb=$(make_stubs "$dir"); home=$(setup_home keyexit); err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
-  fm_write_meta "$home/state/lane-key.meta" "window=sess:fm-lane-key" "kind=ship"
-
-  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
-    "$SEND" lane-key --key Escape >/dev/null 2>"$err"; rc=$?
-  expect_code 0 "$rc" "a delivered --key interrupt should report success"
-  assert_contains "$(cat "$log")" "target=sess:fm-lane-key literal=0 arg=Escape" "the delivered case should send the named key"
-
-  : > "$log"
-  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
-    FM_FAKE_TMUX_SEND_KEY_FAIL=Escape \
-    "$SEND" lane-key --key Escape >/dev/null 2>"$err"; rc=$?
-  [ "$rc" -ne 0 ] || fail "an undelivered --key interrupt reported success"
-  assert_contains "$(cat "$err")" "key 'Escape' not sent" "the undelivered case should name the key that failed"
-  assert_contains "$(cat "$log")" "target=sess:fm-lane-key literal=0 arg=Escape" "the undelivered case should still have attempted the send"
-  pass "fm-send --key: exit status follows delivery, and an undelivered key never reports success"
-}
-
 test_exact_lane_id_send_still_works
 test_key_send_exit_status_follows_delivery
 test_unset_fm_home_fails

@@ -254,6 +254,22 @@ test_pi_pin_selects_the_root_and_the_declared_provider() {
   pass "a Pi pin selects its root and passes the declared provider"
 }
 
+test_pi_pin_and_codex_seat_refuse_before_launch() {
+  local out rc id=acct-pi-seat
+  new_case pi-seat pi
+  mkdir -p "$CASE/pi-work" "$CASE/seats/selene" "$CASE/seats/selene-pi" "$HOME_DIR/config"
+  printf 'openai-codex\n' > "$CASE/pi-work/signed-in"
+  printf '{"fixture":"not-a-credential"}\n' > "$CASE/seats/selene/auth.json"
+  printf '{"fixture":"not-a-credential"}\n' > "$CASE/seats/selene-pi/auth.json"
+  printf '%s\nopenai-codex\n' "$CASE/pi-work" > "$HOME_DIR/config/pi-account"
+  printf 'selene %s %s\n' "$CASE/seats/selene" "$CASE/seats/selene-pi" > "$HOME_DIR/config/codex-seats"
+  out=$(spawn_ship "$id" --model openai-codex/gpt-5.5 --seat selene); rc=$?
+  expect_code 1 "$rc" "a Pi worker-account pin and Codex seat must refuse before launch"
+  assert_refused_before_launch "$id" "$out" "config/pi-account cannot be combined with Codex seat 'selene'"
+  assert_contains "$out" "PI_CODING_AGENT_DIR" "the refusal should name the conflicting environment"
+  pass "a Pi worker-account pin and Codex seat refuse before any worker launches"
+}
+
 test_pi_pin_refusals() {
   local out rc id=acct-pi-bad
   new_case pi-refusals pi
@@ -390,6 +406,7 @@ test_claude_pin_refuses_a_signed_out_root_despite_an_ambient_login
 test_claude_ordinary_pin_unsets_the_config_root
 test_malformed_pins_refuse_before_launch
 test_pi_pin_selects_the_root_and_the_declared_provider
+test_pi_pin_and_codex_seat_refuse_before_launch
 test_pi_pin_refusals
 test_pi_extension_provider_and_old_pi_fall_back_to_the_model_listing
 test_a_pin_governs_only_its_own_runner

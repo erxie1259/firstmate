@@ -28,6 +28,7 @@ A Codex team workspace can hold more than one subscription seat, and each seat h
 `config/codex-seats` names them, and a seat is a fourth launch profile axis alongside harness, model, and effort: `../../../bin/fm-spawn.sh --seat <name>`.
 It reaches exactly two runtimes, because those are the ones that spend a Codex seat: `harness=codex`, where it sets `CODEX_HOME`, and a `pi`/`pi-signed` launch on an `openai-codex/*` model, where it sets `PI_CODING_AGENT_DIR`.
 Every other harness or model is a refusal, not a silently dropped flag.
+The operator-facing `config/pi-account` conflict rule is owned by `../../../docs/configuration.md`: spawn and relaunch refuse before endpoint creation when a Pi `openai-codex/*` launch names both a worker-account pin and a Codex seat, because both select `PI_CODING_AGENT_DIR`.
 `../../../docs/configuration.md` "Codex seats" owns the file format, the one-time per-store sign-in, and the mirror helper; `../../../bin/fm-codex-seat-lib.sh` owns the executable contract.
 
 Treat each configured seat as its own quota scope, because it is one: `quota-axi` reports a seat's windows only when pointed at that seat's store, and one seat's exhausted window says nothing about another's.

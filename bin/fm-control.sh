@@ -871,10 +871,10 @@ resolve_relaunch_profile() {
   # The launch owner applies this home's worker account pin too, but only after
   # the old agent has been stopped, so a pin that no longer resolves or is
   # signed out must refuse here, while nothing has changed yet.
-  local account_model=$TARGET_MODEL
+  local account_model=$TARGET_MODEL account_selection
   [ "$account_model" != default ] || account_model=
-  fm_worker_account_select "$TARGET_HARNESS" "${FM_CONFIG_OVERRIDE:-$FM_HOME/config}" \
-    "$account_model" "$TARGET_HARNESS" >/dev/null || return 1
+  account_selection=$(fm_worker_account_select "$TARGET_HARNESS" "${FM_CONFIG_OVERRIDE:-$FM_HOME/config}" \
+    "$account_model" "$TARGET_HARNESS") || return 1
   local target_seat=
   if [ "$SEAT_SET" = 1 ]; then
     target_seat=$NEW_SEAT
@@ -884,6 +884,13 @@ resolve_relaunch_profile() {
   if [ -n "$target_seat" ]; then
     fm_codex_seat_env_prefix "$CONFIG" "$target_seat" "$TARGET_HARNESS" "$TARGET_MODEL" >/dev/null \
       || die "relaunch target cannot use Codex seat '$target_seat'"
+  fi
+  if [ -n "$account_selection" ] && [ -n "$target_seat" ]; then
+    case "$TARGET_HARNESS" in
+    pi | pi-signed)
+      die "config/pi-account cannot be combined with Codex seat '$target_seat' for a Pi openai-codex launch; both select PI_CODING_AGENT_DIR, so remove the worker-account pin or omit --seat"
+      ;;
+    esac
   fi
 }
 

@@ -1161,6 +1161,42 @@ test_control_relaunch_refuses_an_invalid_seat_before_stopping() {
   pass "fm-control relaunch validates the replacement seat before stopping the existing agent"
 }
 
+test_control_relaunch_refuses_pi_account_and_codex_seat_before_stopping() {
+  local dir out rc id=rl-pi-seat before
+  dir=$(new_case pi-seat "$id")
+  add_ship_task "$dir" "$id" pi
+  cat > "$dir/fakebin/pi" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = auth ] && [ "${2:-}" = check ]; then
+  printf '{"status":"ready","provider":"%s"}\n' "${4:-}"
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$dir/fakebin/pi"
+  sed 's/^model=default$/model=openai-codex\/gpt-5.5/' \
+    "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.tmp"
+  mv "$dir/home/state/$id.meta.tmp" "$dir/home/state/$id.meta"
+  mkdir -p "$dir/home/config" "$dir/pi-work" "$dir/seats/selene" "$dir/seats/selene-pi"
+  printf '%s\nopenai-codex\n' "$dir/pi-work" > "$dir/home/config/pi-account"
+  printf '{"fixture":"not-a-credential"}\n' > "$dir/seats/selene/auth.json"
+  printf '{"fixture":"not-a-credential"}\n' > "$dir/seats/selene-pi/auth.json"
+  printf 'selene %s %s\n' "$dir/seats/selene" "$dir/seats/selene-pi" > "$dir/home/config/codex-seats"
+  printf 'pi' > "$dir/fake/command"
+  printf 'pi' > "$dir/fake/becomes"
+  before=$(cat "$dir/home/state/$id.meta")
+
+  out=$(run_control "$dir" "$id" relaunch --seat selene --note "do not stop for conflicting account selection"); rc=$?
+  expect_code 1 "$rc" "a Pi worker-account pin and Codex seat must refuse before relaunch"
+  assert_contains "$out" "config/pi-account cannot be combined with Codex seat 'selene'" \
+    "the relaunch refusal should name the conflicting selection"
+  assert_contains "$out" "PI_CODING_AGENT_DIR" "the relaunch refusal should name the conflicting environment"
+  [ "$(cat "$dir/fake/command")" = pi ] || fail "the conflicting relaunch stopped the existing Pi agent"
+  [ "$(cat "$dir/home/state/$id.meta")" = "$before" ] || fail "the conflicting relaunch changed the task record"
+  [ ! -s "$dir/fake/literal" ] || fail "the conflicting relaunch sent lifecycle input"
+  pass "fm-control relaunch refuses a Pi worker-account pin and Codex seat before stopping"
+}
+
 test_ship_relaunch_ignores_the_crew_harness_config() {
   local dir out
   dir=$(new_case crewcfg rl20)
@@ -2557,6 +2593,7 @@ test_spawn_relaunch_keeps_the_recorded_codex_seat
 test_spawn_relaunch_drops_an_inherited_seat_the_new_harness_cannot_use
 test_control_relaunch_moves_the_task_onto_a_named_seat
 test_control_relaunch_refuses_an_invalid_seat_before_stopping
+test_control_relaunch_refuses_pi_account_and_codex_seat_before_stopping
 test_tmux_refuses_a_window_missing_from_its_session
 test_tmux_refuses_a_session_that_cannot_be_found
 test_tmux_refuses_when_the_server_is_gone

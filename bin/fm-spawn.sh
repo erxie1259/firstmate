@@ -2517,6 +2517,14 @@ if [ -n "$SEAT" ]; then
     exit 1
   fi
 fi
+if [ -n "$WORKER_ACCOUNT" ] && [ -n "$SEAT_ENV_PREFIX" ]; then
+  case "$HARNESS" in
+  pi | pi-signed)
+    echo "error: config/pi-account cannot be combined with Codex seat '$SEAT' for a Pi openai-codex launch; both select PI_CODING_AGENT_DIR, so remove the worker-account pin or omit --seat" >&2
+    exit 1
+    ;;
+  esac
+fi
 
 secondmate_registry_value() {
   secondmate_registry_field "$DATA/secondmates.md" "$1" "$2"

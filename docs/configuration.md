@@ -1153,6 +1153,8 @@ Codex identity comes from the store `CODEX_HOME` points at, so each seat reports
 `bin/fm-spawn.sh --seat <name>` applies a seat to one launch: for `harness=codex` it sets `CODEX_HOME` in the launch command, and for a `pi` or `pi-signed` launch running an `openai-codex/*` model it sets `PI_CODING_AGENT_DIR`.
 The launch command is the carrier because a worker starts in a pane created by a long-lived backend daemon that does not inherit the spawning shell's environment.
 Any other harness or model combination is refused rather than silently ignored, and a missing seat, store, or store credential refuses before any worker exists, so a launch never falls back to another seat's quota.
+A named Codex seat cannot be combined with `config/pi-account` on a Pi `openai-codex/*` launch: both select `PI_CODING_AGENT_DIR`, so spawn and relaunch refuse before creating or replacing an endpoint.
+Remove the worker-account pin or omit `--seat` to choose one of those account-selection mechanisms.
 The resolved seat is recorded as `seat=` in task metadata and reused by `fm-spawn.sh --relaunch` and therefore by `bin/fm-control.sh relaunch`, which also accepts its own `--seat` to move a task onto another seat.
 A remote secondmate launch refuses `--seat`, because seat paths are local to the host that holds them.
 

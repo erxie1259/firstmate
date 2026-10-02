@@ -86,13 +86,11 @@ fm_pyenv_shim_lock_age_seconds() {  # <path>
   printf '%s\n' "$age"
 }
 
-# fm_pyenv_process_rows: one `pid<TAB>ppid<TAB>etime<TAB>argv0<TAB>argv1` row per
+# fm_pyenv_process_rows: one `pid<TAB>ppid<TAB>etime<TAB>argv0<TAB>args` row per
 # process. Taken once per classification so every question below is answered from
 # the same snapshot rather than racing separate `ps` calls against each other -
 # including how long each process has been running, which is why the elapsed-time
 # column is part of this one read rather than a per-pid `ps` of its own.
-# A shell path containing a space would split wrong and simply fail to match,
-# which loses a detection rather than inventing one.
 fm_pyenv_process_rows() {
   local ps_bin=${FM_PYENV_PS_BIN:-ps} raw
   command -v "$ps_bin" >/dev/null 2>&1 || return 1
@@ -100,7 +98,44 @@ fm_pyenv_process_rows() {
   # unreadable process table into a confident empty answer.
   raw=$("$ps_bin" -axo pid=,ppid=,etime=,args= 2>/dev/null) || return 1
   [ -n "$raw" ] || return 1
-  printf '%s\n' "$raw" | awk '{ printf "%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4, $5 }'
+  printf '%s\n' "$raw" | awk '
+    {
+      line = $0
+      sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+/, "", line)
+      args = line
+      argv0 = args
+      sub(/[[:space:]].*$/, "", argv0)
+      rest = args
+      if (args == argv0) rest = ""
+      else sub(/^[^[:space:]]+[[:space:]]*/, "", rest)
+      printf "%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, argv0, rest
+    }
+  '
+}
+
+fm_pyenv_rehash_path_from_args() {  # <args>
+  local args=${1:-} candidate suffix first
+  case "$args" in
+    */pyenv-rehash*)
+      candidate=${args%%/pyenv-rehash*}/pyenv-rehash
+      suffix=${args#"$candidate"}
+      case "$suffix" in
+        ''|' '*)
+          if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+          fi
+          ;;
+        *) return 2 ;;
+      esac
+      first=${args%% *}
+      if [ -f "$first" ] && [ -x "$first" ]; then
+        return 1
+      fi
+      return 2
+      ;;
+  esac
+  return 1
 }
 
 # fm_pyenv_etime_seconds: <etime> in whole seconds, parsing the [[dd-]hh:]mm:ss
@@ -174,24 +209,26 @@ fm_pyenv_ancestry() {  # <pid> <rows>
 # pyenv-rehash process, holder or waiter, excluding this process and its
 # ancestors. Elapsed time is carried so a caller can derive when each process
 # started; it is empty when `ps` gave no readable time for that process.
-# Status 1 means the process table could not be read at all, which is a refusal
-# to guess rather than an answer of "none".
+# Status 1 means the process table could not be read at all, and status 2 means a
+# shell row's rehash identity was ambiguous. Both are refusals to guess rather than
+# answers of "none".
 # An already-taken snapshot may be passed in so a caller that also walks ancestry
 # answers every question from the one read this file's contract promises; omit it
 # and a fresh snapshot is taken here.
 fm_pyenv_rehash_scan() {  # [rows]
-  local rows=${1:-} exclude pid etime argv0 argv1 elapsed
+  local rows=${1:-} exclude pid etime argv0 args elapsed status
   [ -n "$rows" ] || rows=$(fm_pyenv_process_rows) || return 1
   exclude=$(fm_pyenv_ancestry "$$" "$rows")
-  # Field 2 is the parent pid, needed by the ancestry walks that share these
-  # rows but not here, so it is read into the throwaway and left unnamed.
-  while IFS=$'\t' read -r pid _ etime argv0 argv1; do
-    [ -n "${argv1:-}" ] || continue
-    [ "${argv1##*/}" = pyenv-rehash ] || continue
+  while IFS=$'\t' read -r pid _ etime argv0 args; do
+    [ -n "${args:-}" ] || continue
     fm_pyenv_is_shell_argv0 "$argv0" || continue
-    # The file-system half of the identity: prose on a command line can name the
-    # path, but only a real invocation has argv1 pointing at the executable file.
-    [ -f "$argv1" ] && [ -x "$argv1" ] || continue
+    if fm_pyenv_rehash_path_from_args "$args" >/dev/null; then
+      :
+    else
+      status=$?
+      [ "$status" -eq 1 ] && continue
+      return 2
+    fi
     printf '%s\n' "$exclude" | grep -qx -- "$pid" && continue
     elapsed=$(fm_pyenv_etime_seconds "${etime:-}") || elapsed=""
     printf '%s\t%s\n' "$pid" "$elapsed"
@@ -206,7 +243,11 @@ EOF
 # Takes the same optional already-read snapshot as fm_pyenv_rehash_scan.
 fm_pyenv_rehash_pids() {  # [rows]
   local scanned
-  scanned=$(fm_pyenv_rehash_scan "${1:-}") || return 1
+  if scanned=$(fm_pyenv_rehash_scan "${1:-}"); then
+    :
+  else
+    return $?
+  fi
   printf '%s' "$scanned" | awk -F '\t' 'NF { print $1 }'
 }
 
@@ -239,9 +280,14 @@ fm_pyenv_rehash_pids() {  # [rows]
 # past the lock. Both reads therefore err toward keeping a process in the set,
 # which keeps the slack a bound rather than an assumption about scan latency.
 fm_pyenv_rehash_live_pids() {  # <lock-path>
-  local scanned mtime now
+  local scanned mtime now status
   now=$(date +%s) || now=""
-  scanned=$(fm_pyenv_rehash_scan) || return 1
+  if scanned=$(fm_pyenv_rehash_scan); then
+    :
+  else
+    status=$?
+    return "$status"
+  fi
   mtime=$(fm_pyenv_mtime "${1:-}") || mtime=""
   if [ -z "$mtime" ] || [ -z "$now" ]; then
     printf '%s' "$scanned" | awk -F '\t' 'NF { print $1 }'
@@ -277,7 +323,8 @@ fm_pyenv_pid_has_ancestor() {  # <pid> <ancestor> [rows]
 #   absent   - no lock, nothing to do
 #   orphaned - the lock is present and no rehash can still be holding it
 #   live     - a rehash is genuinely in progress and the lock is its own
-#   unknown  - the process table could not be read, so nothing may be concluded
+#   unknown  - the process table could not be read or a rehash identity was
+#              ambiguous, so nothing may be concluded
 # On `live` it also prints the deciding holder pid as a second field.
 #
 # The rule, in one place. A process that could actually be holding this lock is
@@ -294,12 +341,22 @@ fm_pyenv_pid_has_ancestor() {  # <pid> <ancestor> [rows]
 # started between the two reads is not stepped on. When the process table cannot
 # be read at all, nothing is provably alive: an old lock is still orphaned, so an
 # unreadable table cannot turn the fault this tool exists for into `unknown`,
-# while a young one stays `unknown` rather than being cleared on a guess.
+# while a young one stays `unknown` rather than being cleared on a guess. An
+# ambiguous rehash identity is always `unknown`, regardless of lock age.
 fm_pyenv_shim_lock_state() {  # <lock-path>
-  local lock=$1 age pids
+  local lock=$1 age pids scan_status
   [ -e "$lock" ] || { printf 'absent\n'; return 0; }
   age=$(fm_pyenv_shim_lock_age_seconds "$lock") || { printf 'unknown\n'; return 0; }
-  if ! pids=$(fm_pyenv_rehash_live_pids "$lock"); then
+  if pids=$(fm_pyenv_rehash_live_pids "$lock"); then
+    scan_status=0
+  else
+    scan_status=$?
+  fi
+  if [ "$scan_status" -eq 2 ]; then
+    printf 'unknown\n'
+    return 0
+  fi
+  if [ "$scan_status" -ne 0 ]; then
     if [ "$age" -ge "$FM_PYENV_REHASH_STALE_SECS" ]; then
       printf 'orphaned\n'
     else
@@ -317,7 +374,16 @@ fm_pyenv_shim_lock_state() {  # <lock-path>
   fi
   sleep 0.5
   [ -e "$lock" ] || { printf 'absent\n'; return 0; }
-  if ! pids=$(fm_pyenv_rehash_live_pids "$lock"); then
+  if pids=$(fm_pyenv_rehash_live_pids "$lock"); then
+    scan_status=0
+  else
+    scan_status=$?
+  fi
+  if [ "$scan_status" -eq 2 ]; then
+    printf 'unknown\n'
+    return 0
+  fi
+  if [ "$scan_status" -ne 0 ]; then
     printf 'unknown\n'
     return 0
   fi

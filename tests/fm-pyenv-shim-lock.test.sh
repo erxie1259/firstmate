@@ -262,6 +262,24 @@ test_a_command_line_mention_is_not_a_holder() {
   pass "a process that only mentions pyenv-rehash on its command line is not treated as the holder"
 }
 
+test_an_unverified_shell_command_stays_unknown() {
+  local out status mention
+  read_case "$(make_case shell-mention)"
+  write_lock 'body' old
+  bash -c "printf '%s\\n' '$REHASH' >/dev/null; sleep 120" >/dev/null 2>&1 &
+  mention=$!
+  BG_PIDS="$BG_PIDS $mention"
+  wait_for_pid "$mention"
+  out=$(run_clear)
+  status=$?
+  expect_code 1 "$status" "an unverified shell command must refuse to classify an old lock"
+  assert_contains "$out" "cannot tell whether a pyenv rehash is running" \
+    "the shell command mention did not fail closed"
+  assert_present "$LOCK" "an unverified shell command allowed an old lock to move"
+  stop_background
+  pass "an unverified shell command mentioning pyenv-rehash stays unknown"
+}
+
 # The observed fault: the lock is long orphaned and every new shell is stuck
 # WAITING on it, so live rehash processes exist and none of them created this
 # lock - each started long after the file was already there. The lock is also
@@ -393,6 +411,7 @@ test_a_live_rehash_is_refused
 test_a_live_rehash_path_with_spaces_is_refused
 test_an_ambiguous_rehash_identity_refuses_an_old_lock
 test_a_command_line_mention_is_not_a_holder
+test_an_unverified_shell_command_stays_unknown
 test_a_stale_lock_is_cleared_even_while_waiters_run
 test_a_young_lock_with_a_waiting_rehash_is_cleared
 # The false clear that the age threshold used to allow. A rehash whose body runs

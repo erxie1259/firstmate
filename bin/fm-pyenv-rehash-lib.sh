@@ -117,6 +117,9 @@ fm_pyenv_rehash_path_from_args() {  # <args>
   local args=${1:-} candidate suffix first
   case "$args" in
     */pyenv-rehash*)
+      case "$args" in
+        -*) return 2 ;;
+      esac
       candidate=${args%%/pyenv-rehash*}/pyenv-rehash
       suffix=${args#"$candidate"}
       case "$suffix" in

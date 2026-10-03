@@ -128,3 +128,32 @@ fm_envelope_summary() {  # <file> - one short human line for a report
   command -v jq >/dev/null 2>&1 || return 1
   jq -r '"\(.files_changed | length) file(s) claimed, \(.tests_passed | floor)/\(.tests_run | floor) tests passing, \(.open_questions | length) open question(s)"' < "$file"
 }
+
+# Print teardown's advisory note for a task's typed terminal envelope.
+#
+# Teardown validates the record at the last moment it is read next to the work
+# it describes, but never lets an absent, invalid, or uncheckable envelope
+# refuse cleanup. Claims-versus-diff checking belongs to bin/fm-gate.sh, which
+# runs while the task's branch is still the thing under inspection.
+fm_envelope_teardown_note() {  # <data-dir> <task-id>
+  local data_dir=${1:-} task_id=${2:-}
+  local envelope_path envelope_status envelope_why
+
+  envelope_path=$(fm_envelope_path "$data_dir" "$task_id")
+  if [ -e "$envelope_path" ]; then
+    envelope_status=0
+    envelope_why=$(fm_envelope_validate "$envelope_path") || envelope_status=$?
+    case "$envelope_status" in
+      0)
+        echo "ENVELOPE: $task_id declares $(fm_envelope_summary "$envelope_path" 2>/dev/null || echo 'a valid terminal envelope')"
+        ;;
+      2)
+        echo "ENVELOPE: $task_id left an envelope that could not be checked - $envelope_why" >&2
+        ;;
+      *)
+        echo "ENVELOPE: $task_id left an unusable envelope at $envelope_path - $envelope_why" >&2
+        echo "Cleanup continues; this is a note about the record, not about the work." >&2
+        ;;
+    esac
+  fi
+}

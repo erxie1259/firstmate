@@ -64,6 +64,8 @@ SH
   ln -s "$ROOT/bin/fm-cursor-lib.sh" "$fake/bin/fm-cursor-lib.sh"
   ln -s "$ROOT/bin/fm-composer-lib.sh" "$fake/bin/fm-composer-lib.sh"
   ln -s "$ROOT/bin/fm-nm-run-lib.sh" "$fake/bin/fm-nm-run-lib.sh"
+  ln -s "$ROOT/bin/fm-envelope-lib.sh" "$fake/bin/fm-envelope-lib.sh"
+  ln -s "$ROOT/bin/fm-supervision-engine-lib.sh" "$fake/bin/fm-supervision-engine-lib.sh"
   # fm-lock-lib.sh: teardown sources it for the shared lock-staleness proof.
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   # fm-lease-lib.sh: teardown sources it for the supervision lease guard.
@@ -130,8 +132,10 @@ harness=claude
 kind=ship
 mode=no-mistakes
 yolo=off
-tasktmp=$tasktmp
 META
+  if [ -n "$tasktmp" ]; then
+    printf 'tasktmp=%s\n' "$tasktmp" >> "$fake/state/$id.meta"
+  fi
   printf '%s' "$fake"
 }
 
@@ -172,6 +176,8 @@ SH
   ln -s "$ROOT/bin/fm-cursor-lib.sh" "$fake/bin/fm-cursor-lib.sh"
   ln -s "$ROOT/bin/fm-composer-lib.sh" "$fake/bin/fm-composer-lib.sh"
   ln -s "$ROOT/bin/fm-nm-run-lib.sh" "$fake/bin/fm-nm-run-lib.sh"
+  ln -s "$ROOT/bin/fm-envelope-lib.sh" "$fake/bin/fm-envelope-lib.sh"
+  ln -s "$ROOT/bin/fm-supervision-engine-lib.sh" "$fake/bin/fm-supervision-engine-lib.sh"
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   # fm-lease-lib.sh: teardown sources it for the supervision lease guard.
   ln -s "$ROOT/bin/fm-lease-lib.sh" "$fake/bin/fm-lease-lib.sh"

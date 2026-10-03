@@ -174,7 +174,7 @@ rules_err=$(jq -r --argjson verified_harnesses "$VERIFIED_HARNESSES" --arg provi
     or ($p | has("provider") and (provider_id(.provider) | not))
     or ($p | has("floor") and floor_bad(.floor; false));
   def duplicate_profiles($items):
-    ($items | map([.harness, (.model // null), (.effort // null)] | @json)) as $keys
+    ($items | map([.harness, (.model // null), (.effort // null), (.seat // null)] | @json)) as $keys
     | ($keys | length) != ($keys | unique | length);
   if type != "object" then "top-level value must be an object"
   elif has("rules") and (.rules | type) != "array" then "rules must be an array"

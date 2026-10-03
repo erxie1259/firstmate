@@ -266,7 +266,7 @@ test_an_unverified_shell_command_stays_unknown() {
   local out status mention
   read_case "$(make_case shell-mention)"
   write_lock 'body' old
-  bash -c "printf '%s\\n' '$REHASH' >/dev/null; sleep 120" >/dev/null 2>&1 &
+  bash -c "printf '%s\\n' '$REHASH' >/dev/null; while :; do sleep 120; done" >/dev/null 2>&1 &
   mention=$!
   BG_PIDS="$BG_PIDS $mention"
   wait_for_pid "$mention"

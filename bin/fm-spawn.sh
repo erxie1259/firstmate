@@ -1333,7 +1333,12 @@ spawn_abort_cleanup() {
   fi
   if [ "$HERDR_PROJECTION_ABORT_CLEANUP" = 1 ] &&
     [ "$HERDR_PRESENTATION_ORDER_LOCK_HELD" != 1 ]; then
-    if ! spawn_herdr_presentation_order_lock_acquire "${HERDR_PROJECTION_ABORT_SESSION:-}"; then
+    spawn_abort_lock_rc=0
+    spawn_herdr_presentation_order_lock_acquire \
+      "${HERDR_PROJECTION_ABORT_SESSION:-}" \
+      "$(fm_backend_herdr_presentation_lock_best_effort_wait_attempts)" \
+      "before cleaning up the aborted projection of $ID" || spawn_abort_lock_rc=$?
+    if [ "$spawn_abort_lock_rc" -ne 0 ]; then
       echo "warning: herdr presentation focus lock unavailable; retaining the projection journal and refusing concurrent abort cleanup" >&2
       HERDR_PROJECTION_ABORT_CLEANUP=0
     fi
@@ -1457,20 +1462,14 @@ trap spawn_abort_cleanup EXIT
 # <session> is required so secondmate and primary spawns serialize against the
 # same session without writing any other home's state directory.
 spawn_herdr_presentation_order_lock_acquire() {
-  local session=${1:-} attempt lock_path
+  local session=${1:-} attempts=${2:-} waiting_for=${3:-} lock_path
   [ -n "$session" ] || session=$(fm_backend_herdr_session)
-  lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") || return 1
+  lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") || return 2
   HERDR_PRESENTATION_ORDER_LOCK="$lock_path"
-  attempt=0
-  while [ "$attempt" -lt 50 ]; do
-    if fm_lock_try_acquire "$HERDR_PRESENTATION_ORDER_LOCK"; then
-      HERDR_PRESENTATION_ORDER_LOCK_HELD=1
-      return 0
-    fi
-    sleep 0.1
-    attempt=$((attempt + 1))
-  done
-  return 1
+  fm_backend_herdr_presentation_lock_acquire_wait \
+    "$HERDR_PRESENTATION_ORDER_LOCK" "$attempts" "$waiting_for" || return 1
+  HERDR_PRESENTATION_ORDER_LOCK_HELD=1
+  return 0
 }
 
 clear_relaunch_harness_wiring() {
@@ -3763,7 +3762,8 @@ else
           echo "error: herdr presentation recovery could not ensure its exact named session" >&2
           exit 1
         }
-        spawn_herdr_presentation_order_lock_acquire "$HERDR_SES" || {
+        spawn_herdr_presentation_order_lock_acquire "$HERDR_SES" "" \
+          "before resuming the interrupted presentation recovery of $ID" || {
           echo "error: herdr presentation recovery could not acquire its session lock; refusing a concurrent resume" >&2
           exit 1
         }
@@ -3808,7 +3808,8 @@ else
         elif [ "${FM_BACKEND_HERDR_PRESENTATION_PREFERENCE:-default}" = default ] &&
           ! fm_backend_herdr_presentation_default_supported "$STATE" "$HERDR_SES"; then
           :
-        elif spawn_herdr_presentation_order_lock_acquire "$HERDR_SES"; then
+        elif spawn_herdr_presentation_order_lock_acquire "$HERDR_SES" "" \
+          "before projecting $ID into its parent workspace"; then
           # The projected child is placed and bound UNDER this launcher's exact
           # parent workspace. Its own herdr pane identity names that workspace
           # directly; the label lookup is only the fallback for a launcher with

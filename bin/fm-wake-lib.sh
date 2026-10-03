@@ -1176,6 +1176,11 @@ fm_lock_reap_dead_link() {
 fm_lock_try_acquire_steal_mutex() {  # <steal-lock>
   local lockdir=$1 current
   FM_LOCK_OWNER_DIR=
+  # A nested marker can only be residue from the removed recursive algorithm;
+  # clear it before attempting the one permitted steal level.
+  if [ -e "$lockdir.steal" ] || [ -L "$lockdir.steal" ]; then
+    fm_lock_remove_path "$lockdir.steal" || true
+  fi
   fm_lock_try_create "$lockdir" && return 0
   if [ -n "$FM_LOCK_CREATE_ERROR" ]; then
     # Not contention: no arbitration, retry, or reap can fix a path that cannot
@@ -1188,7 +1193,14 @@ fm_lock_try_acquire_steal_mutex() {  # <steal-lock>
   if [ "$(cat "$lockdir/pid" 2>/dev/null || true)" = "$current" ]; then
     fm_lock_remove_path "$lockdir" || true
   elif [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
-    fm_lock_reap_dead_link "$lockdir" || return 1
+    if [ -L "$lockdir" ]; then
+      fm_lock_reap_dead_link "$lockdir" || return 1
+    else
+      local pid
+      pid=$(cat "$lockdir/pid" 2>/dev/null || true)
+      fm_lock_recheck_stale_owner "$lockdir" "" "$pid" || return 1
+      fm_lock_remove_path "$lockdir" || return 1
+    fi
   fi
   fm_lock_try_create "$lockdir" && return 0
   fm_lock_report_create_error "$lockdir"

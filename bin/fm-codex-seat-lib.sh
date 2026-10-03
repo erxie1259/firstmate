@@ -114,7 +114,7 @@ fm_codex_seat_expand_path() {
 }
 
 fm_codex_seat_path_identity() {
-  local path=$1 lexical resolved
+  local path=$1 lexical resolved prefix component suffix
   lexical=$(printf '%s\n' "$path" | awk '
     {
       normalized = "/"
@@ -139,8 +139,26 @@ fm_codex_seat_path_identity() {
   if [ -d "$path" ]; then
     resolved=$(CDPATH='' cd -- "$path" 2>/dev/null && pwd -P) || return 1
     printf '%s\n' "$resolved"
+    return 0
+  fi
+  prefix=$lexical
+  suffix=
+  while [ ! -d "$prefix" ]; do
+    component=${prefix##*/}
+    if [ -n "$suffix" ]; then
+      suffix="$component/$suffix"
+    else
+      suffix=$component
+    fi
+    prefix=${prefix%/*}
+    [ "$prefix" = "$component" ] && prefix=.
+    [ -n "$prefix" ] || prefix=/
+  done
+  resolved=$(CDPATH='' cd -- "$prefix" 2>/dev/null && pwd -P) || return 1
+  if [ -n "$suffix" ]; then
+    printf '%s/%s\n' "$resolved" "$suffix"
   else
-    printf '%s\n' "$lexical"
+    printf '%s\n' "$resolved"
   fi
 }
 
@@ -421,7 +439,7 @@ fm_codex_seat_mirror_entries() {
 # store the captain set up by hand is never clobbered. Progress lines go to
 # stdout; the caller decides how loud to be.
 fm_codex_seat_mirror() {
-  local source=$1 target=$2 which=$3 entries entry src_real target_real
+  local source=$1 target=$2 which=$3 entries entry src_real target_id target_real
   # shellcheck disable=SC2034 # Public failure reason consumed by the caller after sourcing.
   FM_CODEX_SEAT_ERROR=
   entries=$(fm_codex_seat_mirror_entries "$which") || return 1
@@ -429,10 +447,20 @@ fm_codex_seat_mirror() {
     fm_codex_seat_fail "mirror source '$source' does not exist"
     return 1
   fi
-  src_real=$(CDPATH='' cd -- "$source" 2>/dev/null && pwd -P) || {
+  src_real=$(fm_codex_seat_path_identity "$source") || {
     fm_codex_seat_fail "mirror source '$source' cannot be resolved"
     return 1
   }
+  target_id=$(fm_codex_seat_path_identity "$target") || {
+    fm_codex_seat_fail "mirror target '$target' cannot be resolved"
+    return 1
+  }
+  case "$target_id" in
+    "$src_real"|"$src_real"/*)
+      fm_codex_seat_fail "mirror target '$target' is inside source '$src_real'; a seat needs its own store"
+      return 1
+      ;;
+  esac
   if [ -e "$target" ] || [ -L "$target" ]; then
     if [ ! -d "$target" ] || [ -L "$target" ]; then
       fm_codex_seat_fail "mirror target '$target' exists and is not a directory"
@@ -447,10 +475,6 @@ fm_codex_seat_mirror() {
     fm_codex_seat_fail "mirror target '$target' cannot be resolved"
     return 1
   }
-  if [ "$target_real" = "$src_real" ]; then
-    fm_codex_seat_fail "mirror target and source are the same directory ($target_real); a seat needs its own store"
-    return 1
-  fi
   # shellcheck disable=SC2086  # deliberate word-splitting: the allowlist is a list
   set -- $entries
   for entry in "$@"; do

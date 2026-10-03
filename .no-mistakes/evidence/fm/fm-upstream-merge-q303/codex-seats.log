@@ -1,0 +1,15 @@
+ok - an absent config/codex-seats is reported as the ambient single-seat home, never as a valid empty list
+ok - list prints every seat's stores and says which ones still need a sign-in
+ok - every malformed seat file is refused with the concrete reason, never parsed loosely
+ok - env prints the one correct launch prefix per runtime and refuses every tuple that spends no seat
+ok - an unsigned or undeclared store refuses rather than resolving to another seat
+ok - quota reads every configured seat against its own store and reports a failed read without hiding the rest
+ok - quota --json emits one labelled, valid JSON report per seat
+ok - mirror shares only credential-free config, is idempotent, and refuses to clobber existing content
+ok - the Pi mirror shares exactly the five required credential-free entries
+ok - a seat whose store is the primary store is reported as needing no mirror
+ok - the mirror refuses nested targets before touching the primary store
+ok - the mirror resolves symlinked parents before checking containment
+ok - the mirror refuses nested targets with absent parents before touching the primary store
+ok - the mirror resolves deep symlinked ancestors before checking containment
+# all fm-codex-seats tests passed

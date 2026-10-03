@@ -1,0 +1,20 @@
+LIVE TARGETED BEHAVIOR EVIDENCE
+--- Pi spawn pin/seat collision ---
+7:ok - a Pi worker-account pin and Codex seat refuse before any worker launches
+15:# all fm-worker-account tests passed
+--- Pi relaunch no-seat success and collision preflight ---
+17:ok - fm-control relaunch: a pinned Pi account works when no Codex seat is selected
+65:ok - fm-control relaunch refuses a Pi worker-account pin and Codex seat before stopping
+--- pyenv live path/identity guards ---
+5:ok - a live rehash executable path containing spaces is recognized and refused
+6:ok - an ambiguous rehash identity stays unknown instead of using lock age
+13:ok - an unreadable process table still clears a stale lock but never a young one
+16:# all fm-pyenv-shim-lock tests passed
+--- Codex seat containment ---
+11:ok - the mirror refuses nested targets before touching the primary store
+12:ok - the mirror resolves symlinked parents before checking containment
+13:ok - the mirror refuses nested targets with absent parents before touching the primary store
+14:ok - the mirror resolves deep symlinked ancestors before checking containment
+15:# all fm-codex-seats tests passed
+--- Bash 3.2 guard ---
+timeout-guard-okBASH32_GUARD_EXIT=0

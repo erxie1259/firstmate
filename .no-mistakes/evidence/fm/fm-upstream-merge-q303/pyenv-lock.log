@@ -1,0 +1,16 @@
+ok - an absent pyenv rehash lock is a silent, successful no-op
+ok - an orphaned lock is moved aside with its contents intact, not deleted
+ok - running the cleaner twice clears once and then says nothing
+ok - a genuinely running rehash makes the cleaner refuse and leave the lock alone
+ok - a live rehash executable path containing spaces is recognized and refused
+ok - an ambiguous rehash identity stays unknown instead of using lock age
+ok - a process that only mentions pyenv-rehash on its command line is not treated as the holder
+ok - an unverified shell command mentioning pyenv-rehash stays unknown
+ok - a long-orphaned lock is cleared even while blocked shells are still waiting on it
+ok - a young lock is cleared when its only rehash started after the lock already existed
+ok - a rehash that predates its lock keeps holding it however long it has been running
+ok - a provable holder is refused at any lock age, including past the stale threshold
+ok - an unreadable process table still clears a stale lock but never a young one
+ok - the cleaner refuses arguments so it cannot be aimed at another path
+ok - a symlink at the lock path is refused rather than moved
+# all fm-pyenv-shim-lock tests passed

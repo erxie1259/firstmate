@@ -773,6 +773,27 @@ SH
   chmod +x "$1/fakebin/claude"
 }
 
+make_pi_auth_stub() {  # <case-dir>
+  cat > "$1/fakebin/pi" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --help) printf '%s\n' 'Pi 0.86.1' 'Options: --help --tui-mode <mode>'; exit 0 ;;
+  auth)
+    if [ "${2:-}" = check ]; then
+      printf '{"status":"ready","provider":"%s"}\n' "${4:-}"
+      exit 0
+    fi
+    ;;
+  --list-models)
+    printf '%s\n' 'provider  model  context' 'openai-codex  gpt-5.5  128K'
+    exit 0
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$1/fakebin/pi"
+}
+
 test_signed_out_worker_account_pin_refuses_before_stop() {
   local dir out rc id=rl-acct-out
   dir=$(new_case acct-out "$id")
@@ -789,6 +810,29 @@ test_signed_out_worker_account_pin_refuses_before_stop() {
   [ ! -s "$dir/fake/literal" ] || fail "a signed-out pin must refuse before any lifecycle input is sent"
   cmp -s "$dir/meta-before" "$dir/home/state/$id.meta" || fail "a refused relaunch must leave the task record untouched"
   pass "fm-control relaunch: a signed-out worker account pin refuses before the old agent stops"
+}
+
+test_pi_worker_account_pin_relaunches_without_a_seat() {
+  local dir out rc id=rl-pi-account
+  dir=$(new_case pi-account "$id")
+  add_ship_task "$dir" "$id" pi
+  make_pi_auth_stub "$dir"
+  sed 's/^model=default$/model=openai-codex\/gpt-5.5/' \
+    "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.tmp"
+  mv "$dir/home/state/$id.meta.tmp" "$dir/home/state/$id.meta"
+  mkdir -p "$dir/home/config" "$dir/pi-work"
+  printf '%s\nopenai-codex\n' "$dir/pi-work" > "$dir/home/config/pi-account"
+  printf 'pi' > "$dir/fake/command"
+  printf 'pi' > "$dir/fake/becomes"
+
+  out=$(run_control "$dir" "$id" relaunch --note "pinned account without a seat"); rc=$?
+  expect_code 0 "$rc" "a pinned Pi relaunch without a seat should succeed"$'\n'"$out"
+  assert_contains "$out" "harness=pi" "the relaunch should keep the Pi harness"
+  [ "$(meta_field "$dir" "$id" account)" = "$dir/pi-work" ] \
+    || fail "the relaunched record should carry the pinned Pi account"
+  assert_contains "$(cat "$dir/fake/literal")" "PI_CODING_AGENT_DIR='$dir/pi-work'" \
+    "the replacement should launch under the pinned Pi root"
+  pass "fm-control relaunch: a pinned Pi account works when no Codex seat is selected"
 }
 
 test_worker_account_pin_follows_the_relaunch() {
@@ -2547,6 +2591,7 @@ test_prefixed_recorded_harness_requires_explicit_replacement
 test_same_harness_relaunch_keeps_the_profile_axes
 test_native_ultra_relaunch_preserves_profile_and_rejects_before_stop
 test_signed_out_worker_account_pin_refuses_before_stop
+test_pi_worker_account_pin_relaunches_without_a_seat
 test_worker_account_pin_follows_the_relaunch
 test_explicit_model_wins_over_the_recorded_one
 test_relaunch_onto_an_unverified_harness_is_refused

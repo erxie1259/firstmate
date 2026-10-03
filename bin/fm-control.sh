@@ -874,7 +874,7 @@ resolve_relaunch_profile() {
   local account_model=$TARGET_MODEL account_selection
   [ "$account_model" != default ] || account_model=
   account_selection=$(fm_worker_account_select "$TARGET_HARNESS" "${FM_CONFIG_OVERRIDE:-$FM_HOME/config}" \
-    "$account_model" "$TARGET_HARNESS") || return 1
+    "$account_model" "$TARGET_HARNESS" "") || return 1
   local target_seat=
   if [ "$SEAT_SET" = 1 ]; then
     target_seat=$NEW_SEAT
